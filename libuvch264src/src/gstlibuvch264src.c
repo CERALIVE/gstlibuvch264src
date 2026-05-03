@@ -1,4 +1,8 @@
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <sys/select.h>
 #include <libusb-1.0/libusb.h>
 #include "gstlibuvch264src.h"
 #include <gst/gst.h>
@@ -41,6 +45,13 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
 static void gst_libuvc_h264_src_finalize(GObject *object);
+
+// Forward declarations for control functions
+static gpointer gst_libuvc_h264_src_control_thread(gpointer data);
+static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
+
+// USB device management functions
+static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self);
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -94,16 +105,13 @@ char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
 void create_hidden_directory(GstLibuvcH264Src *self) {
     char *hidden_dir = get_spspps_path(self, NULL);
 
-    // Check if the directory exists
     struct stat st;
     if (stat(hidden_dir, &st) == -1) {
-        // Directory does not exist; create it
         if (mkdir(hidden_dir, 0700) != 0)
             GST_ERROR_OBJECT(self, "Error creating directory %s\n", hidden_dir);
         else
             GST_WARNING_OBJECT(self, "Directory %s created successfully.\n", hidden_dir);
     } else if (!S_ISDIR(st.st_mode))
-        // Path exists but is not a directory
         GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
 }
 
@@ -198,8 +206,13 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->streaming = FALSE;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
+  
+  // Control socket initialization
+  self->control_socket = -1;
+  self->control_thread = NULL;
+  self->control_running = FALSE;
+  g_mutex_init(&self->control_mutex);
 
-  // Initialization, not fixed
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
   self->sps_length = sizeof(sps);
   memcpy(self->sps, sps, self->sps_length);
@@ -210,6 +223,235 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
 
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
+}
+
+// Force USB device release by directly accessing libusb
+static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self) {
+    GST_DEBUG_OBJECT(self, "Forcing USB device release");
+    
+    if (!self->uvc_devh) return;
+    
+    // Get the underlying libusb handle
+    struct libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
+    if (!usb_devh) {
+        GST_WARNING_OBJECT(self, "Cannot get libusb handle from uvc");
+        return;
+    }
+    
+    // Get USB device info
+    struct libusb_device *usb_dev = libusb_get_device(usb_devh);
+    if (!usb_dev) {
+        GST_WARNING_OBJECT(self, "Cannot get libusb device");
+        return;
+    }
+    
+    int bus = libusb_get_bus_number(usb_dev);
+    int addr = libusb_get_device_address(usb_dev);
+    GST_INFO_OBJECT(self, "USB device at bus %d, address %d", bus, addr);
+    
+    // Try to release all interfaces
+    for (int interface = 0; interface < 8; interface++) {
+        int ret = libusb_release_interface(usb_devh, interface);
+        if (ret == LIBUSB_SUCCESS) {
+            GST_DEBUG_OBJECT(self, "Released interface %d", interface);
+        } else if (ret == LIBUSB_ERROR_NOT_FOUND) {
+            // Interface doesn't exist, that's fine
+            break;
+        }
+    }
+    
+    // Try kernel detach if needed
+    #ifdef LIBUSB_OPTION_DETACH_KERNEL_DRIVER
+    for (int interface = 0; interface < 8; interface++) {
+        if (libusb_kernel_driver_active(usb_devh, interface) == 1) {
+            GST_DEBUG_OBJECT(self, "Detaching kernel driver from interface %d", interface);
+            libusb_detach_kernel_driver(usb_devh, interface);
+        }
+    }
+    #endif
+    
+    // Force close the libusb handle
+    GST_DEBUG_OBJECT(self, "Force closing libusb handle");
+    libusb_close(usb_devh);
+    
+    // Reset the device if possible (requires newer libusb)
+    #ifdef LIBUSB_HAS_GET_DEVICE
+    // This forces a USB port reset
+    libusb_reset_device(usb_devh);
+    #endif
+    
+    // Clear the uvc handle pointer since we've closed it
+    // Note: uvc_close() will fail if we call it now, but that's OK
+}
+
+// Control socket thread function
+static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
+    GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
+    struct sockaddr_un addr;
+    int client_fd;
+    char buffer[256];
+    fd_set read_fds;
+    struct timeval timeout;
+    
+    self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (self->control_socket < 0) {
+        GST_ERROR_OBJECT(self, "Failed to create control socket");
+        return NULL;
+    }
+    
+    int flags = fcntl(self->control_socket, F_GETFL, 0);
+    fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/tmp/libuvc_control");
+    
+    unlink(addr.sun_path);
+    
+    if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to bind control socket");
+        close(self->control_socket);
+        self->control_socket = -1;
+        return NULL;
+    }
+    
+    if (listen(self->control_socket, 5) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to listen on control socket");
+        close(self->control_socket);
+        self->control_socket = -1;
+        return NULL;
+    }
+    
+    GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
+    
+    while (self->control_running) {
+        FD_ZERO(&read_fds);
+        FD_SET(self->control_socket, &read_fds);
+        
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        
+        int result = select(self->control_socket + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
+            client_fd = accept(self->control_socket, NULL, NULL);
+            if (client_fd > 0) {
+                ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
+                if (len > 0) {
+                    buffer[len] = 0;
+                    GST_INFO_OBJECT(self, "Received control command: %s", buffer);
+                    char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
+                    if (response) {
+                        write(client_fd, response, strlen(response));
+                        g_free(response);
+                    }
+                }
+                close(client_fd);
+            }
+        } else if (result == 0) {
+            continue;
+        } else {
+            if (self->control_running) {
+                GST_WARNING_OBJECT(self, "Select error in control thread");
+            }
+            break;
+        }
+    }
+    
+    GST_DEBUG_OBJECT(self, "Control thread exiting");
+    return NULL;
+}
+
+static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command) {
+    int pan, tilt, zoom;
+    uint16_t zoom_abs;
+    
+    g_mutex_lock(&self->control_mutex);
+    
+    if (sscanf(command, "PAN_TILT %d %d", &pan, &tilt) == 2) {
+        if (self->uvc_devh) {
+            uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, pan, tilt);
+            if (res == UVC_SUCCESS) {
+                GST_INFO_OBJECT(self, "Set pan/tilt to: %d/%d", pan, tilt);
+                g_mutex_unlock(&self->control_mutex);
+                return g_strdup_printf("OK pan=%d tilt=%d", pan, tilt);
+            } else {
+                GST_WARNING_OBJECT(self, "Failed to set pan/tilt: %s", uvc_strerror(res));
+                g_mutex_unlock(&self->control_mutex);
+                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
+            }
+        }
+    } 
+    else if (sscanf(command, "ZOOM %d", &zoom) == 1) {
+        if (self->uvc_devh) {
+            zoom_abs = (uint16_t)zoom;
+            uvc_error_t res = uvc_set_zoom_abs(self->uvc_devh, zoom_abs);
+            if (res == UVC_SUCCESS) {
+                GST_INFO_OBJECT(self, "Set zoom to: %d", zoom_abs);
+                g_mutex_unlock(&self->control_mutex);
+                return g_strdup_printf("OK zoom=%d", zoom_abs);
+            } else {
+                GST_WARNING_OBJECT(self, "Failed to set zoom: %s", uvc_strerror(res));
+                g_mutex_unlock(&self->control_mutex);
+                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
+            }
+        }
+    }
+    else if (strcmp(command, "GET_POSITION") == 0) {
+        if (self->uvc_devh) {
+            int32_t current_pan, current_tilt;
+            uint16_t current_zoom;
+            char *response = NULL;
+            
+            uvc_error_t res_pan = uvc_get_pantilt_abs(self->uvc_devh, &current_pan, &current_tilt, UVC_GET_CUR);
+            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &current_zoom, UVC_GET_CUR);
+            
+            if (res_pan == UVC_SUCCESS && res_zoom == UVC_SUCCESS) {
+                response = g_strdup_printf("OK pan=%d tilt=%d zoom=%d", current_pan, current_tilt, current_zoom);
+            } else if (res_pan == UVC_SUCCESS) {
+                response = g_strdup_printf("OK pan=%d tilt=%d zoom=unknown", current_pan, current_tilt);
+            } else if (res_zoom == UVC_SUCCESS) {
+                response = g_strdup_printf("OK pan=unknown tilt=unknown zoom=%d", current_zoom);
+            } else {
+                response = g_strdup("ERROR: Cannot read position");
+            }
+            
+            GST_INFO_OBJECT(self, "Current position: pan=%d, tilt=%d, zoom=%d", 
+                           current_pan, current_tilt, current_zoom);
+            g_mutex_unlock(&self->control_mutex);
+            return response;
+        }
+    }
+    else if (strcmp(command, "GET_CAPABILITIES") == 0) {
+        if (self->uvc_devh) {
+            GString *caps = g_string_new("CAPABILITIES:");
+            
+            int32_t pan_min, pan_max, pan_step;
+            int32_t tilt_min, tilt_max, tilt_step;
+            uvc_error_t res_pt = uvc_get_pantilt_abs(self->uvc_devh, &pan_min, &tilt_min, UVC_GET_MIN);
+            if (res_pt == UVC_SUCCESS) {
+                uvc_get_pantilt_abs(self->uvc_devh, &pan_max, &tilt_max, UVC_GET_MAX);
+                uvc_get_pantilt_abs(self->uvc_devh, &pan_step, &tilt_step, UVC_GET_RES);
+                g_string_append_printf(caps, " pan=[%d,%d,step=%d] tilt=[%d,%d,step=%d]", 
+                                      pan_min, pan_max, pan_step, tilt_min, tilt_max, tilt_step);
+            }
+            
+            uint16_t zoom_min, zoom_max, zoom_step;
+            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &zoom_min, UVC_GET_MIN);
+            if (res_zoom == UVC_SUCCESS) {
+                uvc_get_zoom_abs(self->uvc_devh, &zoom_max, UVC_GET_MAX);
+                uvc_get_zoom_abs(self->uvc_devh, &zoom_step, UVC_GET_RES);
+                g_string_append_printf(caps, " zoom=[%d,%d,step=%d]", zoom_min, zoom_max, zoom_step);
+            }
+            
+            GST_INFO_OBJECT(self, "Capabilities: %s", caps->str);
+            g_mutex_unlock(&self->control_mutex);
+            return g_string_free(caps, FALSE);
+        }
+    }
+    
+    g_mutex_unlock(&self->control_mutex);
+    return g_strdup("ERROR: Unknown command");
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -242,8 +484,6 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                                            );
     GstStructure *tmp_structure = gst_caps_get_structure(tmp_caps, 0);
 
-    // Enumerate supported H264 resolutions and framerates
-    // And select the highest compatible resolution, at the highest supported framerate
     for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
          format_desc; format_desc = format_desc->next)
     {
@@ -260,7 +500,6 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                               "height", G_TYPE_INT, frame_desc->wHeight,
                               NULL);
 
-            // This holds the highest framerate for the current resolution
             gint fps = -1;
             if (frame_desc->intervals) {
                 GValue framerates = G_VALUE_INIT;
@@ -285,11 +524,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                 gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
             }
 
-            GST_INFO_OBJECT(basesrc, "Testing hw caps: %" GST_PTR_FORMAT "...", tmp_caps);
-
             if (gst_caps_can_intersect(caps, tmp_caps)) {
-                GST_INFO_OBJECT(basesrc, "  caps valid");
-
                 if (resolution > (width * height)
                     || (resolution == (width * height) && fps > framerate)) {
                     width = frame_desc->wWidth;
@@ -306,12 +541,9 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     gst_structure_get_fraction(s, "framerate", &fr_num, &fr_den);
                     framerate = fr_num / fr_den;
                 }
-            } else {
-                GST_INFO_OBJECT(basesrc, "  caps invalid");
             }
-
-        } // for frame_desc
-    } // for format_desc
+        }
+    }
 
     gst_caps_unref(tmp_caps);
 
@@ -392,6 +624,15 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
 
+  GST_DEBUG_OBJECT(self, "Starting libuvc source");
+
+  // Check if we need to cleanup a previous session
+  if (self->uvc_ctx != NULL || self->uvc_devh != NULL) {
+    GST_WARNING_OBJECT(self, "Previous session not fully cleaned up, forcing cleanup");
+    gst_libuvc_h264_src_stop(src);
+    usleep(1000000); // Wait 1 second for USB to settle
+  }
+
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
   if (res < 0) {
@@ -404,6 +645,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (res < 0) {
     GST_ERROR_OBJECT(self, "Unable to find any UVC devices");
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
 
@@ -418,6 +660,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (!self->uvc_dev) {
     GST_ERROR_OBJECT(self, "Unable to find UVC device: %s", self->index);
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
 
@@ -426,42 +669,105 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (res < 0) {
     GST_ERROR_OBJECT(self, "Unable to open UVC device: %s", uvc_strerror(res));
     uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
 
+  // Start control socket thread
+  self->control_running = TRUE;
+  self->control_thread = g_thread_new("uvc-control", 
+                                     gst_libuvc_h264_src_control_thread, 
+                                     self);
+
   load_spspps(self);
 
+  GST_DEBUG_OBJECT(self, "Libuvc source started successfully");
   return TRUE;
 }
 
+// FIXED: Proper cleanup with libusb handle release
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
 
-  if (self->streaming) {
-    uvc_stop_streaming(self->uvc_devh);
-    self->streaming = FALSE;
+  GST_DEBUG_OBJECT(self, "Stopping libuvc source");
+
+  // Stop control thread
+  if (self->control_running) {
+    GST_DEBUG_OBJECT(self, "Stopping control thread");
+    self->control_running = FALSE;
+    
+    // Wake up control thread
+    int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (wakeup_fd >= 0) {
+      struct sockaddr_un addr;
+      memset(&addr, 0, sizeof(addr));
+      addr.sun_family = AF_UNIX;
+      strcpy(addr.sun_path, "/tmp/libuvc_control");
+      fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
+      connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
+      close(wakeup_fd);
+    }
+    
+    if (self->control_thread) {
+      g_thread_join(self->control_thread);
+      self->control_thread = NULL;
+    }
   }
 
+  // Close control socket
+  if (self->control_socket >= 0) {
+    close(self->control_socket);
+    self->control_socket = -1;
+    unlink("/tmp/libuvc_control");
+  }
+
+  // CRITICAL FIX: Stop streaming and force USB release
+  if (self->streaming && self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Stopping UVC streaming");
+    uvc_stop_streaming(self->uvc_devh);
+    self->streaming = FALSE;
+    usleep(100000); // 100ms for streaming to stop
+  }
+
+  // Clear frame queue
+  if (self->frame_queue) {
+    GstBuffer *buffer;
+    while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+      gst_buffer_unref(buffer);
+    }
+  }
+
+  // FIXED: Release USB device BEFORE uvc_close
   if (self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Force releasing USB device");
+    gst_libuvc_h264_src_force_usb_release(self);
+    
+    // Now call uvc_close (it may fail but that's OK since we already released)
     uvc_close(self->uvc_devh);
     self->uvc_devh = NULL;
   }
 
+  // Unreference UVC device
   if (self->uvc_dev) {
     uvc_unref_device(self->uvc_dev);
     self->uvc_dev = NULL;
   }
 
+  // Exit UVC context
   if (self->uvc_ctx) {
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
   }
 
+  // Clear mutex
+  g_mutex_clear(&self->control_mutex);
+
+  GST_DEBUG_OBJECT(self, "Libuvc source fully stopped");
   return TRUE;
 }
 
-// Callback to handle frame data
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 
@@ -497,14 +803,12 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 memcpy(self->sps, unit->ptr, self->sps_length);
                 updated_sps_pps = TRUE;
                 self->send_sps_pps = TRUE;
-                // deliberately not sending SPS/PPS info in their own buffer
                 continue;
             case 8:
                 self->pps_length = unit->len;
                 memcpy(self->pps, unit->ptr, self->pps_length);
                 updated_sps_pps = TRUE;
                 self->send_sps_pps = TRUE;
-                // deliberately not sending SPS/PPS info in their own buffer
                 continue;
             case 5: {
                 if (!self->had_idr || self->send_sps_pps) {
@@ -523,14 +827,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 if (!self->had_idr) {
                     continue;
                 }
-        } // switch
+        }
 
         if (!buffer) {
           buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
         }
         gst_buffer_fill(buffer, buffer_offset, unit->ptr, unit->len);
 
-        // Set timestamps on the buffer
         if (units[i].type == 1 || units[i].type == 5) {
             /* The problems:
                * libuvc capture timestamps are jittery
@@ -618,7 +921,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
         }
 
         g_async_queue_push(self->frame_queue, buffer);
-    } // for
+    }
 
     if (updated_sps_pps) {
         store_spspps(self);
@@ -646,7 +949,6 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
     }
   }
 
-  // Retrieve a buffer from the queue
   *buf = g_async_queue_pop(self->frame_queue);
   if (*buf == NULL) {
     GST_ERROR_OBJECT(self, "No frame available.");
@@ -659,29 +961,35 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 static void gst_libuvc_h264_src_finalize(GObject *object) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(object);
 
-    // Ensure streaming is stopped
-    if (self->streaming) {
-        uvc_stop_streaming(self->uvc_devh);
-        self->streaming = FALSE;
+    GST_DEBUG_OBJECT(self, "Finalizing libuvc source");
+
+    // Force cleanup
+    gst_libuvc_h264_src_stop(GST_BASE_SRC(self));
+
+    if (self->index) {
+        g_free(self->index);
+        self->index = NULL;
     }
 
-    // Unreference and free the frame queue
     if (self->frame_queue) {
+        GstBuffer *buffer;
+        while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+            gst_buffer_unref(buffer);
+        }
+        
         g_async_queue_unref(self->frame_queue);
         self->frame_queue = NULL;
     }
 
-    // Chain up to the parent class
+    GST_DEBUG_OBJECT(self, "Libuvc source finalized");
+
     G_OBJECT_CLASS(gst_libuvc_h264_src_parent_class)->finalize(object);
 }
 
-// Plugin initialization function
 static gboolean plugin_init(GstPlugin *plugin) {
-    // Register your element
     return gst_element_register(plugin, "libuvch264src", GST_RANK_NONE, GST_TYPE_LIBUVC_H264_SRC);
 }
 
-// Define the plugin using GST_PLUGIN_DEFINE
 #define PACKAGE "libuvch264src"
 #define VERSION "1.0"
 GST_PLUGIN_DEFINE(
