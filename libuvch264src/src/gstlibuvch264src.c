@@ -3,6 +3,7 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <unistd.h>
 #include <libusb-1.0/libusb.h>
 #include "gstlibuvch264src.h"
 #include <gst/gst.h>
@@ -409,8 +410,15 @@ static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
                     GST_INFO_OBJECT(self, "Received control command: %s", buffer);
                     char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
                     if (response) {
-                        write(client_fd, response, strlen(response));
+                        if (write(client_fd, response, strlen(response)) < 0) {
+                            GST_WARNING_OBJECT(self, "Failed to write response to control socket");
+                        }
                         g_free(response);
+                    } else {
+                        const char *default_response = "OK";
+                        if (write(client_fd, default_response, strlen(default_response)) < 0) {
+                            GST_WARNING_OBJECT(self, "Failed to write default response to control socket");
+                        }
                     }
                 }
                 close(client_fd);
