@@ -11,24 +11,38 @@ RUN apt-get update && apt-get install -y \
 	cmake \
 	git \
 	meson \
+	ninja-build \
+	patch \
 	pkg-config \
 	libgstreamer1.0-dev \
 	libgstreamer-plugins-base1.0-dev \
+	libjpeg-dev \
 	libusb-1.0-0 \
 	libusb-1.0-0-dev
 
-# Clone the necessary repositories
-RUN git clone https://github.com/irlserver/gstlibuvch264src.git .
+# Copy plugin sources and patches into the image
+COPY . /app
 
-# Build and install libuvc
-WORKDIR /app/libuvc
-RUN cmake .
-RUN make -j$(nproc)
-RUN make install
+# Build and install libuvc from upstream v0.0.7 with the H265 and UVC 1.5
+# patches applied. Stock libuvc lacks UVC_FRAME_FORMAT_H265 (required by the
+# plugin's H265 codepaths) and predates UVC 1.5 header parsing and the
+# libusb auto-detach call needed to claim devices bound to the uvcvideo
+# kernel driver.
+WORKDIR /app/libuvc-build
+RUN git clone --depth 1 --branch v0.0.7 https://github.com/libuvc/libuvc.git . && \
+	patch -p1 < /app/patches/uvc15-support.patch && \
+	patch -p1 < /app/patches/libuvc-h265-support.patch && \
+	cmake . \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DBUILD_SHARED_LIBS=ON \
+		-DBUILD_EXAMPLE=OFF \
+		-DBUILD_TEST=OFF && \
+	make -j"$(nproc)" && \
+	make install && \
+	ldconfig
 
 # Build and install libuvch264src
 WORKDIR /app
-RUN mkdir build
 RUN meson setup build ./libuvch264src/
 WORKDIR /app/build
 RUN meson compile
