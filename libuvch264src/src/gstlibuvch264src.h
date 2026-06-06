@@ -27,17 +27,23 @@ struct _GstLibuvcH264Src {
   uvc_device_t *uvc_dev;
   uvc_device_handle_t *uvc_devh;
   uvc_stream_ctrl_t uvc_ctrl;
+  enum uvc_frame_format frame_format;
   GAsyncQueue *frame_queue;
   gboolean streaming;
-  GstClockTime uvc_start_time;
+  GstClock *clock;
+  int64_t pts_offset_sum;
+  int64_t pts_stretch;
+  GstClockTime base_time;
   GstClockTime prev_pts;
   gint64 frame_interval; // in ns
   guint64 prev_int_ts;
   gint frame_count;
   gboolean had_idr;
   gboolean send_sps_pps;
+  gint vps_length;
   gint sps_length;
   gint pps_length;
+  unsigned char vps[SPSPPSBUFSZ];
   unsigned char sps[SPSPPSBUFSZ];
   unsigned char pps[SPSPPSBUFSZ];
   
