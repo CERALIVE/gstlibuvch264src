@@ -1,3 +1,7 @@
 
 # OpenCode agent state (local only)
 .omo/
+
+# Build directories (Meson + CMake/ctest)
+/build/
+/build*/

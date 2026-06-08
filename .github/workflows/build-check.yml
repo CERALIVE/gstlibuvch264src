@@ -41,3 +41,39 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Architecture:** ${{ matrix.config.arch }}" >> $GITHUB_STEP_SUMMARY
           echo "**Runner:** ${{ matrix.config.runner }}" >> $GITHUB_STEP_SUMMARY
+
+  smoke-test:
+    name: Plugin-load smoke test (ctest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build + GStreamer dev dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git \
+            patch \
+            pkg-config \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libjpeg-dev \
+            libusb-1.0-0-dev
+
+      - name: Configure and build
+        run: |
+          cmake -B build
+          cmake --build build
+
+      - name: Run ctest
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke Test Summary
+        if: always()
+        run: |
+          echo "## 🔌 Plugin-load smoke test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '`ctest --test-dir build` ran the gst-check smoke suite (plugin registers, factories/pad-templates/properties present). Hardware-independent.' >> $GITHUB_STEP_SUMMARY
