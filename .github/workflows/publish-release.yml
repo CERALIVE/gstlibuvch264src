@@ -223,7 +223,7 @@ jobs:
             gstlibuvch264src (this package) ← standalone GStreamer plugin
               ├── Depends: libgstreamer1.0-0
               │
-              └── Used by: ceracoder → ceralive-device
+              └── Used by: cerastream → ceralive-device
             ```
 
             ### Debian Packages
