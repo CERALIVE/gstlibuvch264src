@@ -8,11 +8,11 @@ Parent manifest: [`../AGENTS.md`](../AGENTS.md)
 
 ## ROLE IN THE GROUP
 
-Capture source element — feeds raw H.264 bitstream from DJI/UVC cameras into the ceracoder pipeline. **Optional device-image component**: the image build may or may not include this plugin depending on capture hardware. HDMI capture paths bypass this element entirely.
+Capture source element — feeds raw H.264 bitstream from DJI/UVC cameras into the cerastream pipeline. **Optional device-image component**: the image build may or may not include this plugin depending on capture hardware. HDMI capture paths bypass this element entirely.
 
 Data flow position:
 ```
-libuvch264src (this) → ceracoder → srtla → irl-srt-server
+libuvch264src (this) → cerastream → srtla → irl-srt-server
 ```
 
 ---
