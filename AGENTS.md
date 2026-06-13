@@ -98,6 +98,31 @@ dual-codec capability.
 
 ---
 
+## VERSION SCHEME
+
+**CalVer derivation: git tag only (no source file).**
+
+The `.deb` version is derived **purely from git tags** at publish time via the `publish-release.yml` workflow. There is no separate `VERSION` file by design.
+
+**Authoritative version source:** `.github/workflows/publish-release.yml` (job `calculate-version`)
+
+**Scheme:** `YYYY.MINOR.PATCH` where:
+- `YYYY` = current year (UTC)
+- `MINOR` = current month (UTC, no zero-pad; e.g., `6` for June)
+- `PATCH` = monotonic counter per month (incremented from git tag history)
+
+**Example:** `2026.6.1` (June 2026, patch 1)
+
+**Tag format:** `v<VERSION>` (stable) or `v<VERSION>-beta.<N>` (beta)
+- Stable: `v2026.6.1`
+- Beta: `v2026.6.2-beta.1`
+
+**FPM .deb version:** The `VERSION` env var from `calculate-version` is passed directly to FPM's `-v` flag (line 99 in `publish-release.yml`), producing `.deb` packages with CalVer versions like `gstreamer1.0-libuvch264src_2026.6.1_arm64.deb`.
+
+**No version file needed.** The workflow calculates the version at publish time from the git tag history; there is no tracked `VERSION` file in the repo. This is intentional — the single source of truth is the git tag namespace (`v*`).
+
+---
+
 ## ANTI-PATTERNS
 
 - **DO NOT heavily modify `libuvc/`** — vendored upstream library. Patch minimally; prefer upgrading the whole vendor snapshot if fixes are needed.
