@@ -5,7 +5,7 @@
  *   - both element factories (primary + alias) exist,
  *   - the element instantiates as a GstPushSrc,
  *   - the documented "index" property is present with its default,
- *   - the ALWAYS "src" pad template advertises H.264 caps.
+ *   - the ALWAYS "src" pad template advertises H.264 AND H.265 caps.
  *
  * No UVC device is opened: gst_element_factory_make() only runs class/instance
  * init; the camera is only touched on the READY->PAUSED start() transition,
@@ -102,6 +102,8 @@ GST_START_TEST (test_src_pad_template)
       gchar *caps_str = gst_caps_to_string (caps);
       fail_unless (g_strrstr (caps_str, "video/x-h264") != NULL,
           "src caps missing video/x-h264: %s", caps_str);
+      fail_unless (g_strrstr (caps_str, "video/x-h265") != NULL,
+          "src caps missing video/x-h265: %s", caps_str);
       g_free (caps_str);
       gst_caps_unref (caps);
     }
