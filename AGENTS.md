@@ -83,10 +83,18 @@ cmake -B build && cmake --build build && ctest --test-dir build --output-on-fail
 
 The suite (`tests/test_plugin_load.c`) asserts: the `libuvch264src` plugin
 registers; both factories (`libuvch264src` + `libuvch26xsrc` alias) exist; the
-element is a `GstPushSrc`; the `index` string property defaults to `"0"`; and
-the ALWAYS `src` pad template advertises `video/x-h264`. No UVC device is opened
+element is a `GstPushSrc`; the `index` string property defaults to `"0"`; the
+ALWAYS `src` pad template advertises `video/x-h264`; **and the element also
+exposes a `video/x-h265` pad template** (dual-codec confirmed — the libuvc v0.0.7
+patches in `patches/` add UVC 1.5 + H.265 support). No UVC device is opened
 (`gst_element_factory_make` only runs class/instance init). Runs in CI via the
 `smoke-test` job in `.github/workflows/build-check.yml`.
+
+**Dual-codec status [EXISTS].** Both H.264 and H.265 pad templates are present and
+asserted by the test suite. `cerastream` uses this element for both
+`InputKind::UvcH264` (negotiated to `video/x-h264`) and `InputKind::UvcH265`
+(negotiated to `video/x-h265`). The `libuvch26xsrc` factory alias reflects this
+dual-codec capability.
 
 ---
 
