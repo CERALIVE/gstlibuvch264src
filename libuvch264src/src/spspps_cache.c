@@ -1,0 +1,100 @@
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "gstlibuvch264src_internal.h"
+#include "frame_pipeline.h"
+#include "spspps_cache.h"
+
+#define DIRBUFLEN 4096
+__thread char dir_buf[DIRBUFLEN];
+char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
+    const char *home_dir = getenv("HOME");
+    if (home_dir == NULL) {
+        GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
+        home_dir = "";
+    }
+
+	int ret = snprintf(dir_buf, DIRBUFLEN, "%s/.spspps%s%s%s",
+	                   home_dir,
+	                   index ? "/" : "",
+	                   index ? index : "",
+	                   (index && self->frame_format == UVC_FRAME_FORMAT_H265) ? ".h265" : "");
+	if (ret >= DIRBUFLEN) {
+	    GST_ERROR_OBJECT(self, "Error building SPS/PPS path\n");
+	    return NULL;
+	}
+
+	return dir_buf;
+}
+
+void create_hidden_directory(GstLibuvcH264Src *self) {
+    char *hidden_dir = get_spspps_path(self, NULL);
+
+    struct stat st;
+    if (stat(hidden_dir, &st) == -1) {
+        if (mkdir(hidden_dir, 0700) != 0)
+            GST_ERROR_OBJECT(self, "Error creating directory %s\n", hidden_dir);
+        else
+            GST_WARNING_OBJECT(self, "Directory %s created successfully.\n", hidden_dir);
+    } else if (!S_ISDIR(st.st_mode))
+        GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
+}
+
+FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
+    if (mode == 'w' || mode == 'a') {
+        create_hidden_directory(self);
+    }
+
+    char m[3];
+    sprintf(m, "%cb", mode);
+    char *file_name = get_spspps_path(self, self->index);
+    FILE *fp = fopen(file_name, m);
+    return fp;
+}
+
+// Must only be called after the caps have been negotiated and the format is known
+void load_spspps(GstLibuvcH264Src *self) {
+    FILE* fp = open_spspps_file(self, 'r');
+    if (fp) {
+        unsigned char buf[SPSPPSBUFSZ*3];
+        gint read_bytes = fread(buf, 1, sizeof(buf), fp);
+        fclose(fp);
+
+        #define MAX_UNITS_LOAD 3
+        nal_unit_t units[MAX_UNITS_LOAD];
+        int c = parse_nal_units(self->frame_format, units, MAX_UNITS_LOAD, buf, read_bytes);
+
+        for (int i = 0; i < c; i++) {
+            switch (units[i].type) {
+                case UNIT_VPS:
+                    memcpy(self->vps, units[i].ptr, units[i].len);
+                    self->vps_length = units[i].len;
+                    break;
+                case UNIT_SPS:
+                    memcpy(self->sps, units[i].ptr, units[i].len);
+                    self->sps_length = units[i].len;
+                    break;
+                case UNIT_PPS:
+                    memcpy(self->pps, units[i].ptr, units[i].len);
+                    self->pps_length = units[i].len;
+                    break;
+                default:
+                    // We shouldn't have other types; but ignore them if we do
+                    break;
+            }
+        }
+    }
+}
+
+void store_spspps(GstLibuvcH264Src *self) {
+    FILE* fp = open_spspps_file(self, 'w');
+	if (fp) {
+		if (self->frame_format == UVC_FRAME_FORMAT_H265) {
+			fwrite(self->vps, 1, self->vps_length, fp);
+		}
+		fwrite(self->sps, 1, self->sps_length, fp);
+		fwrite(self->pps, 1, self->pps_length, fp);
+		fclose(fp);
+	}
+}
