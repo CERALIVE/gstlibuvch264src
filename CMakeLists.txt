@@ -18,10 +18,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 enable_testing()
 
 find_package(PkgConfig REQUIRED)
+# Version floors. GStreamer 1.14 is the oldest series the plugin's pad/caps API
+# usage compiles against (Ubuntu 18.04 baseline); no known incompatibility on
+# the 1.x line, so no upper bound is imposed. libusb 1.0.20 is the floor for the
+# auto-detach-kernel-driver call the libuvc patches rely on.
 pkg_check_modules(GST REQUIRED IMPORTED_TARGET gstreamer-1.0>=1.14)
 pkg_check_modules(GST_BASE REQUIRED IMPORTED_TARGET gstreamer-base-1.0>=1.14)
 pkg_check_modules(GST_CHECK REQUIRED IMPORTED_TARGET gstreamer-check-1.0>=1.14)
-pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0>=1.0.20)
 
 # -----------------------------------------------------------------------------
 # libuvc dependency.
@@ -49,7 +53,8 @@ else()
 
   FetchContent_Declare(libuvc
     GIT_REPOSITORY https://github.com/libuvc/libuvc.git
-    GIT_TAG v0.0.7
+    # Pinned to the v0.0.7 commit SHA (tags are mutable). Keep in sync with the Dockerfile.
+    GIT_TAG 68d07a00e11d1944e27b7295ee69673239c00b4b
     PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/uvc15-support.patch
       && patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/libuvc-h265-support.patch
     UPDATE_DISCONNECTED 1

@@ -1,7 +1,10 @@
 # Multi-architecture support (driven by buildx --platform; CI builds amd64 + arm64)
 ARG TARGETARCH
 
-FROM ubuntu:latest AS build
+# Base pinned to a digest (not the mutable :latest / floating :24.04 tag) so the
+# build is reproducible and verifiable offline. Refresh via:
+#   docker buildx imagetools inspect ubuntu:24.04   (use the index Digest)
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54 AS build
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -31,7 +34,12 @@ COPY . /app
 # libusb auto-detach call needed to claim devices bound to the uvcvideo
 # kernel driver.
 WORKDIR /app/libuvc-build
-RUN git clone --depth 1 --branch v0.0.7 https://github.com/libuvc/libuvc.git . && \
+# Pinned to the exact commit the v0.0.7 tag pointed to (tags are mutable; a SHA
+# is not). Shallow-fetch the single commit. Keep in sync with CMakeLists.txt.
+RUN git init -q . && \
+	git remote add origin https://github.com/libuvc/libuvc.git && \
+	git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b && \
+	git checkout -q FETCH_HEAD && \
 	patch -p1 < /app/patches/uvc15-support.patch && \
 	patch -p1 < /app/patches/libuvc-h265-support.patch && \
 	cmake . \
@@ -52,7 +60,8 @@ RUN meson compile
 RUN meson install --no-rebuild
 
 # --- Second Stage: Create a smaller image for just the plugin ---
-FROM ubuntu:latest AS runtime
+# Same pinned digest as the build stage (see note above).
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54 AS runtime
 
 # Multi-architecture support
 ARG TARGETARCH
@@ -71,7 +80,7 @@ RUN apt-get update && apt-get install -y \
 RUN GNUARCH=$(case "${TARGETARCH}" in \
 	"arm64") echo "aarch64-linux-gnu" ;; \
 	"amd64") echo "x86_64-linux-gnu" ;; \
-	*) echo "unknown-linux-gnu" ;; \
+	*) echo "Unsupported architecture: '${TARGETARCH}' (expected arm64 or amd64)" >&2; exit 1 ;; \
 	esac) && \
 	mkdir -p /usr/lib/${GNUARCH}/gstreamer-1.0 && \
 	echo "${GNUARCH}" > /tmp/gnuarch
