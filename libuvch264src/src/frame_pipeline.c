@@ -20,7 +20,12 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
         switch (type) {
             case 1:
                 return UNIT_FRAME_NON_IDR;
-            case 20:
+            /* Both IDR NAL types are keyframes (ITU-T H.265 Table 7-1).
+               IDR_W_RADL (19) is the type x265 and most hardware encoders emit;
+               mapping only IDR_N_LP (20) left those keyframes as UNIT_INVALID, so
+               the IDR gate never armed and SPS/PPS/VPS were never prepended. */
+            case 19:  /* IDR_W_RADL */
+            case 20:  /* IDR_N_LP */
                 return UNIT_FRAME_IDR;
             case 32:
                 return UNIT_VPS;
@@ -125,6 +130,33 @@ gsize parse_nal_units(enum uvc_frame_format format,
     return i;
 }
 
+/* Framerate-mismatch behavior (harden-v2 Task 9; Oracle Option B).
+ *
+ * The negotiated framerate (caps 1/fps, used for DURATION and the live-source
+ * latency report) is only a nominal contract with downstream. The device's real
+ * delivery cadence routinely differs from it: a "30 fps" camera may settle at
+ * ~24 fps, run jittery, or stall and burst. This element does NOT coerce the
+ * nominal cadence onto a non-conforming device. The policy is:
+ *
+ *   - PTS is stamped from the real running-time the frame arrived at
+ *     (ts = gst_clock_get_time(clock) - base_time, computed below), regardless
+ *     of the negotiated fps. A slow/fast/jittery device is reflected faithfully
+ *     in the timestamps instead of being snapped onto an idealized grid.
+ *   - DURATION stays the constant caps-derived 1/fps. It is a nominal hint, not
+ *     a measurement of the real inter-arrival delta, so it never tracks the
+ *     mismatched rate.
+ *   - The element never renegotiates caps and never drops or duplicates frames
+ *     to force the nominal cadence. Every delivered frame is forwarded exactly
+ *     once with a strictly monotonic GST_BUFFER_OFFSET, so downstream can still
+ *     detect real drops on the wire.
+ *   - A material, sustained divergence between the measured cadence and the
+ *     negotiated fps is surfaced once via a one-time GST_INFO/WARNING for
+ *     diagnostics; it does not change the stamping policy.
+ *
+ * Rationale: downstream (h264parse/mux/srt) wants honest arrival timing far more
+ * than a synthetic constant rate; rewriting PTS onto the nominal grid is what
+ * caused the historical skip/stall artifacts. Regression-guarded by
+ * tests/test_framerate_mismatch.c (and tests/test_pts_drift.c). */
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 
@@ -275,125 +307,45 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
         // Set timestamps on the buffer
         if (units[i].type == UNIT_FRAME_IDR || units[i].type == UNIT_FRAME_NON_IDR) {
-            /* The problems:
-               * libuvc capture timestamps are jittery
-               * video players skip and duplicate frames if the PTSes are noisy
-               * the actual framerate is never precisely equal to the nominal value,
-                 and can drift over time
-            */
-
-            GstClockTime timestamp;
+            /* Option B: stamp the running-time the frame actually arrived at,
+               ts = now - base_time (computed above). The arrival clock IS the PTS
+               clock, so PTS can never drift from real time and no interval
+               estimator/stretch/resync is needed. */
+            GstClockTime timestamp = ts;
             GstClockTime duration;
-            int64_t offset;
 
-            /* prev_pts / pts_offset_sum / pts_stretch (and base_time, above) are
-               shared with set_clock(); keep this read-modify-write under the
-               object lock. The buffer fields are written afterwards from locals
-               so the buffer alloc/fill and the queue push stay outside it. */
+            /* base_time / prev_pts / frame_interval are shared with set_clock()
+               and change_state(); take the object lock for this read-modify-write.
+               The buffer fields are written afterwards from locals so the alloc/
+               fill and the queue push stay outside the lock. */
             GST_OBJECT_LOCK(self);
 
-            // We'll set the first PTS to the current timestamp ts. Guard the
-            // subtraction: if the first frame arrives less than one interval
-            // after the clock baseline, ts - frame_interval would underflow the
-            // unsigned baseline into a huge value and poison the first PTS.
-            if (self->prev_pts == G_MAXUINT64) {
-                self->prev_pts = (ts > (GstClockTime)self->frame_interval)
-                                 ? ts - self->frame_interval : 0;
-            }
-
-            // Update the PTS calculation on the first IDR after MIN_FRAMES_CALC_INTERVAL frames
-            self->frame_count++;
-            gboolean update_pts_calc = (units[i].type == UNIT_FRAME_IDR &&
-                                        self->frame_count >= MIN_FRAMES_CALC_INTERVAL);
-
-            int64_t timestamp_offset = 0;
-            if (update_pts_calc) {
-                // Discard the first set of results, as they can be quite noisy
-                if (self->prev_int_ts != 0) {
-                    #define AVG_DIV 20
-                    #define AVG_MULT 1
-                    #define AVG_ROUNDING (AVG_DIV/2)
-
-                    #define CLOCK_START_LEN (MIN_FRAMES_CALC_INTERVAL * 3 * (uint64_t)self->frame_interval)
-                    #define PTS_JUMP_THRESHOLD (80L * 1000L * 1000L) // 80 ms
-                    #define PTS_STRETCH_HYST   (8L * 1000L * 1000L)  //  8 ms
-                    #define PTS_STRETCH_VAL    (50L * 1000L)         // 50 us (per frame)
-
-
-                    // Average frame interval tracking
-                    int64_t interval = ((ts - self->prev_int_ts) + self->frame_count / 2) / self->frame_count;
-                    self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
-                                            interval + AVG_ROUNDING) / AVG_DIV;
-
-
-                    // Determine if we need to resync the PTSes with the running clock
-                    int64_t avg_offset = (self->pts_offset_sum + self->frame_count/2) / self->frame_count;
-                    GST_DEBUG_OBJECT(self, "measured frame interval %ld us, average interval %ld us, "
-                                           "average PTS offset: %ld us",
-                                           interval / 1000, self->frame_interval / 1000, avg_offset / 1000);
-
-                    // Usually we don't need to stretch the frame interval
-                    self->pts_stretch = 0;
-
-                    /* After just starting, jump immediately to resync on delta longer than a frame interval.
-                       During normal execution, prefer gradual resync as it's less noticeable
-                       We've seen delta up to around 75ms caused by dropped frames on a Pocket 3 in 4K60 */
-                    if ((ts < CLOCK_START_LEN &&
-                        (avg_offset < -self->frame_interval || avg_offset > self->frame_interval)) ||
-                        avg_offset < -PTS_JUMP_THRESHOLD || avg_offset > PTS_JUMP_THRESHOLD) {
-                        timestamp_offset = avg_offset;
-                        GST_DEBUG_OBJECT(self, "  adjusting PTS offset by: %ld us", timestamp_offset / 1000);
-
-                    // For smaller delta of +/- 8ms, slightly stretch or compress frame intervals to catch up
-                    } else if (avg_offset > PTS_STRETCH_HYST) {
-                        self->pts_stretch = PTS_STRETCH_VAL;
-                        GST_DEBUG_OBJECT(self, "  stretching PTS interval by: %ld us", self->pts_stretch / 1000);
-
-                    } else if (avg_offset < -PTS_STRETCH_HYST) {
-                        self->pts_stretch = -PTS_STRETCH_VAL;
-                        GST_DEBUG_OBJECT(self, "  compressing PTS interval by: %ld us", -self->pts_stretch / 1000);
-
-                    }
-                }
-
-                // Reset all the counters regardless of whether the PTS calculations were updated
-                self->frame_count = 0;
-                self->pts_offset_sum = 0;
-                self->prev_int_ts = ts;
-            }
-
-            // The interval, stretch and resync offset are signed deltas added
-            // to an unsigned PTS. Early in the stream prev_pts is small, so a
-            // strongly negative resync offset could drive the sum below zero and
-            // wrap the guint64 into a huge timestamp that stalls downstream.
-            // Bound the offset so the running PTS can never underflow.
-            int64_t pts_base = (int64_t)self->prev_pts + self->frame_interval + self->pts_stretch;
-            if (timestamp_offset < -pts_base) {
-                timestamp_offset = -pts_base;
-            }
-
-            timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
-
-            // Keep PTSes strictly increasing: a backwards or repeated PTS makes
-            // players skip or stall, so clamp to at least one tick past prev_pts.
-            if (timestamp <= self->prev_pts) {
+            /* prev_pts == G_MAXUINT64 is the rebaseline sentinel (first frame
+               after start/reconnect/clock-change or a PAUSED->PLAYING relatch):
+               latch ts as-is. Otherwise a ts at or behind the last PTS nudges one
+               tick forward so downstream never sees a backwards or repeated PTS.
+               Rare in normal flow (clock swap/relatch/reconnect); also covers the
+               multi-slice case where slices of one access unit share a ts. */
+            if (self->prev_pts != G_MAXUINT64 && timestamp <= self->prev_pts) {
                 timestamp = self->prev_pts + 1;
-            }
-
-            offset = ts - timestamp;
-            self->pts_offset_sum += offset;
-            duration = timestamp - self->prev_pts;
-            if (duration == 0) {
-                duration = 1;
+                GST_WARNING_OBJECT(self, "non-monotonic running-time "
+                    "(clock swap/relatch/reconnect?); clamped PTS to prev_pts + 1");
             }
             self->prev_pts = timestamp;
 
+            /* DURATION is the nominal frame interval (1/fps) from the negotiated
+               caps framerate, never an inter-arrival delta. GST_CLOCK_TIME_NONE
+               until negotiate() resolves the framerate. */
+            duration = (self->frame_interval > 0)
+                       ? (GstClockTime) self->frame_interval : GST_CLOCK_TIME_NONE;
+
             GST_OBJECT_UNLOCK(self);
 
+            /* DTS == PTS: DJI/UVC H.264/H.265 has no B-frames */
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
             GST_BUFFER_DURATION(buffer) = duration;
-            GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
+            GST_LOG_OBJECT(self, "PTS %" GST_TIME_FORMAT, GST_TIME_ARGS(timestamp));
         }
 
         // Monotonic frame counter so downstream can detect drops. Only the

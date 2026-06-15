@@ -14,7 +14,8 @@
  *        MOCK_UVC_DEVICE_COUNT   integer, devices uvc_find_devices() exposes (default 1)
  *        MOCK_UVC_MAX_FRAMES     integer, frames the feeder delivers then stops (default 0 = until stop)
  *        MOCK_UVC_FRAME_FORMAT   "H264" | "H265" (default H264)
- *        MOCK_UVC_FRAME_MODE     "valid" | "oversized_sps" | "disconnect" (default valid)
+ *        MOCK_UVC_FRAME_MODE     "valid" | "oversized_sps" | "oversized_vps" | "disconnect" (default valid)
+ *        MOCK_UVC_OPEN_FAIL_AFTER integer, succeed this many uvc_open() calls then fail the rest (default -1 = never)
  *   Environment variables, when present, win over the programmatic setters.
  */
 
@@ -36,6 +37,11 @@ typedef enum {
   /* An SPS NAL larger than SPSPPSBUFSZ (1024 B) to exercise the element's
    * fixed-size SPS/PPS copy buffers. For overflow-detection tests only. */
   MOCK_UVC_FRAME_OVERSIZED_SPS,
+  /* An H.265 VPS NAL larger than SPSPPSBUFSZ (1024 B). Mirrors OVERSIZED_SPS for
+   * the VPS copy path (frame_pipeline.c UNIT_VPS): the clamp must drop it with a
+   * warning instead of overflowing self->vps[SPSPPSBUFSZ]. H.265-only; pair it
+   * with MOCK_UVC_FRAME_FORMAT=H265. For overflow-detection tests only. */
+  MOCK_UVC_FRAME_OVERSIZED_VPS,
   /* Simulated cable pull: the feeder stops delivering frames and goes silent.
    * Real libuvc does NOT pass a NULL frame on disconnect in callback mode -
    * the callback simply stops being invoked (spike verdict, Task 4). */
@@ -60,6 +66,10 @@ typedef enum {
   /* An interval so long it rounds to 0 fps: the frame_interval computation in
    * negotiate() must not divide by zero. */
   MOCK_UVC_FORMAT_ZERO_FRAMERATE,
+  /* Width/height/interval taken from mock_uvc_set_geometry(): lets a test drive
+   * negotiate() at resolution/framerate extremes (1 fps, 120 fps, 320x240, 4K)
+   * and assert the caps and frame_interval math overflow-/SIGFPE-free. */
+  MOCK_UVC_FORMAT_CUSTOM_GEOMETRY,
 } mock_uvc_format_mode_t;
 
 /* Restore every mock knob to its default (1 device, H264, valid frames,
@@ -69,6 +79,12 @@ void mock_uvc_reset(void);
 
 /* Shape of the advertised format/frame descriptor; see mock_uvc_format_mode_t. */
 void mock_uvc_set_format_mode(mock_uvc_format_mode_t mode);
+
+/* Width/height (pixels) and device frame interval (100ns units) the next
+ * uvc_open() advertises when the format mode is MOCK_UVC_FORMAT_CUSTOM_GEOMETRY.
+ * A zero interval would itself be the ZERO_DEVICE_INTERVAL case, so callers pass
+ * a real interval (e.g. 10000000 for 1 fps, 83333 for 120 fps). */
+void mock_uvc_set_geometry(uint16_t width, uint16_t height, uint32_t interval);
 
 /* Number of devices the next uvc_find_devices()/uvc_open() will expose.
  * 0 makes uvc_find_devices() report UVC_ERROR_NO_DEVICE. */
@@ -122,6 +138,17 @@ int mock_uvc_frames_delivered(void);
  * cycles both counters reach N. */
 int mock_uvc_open_count(void);
 int mock_uvc_close_count(void);
+
+/* Allow this many successful uvc_open() calls, then fail every subsequent one
+ * with UVC_ERROR_NO_DEVICE (-1, the default, never fails). Set to 1 so the
+ * initial open succeeds but every reconnect reopen fails, driving the element's
+ * bounded-backoff retry loop to exhaustion (reconnect-exhaustion test, Task 8). */
+void mock_uvc_set_open_fail_after(int n);
+
+/* Total uvc_open() calls since reset that passed the param/refcount checks,
+ * counting both successes and injected failures. Lets the exhaustion test prove
+ * all RECONNECT_MAX_RETRIES reopen attempts ran (1 initial + N retries). */
+int mock_uvc_open_attempt_count(void);
 
 /* Device-list arrays handed out by uvc_find_devices() that have not yet been
  * released with uvc_free_device_list(). A correct caller leaves this at its

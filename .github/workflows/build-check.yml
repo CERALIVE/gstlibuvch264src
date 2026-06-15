@@ -42,6 +42,65 @@ jobs:
           echo "**Architecture:** ${{ matrix.config.arch }}" >> $GITHUB_STEP_SUMMARY
           echo "**Runner:** ${{ matrix.config.runner }}" >> $GITHUB_STEP_SUMMARY
 
+  fork-guard:
+    name: Fork pin + capability + source-list guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # The fork is PUBLIC (see libuvch264src/docs/notes/libuvc-fork-adr.md):
+      # the capability check clones CeraLive/libuvc with NO credentials. Only
+      # git + coreutils are needed — no build toolchain for these two checks.
+      - name: Source-list consistency (sources.txt vs build)
+        run: bash scripts/check-source-list.sh
+
+      - name: Fork pin integrity + capability presence
+        run: bash scripts/check-libuvc-fork.sh
+
+      - name: Guard Summary
+        if: always()
+        run: |
+          echo "## 🔒 Fork + source-list guard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '`check-source-list.sh` asserts sources.txt agrees with what CMake/Meson compile; `check-libuvc-fork.sh` asserts the pinned fork SHA matches the ADR and the fork carries UVC_FRAME_FORMAT_H265, the 0x0150 UVC 1.5 case, and the LIBUVC_AUTO_DETACH_KERNEL_DRIVER option (capability-presence, not upstream-drift). The fork clone uses no credentials.' >> $GITHUB_STEP_SUMMARY
+
+  reproducibility:
+    name: Plugin .so build reproducibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build + GStreamer dev dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git \
+            patch \
+            pkg-config \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libjpeg-dev \
+            libusb-1.0-0-dev \
+            binutils
+
+      # Builds libgstlibuvch264src.so twice from the same pinned fork SHA and
+      # compares sha256sums. Exits non-zero on real non-determinism; a build-id
+      # -only difference is normalized (strip + drop .note.gnu.build-id) and
+      # reported as an explained, deterministic-modulo-build-id pass.
+      - name: Build .so twice + compare sha256
+        run: bash scripts/check-reproducibility.sh
+
+      - name: Reproducibility Summary
+        if: always()
+        run: |
+          echo "## ♻️ Build reproducibility" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '`check-reproducibility.sh` built the plugin .so twice and compared sha256sums to confirm a deterministic build (raw match, or byte-identical after normalizing the linker .note.gnu.build-id).' >> $GITHUB_STEP_SUMMARY
+
   functional-test:
     name: Functional suite + TSan/ASAN (ctest)
     runs-on: ubuntu-latest

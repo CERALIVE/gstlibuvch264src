@@ -1,0 +1,6 @@
+gstlibuvch264src.c
+uvc_device.c
+frame_pipeline.c
+ptz_control.c
+spspps_cache.c
+gstlibuvch264src_error.c

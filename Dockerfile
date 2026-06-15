@@ -28,29 +28,32 @@ RUN apt-get update && apt-get install -y \
 # Copy plugin sources and patches into the image
 COPY . /app
 
-# Build and install libuvc from upstream v0.0.7 with the H265 and UVC 1.5
-# patches applied. Stock libuvc lacks UVC_FRAME_FORMAT_H265 (required by the
-# plugin's H265 codepaths) and predates UVC 1.5 header parsing and the
-# libusb auto-detach call needed to claim devices bound to the uvcvideo
-# kernel driver.
-WORKDIR /app/libuvc-build
-# Pinned to the exact commit the v0.0.7 tag pointed to (tags are mutable; a SHA
-# is not). Shallow-fetch the single commit. Keep in sync with CMakeLists.txt.
-RUN git init -q . && \
-	git remote add origin https://github.com/libuvc/libuvc.git && \
-	git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b && \
-	git checkout -q FETCH_HEAD && \
-	patch -p1 < /app/patches/uvc15-support.patch && \
-	patch -p1 < /app/patches/libuvc-h265-support.patch && \
-	cmake . \
-		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DBUILD_SHARED_LIBS=ON \
-		-DBUILD_EXAMPLE=OFF \
-		-DBUILD_TEST=OFF && \
-	make -j"$(nproc)" && \
-	make install && \
-	ldconfig
+# Build and install libuvc via the single-source build script
+# (scripts/build-libuvc.sh) so the pinned SHAs, the CMake options, and the
+# fallback patch steps live in exactly ONE place, shared verbatim with the test
+# build in CMakeLists.txt. The plugin needs UVC_FRAME_FORMAT_H265 (absent from
+# stock libuvc), UVC 1.5 header parsing, and the libusb auto-detach call needed
+# to claim devices bound to the uvcvideo kernel driver — all carried by the fork.
+#
+# Source selected by the LIBUVC_USE_FORK build arg (see the ADR at
+# libuvch264src/docs/notes/libuvc-fork-adr.md):
+#
+#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.1 SHA. The
+#                three changes are commits on the fork, so NO patch(1) step runs.
+#   0 (rollback): upstream v0.0.7 at its pinned SHA + the UVC 1.5 / H.265 patches
+#                from patches/ (the pre-fork path). Build with
+#                `docker build --build-arg LIBUVC_USE_FORK=0 ...` to use it.
+#
+# The script owns the SHAs, the git-init/fetch/checkout idiom, the patch steps,
+# and the CMake options; here it installs into /usr/local and runs ldconfig.
+WORKDIR /app
+ARG LIBUVC_USE_FORK=1
+RUN if [ "${LIBUVC_USE_FORK}" = "1" ]; then _mode=fork; else _mode=upstream; fi && \
+	bash scripts/build-libuvc.sh \
+		--mode="${_mode}" \
+		--prefix=/usr/local \
+		--src-dir=/app/libuvc-build \
+		--ldconfig
 
 # Build and install libuvch264src
 WORKDIR /app
@@ -67,6 +70,12 @@ FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae
 ARG TARGETARCH
 
 # Install runtime dependencies (GStreamer)
+# TODO(libjpeg runtime gap): libuvc is built with libjpeg-dev present in the
+# build stage, so libuvc.so* carries a DT_NEEDED on libjpeg.so.8 — but this
+# runtime stage does not install libjpeg, so loading the plugin here would fail
+# on a missing libjpeg.so.8. Out of scope for Task 22 (build unification); add
+# `libjpeg-turbo8` (or build libuvc without JPEG) in a follow-up before relying
+# on this runtime image.
 RUN apt-get update && apt-get install -y \
 	libgstreamer1.0-0 \
 	libgstreamer-plugins-base1.0-0 \
@@ -89,6 +98,9 @@ RUN GNUARCH=$(case "${TARGETARCH}" in \
 # installs the plugin under /usr/local/lib/<triplet>/gstreamer-1.0/ and libuvc
 # installs flat under /usr/local/lib/; relocate both under /usr/lib/<triplet>/
 # while preserving the libgstlibuvch264src.so / libuvc.so* file names.
+# TODO(Task 22): unify with scripts/build-libuvc.sh --prefix option so the
+# install prefix is set once at meson setup time and this manual relocation
+# (and the matching copy in CMakeLists.txt) can be dropped.
 COPY --from=build /usr/local/lib/*/gstreamer-1.0/libgstlibuvch264src.so /tmp/stage/
 COPY --from=build /usr/local/lib/libuvc.* /tmp/stage/
 RUN GNUARCH=$(cat /tmp/gnuarch) && \

@@ -16,6 +16,17 @@
  *                                  1e9 / framerate division (H4).
  *   test_negotiate_zero_interval   a zero device frame interval must not SIGFPE
  *                                  on the 1e7 / interval division (H4).
+ *
+ * Extremes (Task 10): a descriptor at the corners of the resolution/framerate
+ * space (1 fps, 120 fps, 320x240, 4K) must negotiate without integer overflow in
+ * the wWidth*wHeight caps math or SIGFPE in the 1e9/framerate frame_interval
+ * division - it either selects that valid descriptor and streams, or fails
+ * loudly on the bus. The bad outcome these guard against is a silent zero: no
+ * frames AND no error.
+ *   test_negotiate_extreme_fps_low    1 fps   (interval 1e7 100ns units)
+ *   test_negotiate_extreme_fps_high   120 fps (interval 83333)
+ *   test_negotiate_extreme_res_low    320x240
+ *   test_negotiate_extreme_res_high   3840x2160 (4K)
  */
 
 #include <gst/check/gstcheck.h>
@@ -240,6 +251,96 @@ GST_START_TEST (test_negotiate_zero_interval)
 
 GST_END_TEST;
 
+/* Drive PLAYING against a CUSTOM_GEOMETRY descriptor and assert the negotiation
+ * made progress without crashing: either a buffer flowed (valid descriptor
+ * selected) or a bus ERROR was posted (loud failure). Reaching this assertion at
+ * all proves no SIGFPE/overflow aborted the streaming task; the assertion itself
+ * rules out the silent-zero outcome (no frame, no error). label names the case in
+ * the failure message. */
+static void
+play_and_assert_progress (GstElement * pipeline, const gchar * label)
+{
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  GstPad *pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, NULL,
+      NULL);
+  gst_object_unref (pad);
+  gst_object_unref (sink);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING) !=
+      GST_STATE_CHANGE_FAILURE, "%s: could not set pipeline to PLAYING", label);
+
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gboolean got_error = FALSE;
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    if (g_atomic_int_get (&g_buffers_seen) > 0)
+      break;
+    GstMessage *msg =
+        gst_bus_timed_pop_filtered (bus, 50 * GST_MSECOND, GST_MESSAGE_ERROR);
+    if (msg != NULL) {
+      got_error = TRUE;
+      gst_message_unref (msg);
+      break;
+    }
+  }
+  gst_object_unref (bus);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  fail_unless (g_atomic_int_get (&g_buffers_seen) > 0 || got_error,
+      "%s: negotiation produced neither a frame nor a loud error (silent zero)",
+      label);
+}
+
+GST_START_TEST (test_negotiate_extreme_fps_low)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_CUSTOM_GEOMETRY);
+  mock_uvc_set_geometry (1920, 1080, 10000000); /* 1e7 100ns units -> 1 fps */
+
+  GstElement *pipeline = build_pipeline ();
+  play_and_assert_progress (pipeline, "1 fps");
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_negotiate_extreme_fps_high)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_CUSTOM_GEOMETRY);
+  mock_uvc_set_geometry (1920, 1080, 83333); /* ~120 fps */
+
+  GstElement *pipeline = build_pipeline ();
+  play_and_assert_progress (pipeline, "120 fps");
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_negotiate_extreme_res_low)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_CUSTOM_GEOMETRY);
+  mock_uvc_set_geometry (320, 240, 333333); /* QVGA @ 30 fps */
+
+  GstElement *pipeline = build_pipeline ();
+  play_and_assert_progress (pipeline, "320x240");
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_negotiate_extreme_res_high)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_CUSTOM_GEOMETRY);
+  mock_uvc_set_geometry (3840, 2160, 333333); /* 4K @ 30 fps */
+
+  GstElement *pipeline = build_pipeline ();
+  play_and_assert_progress (pipeline, "3840x2160");
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
 static Suite *
 negotiate_suite (void)
 {
@@ -254,6 +355,10 @@ negotiate_suite (void)
   tcase_add_test (tc, test_negotiate_zero_format);
   tcase_add_test (tc, test_negotiate_framerate_zero);
   tcase_add_test (tc, test_negotiate_zero_interval);
+  tcase_add_test (tc, test_negotiate_extreme_fps_low);
+  tcase_add_test (tc, test_negotiate_extreme_fps_high);
+  tcase_add_test (tc, test_negotiate_extreme_res_low);
+  tcase_add_test (tc, test_negotiate_extreme_res_high);
 
   return s;
 }

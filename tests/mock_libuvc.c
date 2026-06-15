@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -93,10 +94,24 @@ static enum uvc_frame_format g_frame_format = UVC_FRAME_FORMAT_H264;
 static mock_uvc_frame_mode_t g_frame_mode = MOCK_UVC_FRAME_VALID;
 static mock_uvc_format_mode_t g_format_mode = MOCK_UVC_FORMAT_NORMAL;
 static int g_max_frames = 0; /* 0 = until uvc_stop_streaming() */
+static int g_frame_interval_us = 2000; /* feeder inter-frame sleep; controllable cadence */
+
+/* Geometry advertised under MOCK_UVC_FORMAT_CUSTOM_GEOMETRY (default 1080p30). */
+static uint16_t g_geom_width = 1920;
+static uint16_t g_geom_height = 1080;
+static uint32_t g_geom_interval = 333333;
+
 static int g_frames_delivered = 0;
 static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed */
 static int g_uvc_open_count = 0;  /* successful uvc_open() calls */
 static int g_uvc_close_count = 0; /* uvc_close() calls on a live handle */
+
+/* Open-failure injection (Task 8). g_uvc_open_attempts counts every uvc_open()
+ * past the param/refcount checks (successes AND injected failures). After
+ * g_uvc_open_fail_after successful opens, every further open returns
+ * UVC_ERROR_NO_DEVICE; -1 (default) never fails. */
+static int g_uvc_open_attempts = 0;
+static int g_uvc_open_fail_after = -1;
 
 static int32_t g_pan_min = -180000, g_pan_max = 180000, g_pan_cur = 0;
 static int32_t g_tilt_min = -90000, g_tilt_max = 90000, g_tilt_cur = 0;
@@ -122,6 +137,8 @@ static void apply_env_overrides_locked(void) {
     g_device_count = atoi(s);
   if ((s = getenv("MOCK_UVC_MAX_FRAMES")) != NULL)
     g_max_frames = atoi(s);
+  if ((s = getenv("MOCK_UVC_OPEN_FAIL_AFTER")) != NULL)
+    g_uvc_open_fail_after = atoi(s);
   if ((s = getenv("MOCK_UVC_FRAME_FORMAT")) != NULL)
     g_frame_format = (strcmp(s, "H265") == 0 || strcmp(s, "h265") == 0)
                          ? UVC_FRAME_FORMAT_H265
@@ -129,6 +146,8 @@ static void apply_env_overrides_locked(void) {
   if ((s = getenv("MOCK_UVC_FRAME_MODE")) != NULL) {
     if (strcmp(s, "oversized_sps") == 0)
       g_frame_mode = MOCK_UVC_FRAME_OVERSIZED_SPS;
+    else if (strcmp(s, "oversized_vps") == 0)
+      g_frame_mode = MOCK_UVC_FRAME_OVERSIZED_VPS;
     else if (strcmp(s, "disconnect") == 0)
       g_frame_mode = MOCK_UVC_FRAME_DISCONNECT;
     else if (strcmp(s, "nonidr_lead") == 0)
@@ -136,6 +155,8 @@ static void apply_env_overrides_locked(void) {
     else
       g_frame_mode = MOCK_UVC_FRAME_VALID;
   }
+  if ((s = getenv("MOCK_UVC_FRAME_INTERVAL_US")) != NULL)
+    g_frame_interval_us = atoi(s);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -149,9 +170,15 @@ void mock_uvc_reset(void) {
   g_frame_mode = MOCK_UVC_FRAME_VALID;
   g_format_mode = MOCK_UVC_FORMAT_NORMAL;
   g_max_frames = 0;
+  g_frame_interval_us = 2000;
+  g_geom_width = 1920;
+  g_geom_height = 1080;
+  g_geom_interval = 333333;
   g_frames_delivered = 0;
   g_uvc_open_count = 0;
   g_uvc_close_count = 0;
+  g_uvc_open_attempts = 0;
+  g_uvc_open_fail_after = -1;
   g_pan_min = -180000; g_pan_max = 180000; g_pan_cur = 0;
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
@@ -216,6 +243,14 @@ void mock_uvc_set_format_mode(mock_uvc_format_mode_t mode) {
   pthread_mutex_unlock(&g_lock);
 }
 
+void mock_uvc_set_geometry(uint16_t width, uint16_t height, uint32_t interval) {
+  pthread_mutex_lock(&g_lock);
+  g_geom_width = width;
+  g_geom_height = height;
+  g_geom_interval = interval;
+  pthread_mutex_unlock(&g_lock);
+}
+
 void mock_uvc_set_max_frames(int max_frames) {
   pthread_mutex_lock(&g_lock);
   g_max_frames = max_frames;
@@ -273,6 +308,19 @@ int mock_uvc_close_count(void) {
   return n;
 }
 
+void mock_uvc_set_open_fail_after(int n) {
+  pthread_mutex_lock(&g_lock);
+  g_uvc_open_fail_after = n;
+  pthread_mutex_unlock(&g_lock);
+}
+
+int mock_uvc_open_attempt_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_uvc_open_attempts;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
 int mock_uvc_device_lists_outstanding(void) {
   pthread_mutex_lock(&g_lock);
   int n = g_device_lists_outstanding;
@@ -322,15 +370,17 @@ static size_t craft_access_unit(uint8_t *buf, enum uvc_frame_format fmt,
       return append_nal_h265(buf, 1, 48); /* TRAIL non-IDR slice */
     return append_nal_h264(buf, 1, 48);   /* non-IDR slice */
   }
-  /* OVERSIZED_SPS overflows the element's fixed 1024 B SPS buffer. The payload
-   * must exceed the whole SPS+PPS+control tail of the instance struct so an
-   * unclamped copy runs off the END of the GObject allocation (where ASan's
-   * redzone lives), not merely into the adjacent pps[] field - an intra-object
-   * spill ASan cannot see. 4096 clears that >2 KB tail with margin. */
+  /* OVERSIZED_SPS / OVERSIZED_VPS overflow the element's fixed 1024 B SPS / VPS
+   * buffers. The payload must exceed the whole sps/pps/vps + control tail of the
+   * instance struct so an unclamped copy runs off the END of the GObject
+   * allocation (where ASan's redzone lives), not merely into an adjacent field -
+   * an intra-object spill ASan cannot see. 4096 clears that >2 KB tail with
+   * margin. OVERSIZED_VPS is H.265-only (VPS exists only in H.265). */
   size_t sps_payload = (mode == MOCK_UVC_FRAME_OVERSIZED_SPS) ? 4096 : 12;
+  size_t vps_payload = (mode == MOCK_UVC_FRAME_OVERSIZED_VPS) ? 4096 : 8;
 
   if (fmt == UVC_FRAME_FORMAT_H265) {
-    n += append_nal_h265(buf + n, 32, 8);            /* VPS */
+    n += append_nal_h265(buf + n, 32, vps_payload);  /* VPS */
     n += append_nal_h265(buf + n, 33, sps_payload);  /* SPS */
     n += append_nal_h265(buf + n, 34, 8);            /* PPS */
     n += append_nal_h265(buf + n, 20, 48);           /* IDR_W_RADL */
@@ -353,7 +403,38 @@ static void *feeder_main(void *arg) {
   enum uvc_frame_format fmt = g_frame_format;
   mock_uvc_frame_mode_t mode = g_frame_mode;
   int max_frames = g_max_frames;
+  int frame_interval_us = g_frame_interval_us;
   pthread_mutex_unlock(&g_lock);
+
+  /* Real-bitstream replay (env MOCK_UVC_ES_FILE): load one Annex-B access unit
+   * from disk and feed it verbatim on every callback instead of the crafted
+   * zero-filled NALs. The crafted units are fine for tests that terminate at
+   * `... ! fakesink`, but a real downstream parser (h264parse before mpegtsmux)
+   * rejects the zero-filled SPS as a broken bit stream. Pointing this at a tiny
+   * encoder-produced IDR (SPS+PPS+IDR) lets the element drive the real
+   * cerastream mux topology end to end. Off by default: when the env is unset
+   * es_buf stays NULL and the crafted path below is unchanged. */
+  uint8_t *es_buf = NULL;
+  size_t es_len = 0;
+  const char *es_file = getenv("MOCK_UVC_ES_FILE");
+  if (es_file != NULL && *es_file != '\0') {
+    FILE *f = fopen(es_file, "rb");
+    if (f != NULL) {
+      fseek(f, 0, SEEK_END);
+      long sz = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (sz > 0) {
+        es_buf = malloc((size_t)sz);
+        if (es_buf != NULL && fread(es_buf, 1, (size_t)sz, f) == (size_t)sz) {
+          es_len = (size_t)sz;
+        } else {
+          free(es_buf);
+          es_buf = NULL;
+        }
+      }
+      fclose(f);
+    }
+  }
 
   for (;;) {
     pthread_mutex_lock(&h->lock);
@@ -372,17 +453,26 @@ static void *feeder_main(void *arg) {
       break;
     }
 
-    size_t len = craft_access_unit(h->frame_buf, fmt, mode, delivered);
+    size_t len;
+    uint8_t *frame_data;
+    if (es_buf != NULL) {
+      frame_data = es_buf;
+      len = es_len;
+    } else {
+      len = craft_access_unit(h->frame_buf, fmt, mode, delivered);
+      frame_data = h->frame_buf;
+    }
 
     uvc_frame_t frame;
     memset(&frame, 0, sizeof(frame));
-    frame.data = h->frame_buf;
+    frame.data = frame_data;
     frame.data_bytes = len;
     frame.frame_format = fmt;
     frame.width = 1920;
     frame.height = 1080;
     frame.source = h;
     frame.library_owns_data = 1;
+    frame.sequence = (uint32_t)delivered;
 
     h->cb(&frame, h->user_ptr);
 
@@ -396,8 +486,9 @@ static void *feeder_main(void *arg) {
       break;
     }
 
-    usleep(2000); /* ~500 fps ceiling; consumption paces the real rate */
+    usleep(frame_interval_us); /* inter-frame cadence; MOCK_UVC_FRAME_INTERVAL_US */
   }
+  free(es_buf);
   return NULL;
 }
 
@@ -556,6 +647,17 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   if (dev->refcount <= 0)
     return UVC_ERROR_NO_DEVICE;
 
+  /* Injected open failure (Task 8): once g_uvc_open_fail_after successful opens
+   * have happened, fail every further open so the reconnect retry loop exhausts.
+   * Counted before the early return so attempts (incl. failures) are observable. */
+  pthread_mutex_lock(&g_lock);
+  g_uvc_open_attempts++;
+  bool inject_fail =
+      (g_uvc_open_fail_after >= 0 && g_uvc_open_count >= g_uvc_open_fail_after);
+  pthread_mutex_unlock(&g_lock);
+  if (inject_fail)
+    return UVC_ERROR_NO_DEVICE;
+
   uvc_device_handle_t *h = calloc(1, sizeof(*h));
   if (!h)
     return UVC_ERROR_NO_MEM;
@@ -571,6 +673,9 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   pthread_mutex_lock(&g_lock);
   enum uvc_frame_format fmt = g_frame_format;
   mock_uvc_format_mode_t format_mode = g_format_mode;
+  uint16_t geom_width = g_geom_width;
+  uint16_t geom_height = g_geom_height;
+  uint32_t geom_interval = g_geom_interval;
   pthread_mutex_unlock(&g_lock);
 
   /* One 1080p frame descriptor; its interval shape and fourcc vary by
@@ -595,6 +700,15 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
       h->frame_desc.intervals = h->intervals;
       h->frame_desc.dwMinFrameInterval = 20000000;
       h->frame_desc.dwMaxFrameInterval = 20000000;
+      break;
+    case MOCK_UVC_FORMAT_CUSTOM_GEOMETRY:
+      h->frame_desc.wWidth = geom_width;
+      h->frame_desc.wHeight = geom_height;
+      h->intervals[0] = geom_interval;
+      h->intervals[1] = 0;
+      h->frame_desc.intervals = h->intervals;
+      h->frame_desc.dwMinFrameInterval = geom_interval;
+      h->frame_desc.dwMaxFrameInterval = geom_interval;
       break;
     default:
       h->intervals[0] = 333333; /* 100ns units -> 30 fps */

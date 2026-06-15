@@ -199,7 +199,14 @@ sudo cp /usr/local/lib/libuvc.* /usr/lib/${MULTIARCH}/
 
 `$(gcc -print-multiarch)` resolves to `aarch64-linux-gnu` on arm64, `x86_64-linux-gnu` on amd64, etc. Do not hardcode the arch string.
 
-Rockchip decoder note: kernel 5.10 → `mppvideodec`; kernel 6.6 → `v4l2slh264dec`.
+Rockchip decoder/encoder reference:
+
+| Kernel | H.264 decoder | H.265 decoder | Encoder (both codecs) |
+|--------|---------------|---------------|-----------------------|
+| 5.10   | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
+| 6.6    | `v4l2slh264dec` | `v4l2slh265dec` | `mpph264enc` / `mpph265enc` |
+
+On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP layer. On kernel 6.6, the V4L2 stateless decoders are codec-specific.
 
 ### Reproducible Docker build
 

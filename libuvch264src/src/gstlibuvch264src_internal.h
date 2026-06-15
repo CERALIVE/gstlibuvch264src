@@ -26,8 +26,7 @@ struct _GstLibuvcH264Src {
   gint negotiated_width;
   gint negotiated_height;
   /* The framerate negotiate() resolved, kept so the opt-in reconnect path can
-   * re-run uvc_get_stream_ctrl_format_size() with the original geometry. Unlike
-   * frame_interval (mutated by the PTS estimator), this stays the negotiated value. */
+   * re-run uvc_get_stream_ctrl_format_size() with the original geometry. */
   gint negotiated_framerate;
   GAsyncQueue *frame_queue;
   gboolean streaming;
@@ -38,17 +37,24 @@ struct _GstLibuvcH264Src {
    * timeouts. Reset in start() and whenever a real frame arrives. */
   gint consecutive_timeouts;
   gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
+  /* Interruptible reconnect backoff (Task 7). The backoff between retries parks
+   * in g_cond_wait_until() on reconnect_cond; unlock() sets flushing and
+   * broadcasts the cond so a state change to NULL/PAUSED tears the element down
+   * promptly instead of waiting out the full (up to 16 s) backoff window.
+   * Initialised in init(), cleared in finalize(). */
+  GMutex reconnect_lock;
+  GCond reconnect_cond;
   GstClock *clock;
-  int64_t pts_offset_sum;
-  int64_t pts_stretch;
   GstClockTime base_time;
   GstClockTime prev_pts;
+  /* Nominal frame interval (1/fps in ns) resolved by negotiate() from the
+   * fixated caps framerate. Set once and never mutated while streaming (Option B
+   * stamps PTS = arrival running-time directly, with no interval estimator); read
+   * by the LATENCY query and stamped as GST_BUFFER_DURATION (always the nominal
+   * caps interval, never an inter-arrival delta). */
   gint64 frame_interval; // in ns
-  guint64 prev_int_ts;
-  gint frame_count;
-  /* Monotonic per-session output counter for GST_BUFFER_OFFSET. Distinct from
-   * frame_count, which is periodically reset by the PTS estimator and so is not
-   * monotonic. Reset in start(); only touched on the feeder thread. */
+  /* Monotonic per-session output counter for GST_BUFFER_OFFSET. Reset in
+   * start(); only touched on the feeder thread. */
   guint64 frame_offset;
   gboolean had_idr;
   gboolean send_sps_pps;
@@ -78,6 +84,19 @@ struct _GstLibuvcH264Src {
   gboolean pan_supported, tilt_supported, zoom_supported;
   gboolean ptz_supported;
 };
+
+/* Test seam for the reconnect backoff (Task 7). A hook is invoked at the start
+ * of every backoff interval with the attempt index and the nominal backoff
+ * seconds, and returns the microseconds to actually wait; returning 0 collapses
+ * the wall-clock wait so a test never sleeps the full 1+2+4+8+16 s. A NULL hook
+ * (production default) waits the full nominal backoff. The hook also lets a test
+ * record the interval sequence to assert the exponential 1,2,4,8,16 s schedule. */
+typedef gint64 (*GstLibuvcReconnectBackoffHook)(GstLibuvcH264Src *self,
+                                                gint attempt, guint backoff_s);
+void gst_libuvc_h264_src_set_reconnect_backoff_hook(
+    GstLibuvcReconnectBackoffHook hook);
+
+gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self);
 
 G_END_DECLS
 

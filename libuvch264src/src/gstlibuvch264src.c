@@ -63,6 +63,8 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
 static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
                                              GValue *value, GParamSpec *pspec);
 static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock);
+static GstStateChangeReturn gst_libuvc_h264_src_change_state(GstElement *element,
+                                                             GstStateChange transition);
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src);
@@ -147,6 +149,7 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
     gst_static_pad_template_get(&src_template));
 
   element_class->set_clock = gst_libuvc_h264_set_clock;
+  element_class->change_state = gst_libuvc_h264_src_change_state;
   base_src_class->start = gst_libuvc_h264_src_start;
   base_src_class->stop = gst_libuvc_h264_src_stop;
   base_src_class->unlock = gst_libuvc_h264_src_unlock;
@@ -177,6 +180,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->control_thread = NULL;
   self->control_running = FALSE;
   g_mutex_init(&self->control_mutex);
+  g_mutex_init(&self->reconnect_lock);
+  g_cond_init(&self->reconnect_cond);
 
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
   self->sps_length = sizeof(sps);
@@ -485,15 +490,35 @@ static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) 
 
   if (clock) {
     self->clock = gst_object_ref(clock);
+    /* Rebaseline: re-latch base_time and prev_pts on the next frame at the new
+       clock's running-time instead of clamping against a stale PTS. */
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
-    self->pts_offset_sum = 0;
-    self->pts_stretch = 0;
   }
 
   GST_OBJECT_UNLOCK(self);
 
   return GST_ELEMENT_CLASS(gst_libuvc_h264_src_parent_class)->set_clock(element, clock);
+}
+
+/* On PAUSED->PLAYING the pipeline (re)assigns the element's base_time without
+ * start() running (e.g. a pause/resume cycle that never passes through NULL), so
+ * the cached self->base_time and running PTS would otherwise be stale. Reset both
+ * latch sentinels here so the next frame re-latches the new running-time baseline
+ * (base_time) and is not clamped against the old PTS (prev_pts) by the
+ * frame_callback() monotonicity guard. Mirrors the set_clock() rebaseline. */
+static GstStateChangeReturn
+gst_libuvc_h264_src_change_state(GstElement *element, GstStateChange transition) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(element);
+
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_PLAYING) {
+    GST_OBJECT_LOCK(self);
+    self->base_time = G_MAXUINT64;
+    self->prev_pts = G_MAXUINT64;
+    GST_OBJECT_UNLOCK(self);
+  }
+
+  return GST_ELEMENT_CLASS(gst_libuvc_h264_src_parent_class)->change_state(element, transition);
 }
 
 /* The `index` property selects ONE device from the libuvc enumeration. It stays
@@ -660,15 +685,12 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
 
   // Reset per-session frame state so a restart never forwards stale non-IDR
   // frames (or a stale PTS baseline) before a fresh IDR re-establishes the
-  // stream. had_idr/send_sps_pps gate NAL forwarding in frame_callback(),
-  // frame_count/prev_int_ts seed the PTS interval estimator, and prev_pts/
-  // base_time use G_MAXUINT64 as the "latch on first frame" sentinel that
-  // frame_callback() and create() test for.
+  // stream. had_idr/send_sps_pps gate NAL forwarding in frame_callback(), and
+  // prev_pts/base_time use G_MAXUINT64 as the "latch on first frame" sentinel
+  // that frame_callback() and create() test for.
   self->had_idr = FALSE;
   self->send_sps_pps = FALSE;
-  self->frame_count = 0;
   self->frame_offset = 0;
-  self->prev_int_ts = 0;
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;
   self->consecutive_timeouts = 0;
@@ -852,6 +874,13 @@ static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src) {
   g_atomic_int_set(&self->flushing, 1);
   g_async_queue_push(self->frame_queue, FLUSH_SENTINEL);
 
+  // Wake a reconnect backoff parked in g_cond_wait_until() (Task 7). The flag is
+  // set before the broadcast and re-checked by the waiter under reconnect_lock,
+  // so the broadcast is serialised by the lock and no wakeup is lost.
+  g_mutex_lock(&self->reconnect_lock);
+  g_cond_broadcast(&self->reconnect_cond);
+  g_mutex_unlock(&self->reconnect_lock);
+
   return TRUE;
 }
 
@@ -874,6 +903,13 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
   return TRUE;
 }
 
+static GstLibuvcReconnectBackoffHook gst_libuvc_reconnect_backoff_hook = NULL;
+
+void gst_libuvc_h264_src_set_reconnect_backoff_hook(
+    GstLibuvcReconnectBackoffHook hook) {
+  gst_libuvc_reconnect_backoff_hook = hook;
+}
+
 /* Opt-in in-element reconnect (Task 18), gated on the Task 4 spike verdict.
  *
  * Runs on the streaming thread from inside create() after a sustained-silence
@@ -888,7 +924,7 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
  * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
  * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
  * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
-static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   GstLibuvcDeviceSelector selector = {0};
   const gchar *parse_err = NULL;
   if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
@@ -920,13 +956,27 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
 
   guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
   for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
-    // Interruptible backoff: bail at once if unlock() flagged a flush, so
-    // teardown never blocks for the full (up to 16 s) backoff window.
-    for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
-      if (g_atomic_int_get(&self->flushing)) {
-        return FALSE;
+    gint64 wait_us = (gint64) backoff_s * G_USEC_PER_SEC;
+    if (gst_libuvc_reconnect_backoff_hook != NULL) {
+      wait_us = gst_libuvc_reconnect_backoff_hook(self, attempt, backoff_s);
+    }
+
+    // Interruptible backoff: park in g_cond_wait_until() so unlock() (which sets
+    // flushing and broadcasts reconnect_cond) wakes us at once on a NULL/PAUSED
+    // transition instead of blocking for the full (up to 16 s) backoff window.
+    if (wait_us > 0) {
+      gint64 deadline = g_get_monotonic_time() + wait_us;
+      g_mutex_lock(&self->reconnect_lock);
+      while (!g_atomic_int_get(&self->flushing)) {
+        if (!g_cond_wait_until(&self->reconnect_cond, &self->reconnect_lock,
+                               deadline)) {
+          break;
+        }
       }
-      g_usleep(100 * 1000);
+      g_mutex_unlock(&self->reconnect_lock);
+    }
+    if (g_atomic_int_get(&self->flushing)) {
+      return FALSE;
     }
 
     GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
@@ -1006,8 +1056,6 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
   if (!self->streaming) {
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
-    self->pts_offset_sum = 0;
-    self->pts_stretch = 0;
 
     self->streaming = TRUE;
 
@@ -1107,6 +1155,8 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
     // Sole clear point for control_mutex (paired with g_mutex_init in init): the
     // control thread was already joined by stop() above, so this is race-free.
     g_mutex_clear(&self->control_mutex);
+    g_cond_clear(&self->reconnect_cond);
+    g_mutex_clear(&self->reconnect_lock);
 
     GST_DEBUG_OBJECT(self, "Libuvc source finalized");
 

@@ -53,7 +53,14 @@ count_buffers_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_OK;
 }
 
-GST_START_TEST (test_oversized_sps_is_clamped_no_overflow)
+/* Body shared by the oversized-SPS and oversized-VPS cases: the mock feeder mode
+ * (MOCK_UVC_FRAME_MODE) and codec (MOCK_UVC_FRAME_FORMAT) are selected per ctest
+ * case via the environment, so the element-side assertions are identical - drive
+ * the pipeline, prove the oversized NAL was dropped via the guarded warning path,
+ * that frames kept flowing to EOS, and (under ASan) that nothing overflowed.
+ * label names the NAL in failure messages. */
+static void
+run_oversized_clamp_check (const gchar * label)
 {
   g_atomic_int_set (&buffer_count, 0);
   g_atomic_int_set (&oversized_warning_seen, 0);
@@ -108,7 +115,7 @@ GST_START_TEST (test_oversized_sps_is_clamped_no_overflow)
     g_free (dbg);
   }
   fail_unless (msg != NULL,
-      "timed out waiting for EOS - the oversized SPS path likely crashed");
+      "timed out waiting for EOS - the oversized %s path likely crashed", label);
   fail_unless (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_EOS,
       "expected EOS, got %s", GST_MESSAGE_TYPE_NAME (msg));
   gst_message_unref (msg);
@@ -118,10 +125,22 @@ GST_START_TEST (test_oversized_sps_is_clamped_no_overflow)
   gst_object_unref (pipeline);
 
   fail_unless (g_atomic_int_get (&buffer_count) == N_BUFFERS,
-      "expected %d buffers after dropping the oversized SPS, got %d",
-      N_BUFFERS, g_atomic_int_get (&buffer_count));
+      "expected %d buffers after dropping the oversized %s, got %d",
+      N_BUFFERS, label, g_atomic_int_get (&buffer_count));
   fail_unless (g_atomic_int_get (&oversized_warning_seen) == 1,
-      "expected a GST_WARNING that the oversized SPS NAL was dropped");
+      "expected a GST_WARNING that the oversized %s NAL was dropped", label);
+}
+
+GST_START_TEST (test_oversized_sps_is_clamped_no_overflow)
+{
+  run_oversized_clamp_check ("SPS");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_oversized_vps_is_clamped_no_overflow)
+{
+  run_oversized_clamp_check ("VPS");
 }
 
 GST_END_TEST;
@@ -135,6 +154,7 @@ sps_bounds_suite (void)
   tcase_set_timeout (tc, 60);
   suite_add_tcase (s, tc);
   tcase_add_test (tc, test_oversized_sps_is_clamped_no_overflow);
+  tcase_add_test (tc, test_oversized_vps_is_clamped_no_overflow);
 
   return s;
 }

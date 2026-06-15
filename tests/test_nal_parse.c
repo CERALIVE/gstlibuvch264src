@@ -62,6 +62,38 @@ static gsize append_nal(unsigned char *buf, gsize pos, int sc_len,
     return pos;
 }
 
+/* H.265 NAL unit types (ITU-T H.265 Table 7-1). VPS/SPS/PPS sit in the 32..34
+   range that H.264 never reaches, and there are two IDR types - both keyframes. */
+#define H265_TRAIL_R    1   /* non-IDR slice */
+#define H265_IDR_W_RADL 19
+#define H265_IDR_N_LP   20
+#define H265_VPS        32
+#define H265_SPS        33
+#define H265_PPS        34
+
+/* The H.265 NAL header is TWO bytes (H.264's is one): the type is the 6 bits
+   nal_unit_type = (header[0] >> 1) & 0x3F. header[0] is the forbidden_zero_bit,
+   the 6 type bits, then the top bit of nuh_layer_id; header[1] carries the rest
+   of the layer id and nuh_temporal_id_plus1. The parser inspects only header[0]
+   for the type, so header[1] is just leading payload to it. */
+#define H265_NH0(type) ((unsigned char)(((type) & 0x3F) << 1))
+#define H265_NH1       0x01  /* layer 0, temporal_id_plus1 = 1; never zero */
+
+/* Append one Annex-B H.265 NAL: sc_len-byte start code, the 2-byte NAL header,
+   then `pay` bytes of 0xAB. No emitted byte (header or payload) is 0x00, so the
+   only start codes in the buffer are the ones placed here. Returns new pos. */
+static gsize append_nal_h265(unsigned char *buf, gsize pos, int sc_len,
+                             int nal_type, gsize pay) {
+    if (sc_len == 4) buf[pos++] = 0x00;
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x00;
+    buf[pos++] = 0x01;
+    buf[pos++] = H265_NH0(nal_type);
+    buf[pos++] = H265_NH1;
+    for (gsize k = 0; k < pay; k++) buf[pos++] = 0xAB;
+    return pos;
+}
+
 static int run_multislice(void) {
     enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H264;
 
@@ -282,9 +314,258 @@ static int run_bounds(void) {
     return g_failures;
 }
 
+/* The H.265 suites below mirror the H.264 ones one-for-one so the second codec
+   reaches parity: same multi-slice count proof, same 3-/4-byte start-code and
+   offset-shift coverage, same size_t bounds teeth under ASAN. The only shape
+   difference is the extra VPS NAL that leads every H.265 access unit and the
+   2-byte NAL header. */
+
+static int run_multislice_h265(void) {
+    enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H265;
+
+    /* One access unit: VPS + SPS + PPS + IDR + 12 non-IDR slices = 16 NAL units.
+       The leading VPS is the H.265-only parameter set; the IDR is IDR_W_RADL
+       (19), the type real encoders emit, which the parser must classify as a
+       keyframe just like H.264 type 5. */
+    gsize size = 0;
+    size += 4 + 2 + 8;            /* VPS */
+    size += 4 + 2 + 8;            /* SPS */
+    size += 4 + 2 + 4;            /* PPS */
+    size += 4 + 2 + 32;           /* IDR */
+    size += 12 * (4 + 2 + 16);    /* 12 non-IDR slices */
+    unsigned char *buf = g_malloc(size);
+
+    gsize pos = 0;
+    pos = append_nal_h265(buf, pos, 4, H265_VPS, 8);
+    pos = append_nal_h265(buf, pos, 4, H265_SPS, 8);
+    pos = append_nal_h265(buf, pos, 4, H265_PPS, 4);
+    pos = append_nal_h265(buf, pos, 4, H265_IDR_W_RADL, 32);
+    for (int s = 0; s < 12; s++)
+        pos = append_nal_h265(buf, pos, 4, H265_TRAIL_R, 16);
+    CHECK(pos == size, "h265 multislice buffer filled to its exact length");
+
+    gsize n = count_nal_units(fmt, buf, size);
+    CHECK(n == 16, "h265 count_nal_units returns all 16 units (VPS+SPS+PPS+IDR+12)");
+
+    nal_unit_t *units = g_new(nal_unit_t, n ? n : 1);
+    gsize c = parse_nal_units(fmt, units, n, buf, size);
+    CHECK(c == 16, "h265 parse_nal_units delivers all 16 units when sized to the count");
+    CHECK(c >= 4 && units[0].type == UNIT_VPS, "h265 unit 0 is VPS");
+    CHECK(c >= 4 && units[1].type == UNIT_SPS, "h265 unit 1 is SPS");
+    CHECK(c >= 4 && units[2].type == UNIT_PPS, "h265 unit 2 is PPS");
+    CHECK(c >= 4 && units[3].type == UNIT_FRAME_IDR, "h265 unit 3 is IDR (IDR_W_RADL)");
+
+    int all_nonidr = (c == 16);
+    for (gsize i = 4; i < c; i++)
+        if (units[i].type != UNIT_FRAME_NON_IDR) all_nonidr = 0;
+    CHECK(all_nonidr, "h265 units 4..15 are all non-IDR slices (none dropped)");
+
+    /* The unit spans must tile the whole buffer with no gaps or overruns. */
+    gsize sum = 0;
+    for (gsize i = 0; i < c; i++) sum += units[i].len;
+    CHECK(sum == size, "h265 unit lengths tile the whole buffer exactly");
+    CHECK(c > 0 && units[c - 1].ptr + units[c - 1].len == buf + size,
+          "h265 last unit reaches the end of the buffer");
+
+    /* A caller-supplied small max still caps - proving the count is the real fix. */
+    nal_unit_t capped[10];
+    gsize cc = parse_nal_units(fmt, capped, 10, buf, size);
+    CHECK(cc == 10, "h265 a small max caps at 10, yet count_nal_units reported 16");
+
+    g_free(units);
+    g_free(buf);
+    return g_failures;
+}
+
+static int run_startcode_h265(void) {
+    enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H265;
+
+    /* (a) 3-byte start codes only must parse just like 4-byte ones. */
+    {
+        gsize size = (3 + 2 + 8) + (3 + 2 + 8) + (3 + 2 + 4) + (3 + 2 + 32);
+        unsigned char *buf = g_malloc(size);
+        gsize pos = 0;
+        pos = append_nal_h265(buf, pos, 3, H265_VPS, 8);
+        pos = append_nal_h265(buf, pos, 3, H265_SPS, 8);
+        pos = append_nal_h265(buf, pos, 3, H265_PPS, 4);
+        pos = append_nal_h265(buf, pos, 3, H265_IDR_N_LP, 32);
+        CHECK(pos == size, "h265 startcode(a): buffer filled exactly");
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 4, "h265 3-byte start codes: all 4 units found");
+        nal_unit_t u[4];
+        gsize c = parse_nal_units(fmt, u, 4, buf, size);
+        CHECK(c == 4 && u[0].type == UNIT_VPS && u[1].type == UNIT_SPS &&
+              u[2].type == UNIT_PPS && u[3].type == UNIT_FRAME_IDR,
+              "h265 3-byte start codes: types parsed correctly");
+        g_free(buf);
+    }
+
+    /* (b) A frame that does not begin at offset 0 (leading junk before the
+       first start code) must be found, not dropped. */
+    {
+        gsize junk = 6;
+        gsize size = junk + (4 + 2 + 8) + (4 + 2 + 16);
+        unsigned char *buf = g_malloc(size);
+        gsize pos = 0;
+        for (gsize k = 0; k < junk; k++) buf[pos++] = 0xFF;  /* no 00 00 01 here */
+        gsize first_sc = pos;
+        pos = append_nal_h265(buf, pos, 4, H265_VPS, 8);
+        pos = append_nal_h265(buf, pos, 4, H265_IDR_W_RADL, 16);
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 2, "h265 offset-shifted frame: units found despite leading junk");
+        nal_unit_t u[2];
+        gsize c = parse_nal_units(fmt, u, 2, buf, size);
+        CHECK(c == 2, "h265 offset-shifted frame: parsed, not dropped");
+        CHECK(c == 2 && u[0].ptr == buf + first_sc,
+              "h265 first unit begins at the start code, not at offset 0");
+        CHECK(c == 2 && u[0].type == UNIT_VPS && u[1].type == UNIT_FRAME_IDR,
+              "h265 offset-shifted frame: types parsed correctly");
+        g_free(buf);
+    }
+
+    /* (c) A 3-byte start code sitting immediately after a 4-byte one must not be
+       skipped (advance-by-start-code-length, not a fixed offset). */
+    {
+        gsize size = (4 + 2 + 8) + (3 + 2 + 4) + (4 + 2 + 16);
+        unsigned char *buf = g_malloc(size);
+        gsize pos = 0;
+        pos = append_nal_h265(buf, pos, 4, H265_SPS, 8);
+        pos = append_nal_h265(buf, pos, 3, H265_PPS, 4);
+        pos = append_nal_h265(buf, pos, 4, H265_IDR_W_RADL, 16);
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 3, "h265 mixed 3+4-byte start codes: all 3 units found");
+        nal_unit_t u[3];
+        gsize c = parse_nal_units(fmt, u, 3, buf, size);
+        CHECK(c == 3 && u[0].type == UNIT_SPS && u[1].type == UNIT_PPS &&
+              u[2].type == UNIT_FRAME_IDR,
+              "h265 mixed start codes: types parsed correctly");
+        g_free(buf);
+    }
+
+    /* (d) find_nal_unit reports the start-code length for both forms, reading
+       the H.265 two-byte header to derive the type. */
+    {
+        unsigned char b4[8] = {0, 0, 0, 1, H265_NH0(H265_IDR_W_RADL), H265_NH1, 0xAB, 0xAB};
+        unsigned char b3[8] = {0, 0, 1, H265_NH0(H265_VPS), H265_NH1, 0xAB, 0xAB, 0xAB};
+        gsize off = 99, sc = 0;
+        int t = find_nal_unit(fmt, b4, sizeof(b4), 0, 1, &off, &sc);
+        CHECK(t == UNIT_FRAME_IDR && off == 0 && sc == 4,
+              "h265 find_nal_unit reports a 4-byte start code (sc_len == 4)");
+        off = 99;
+        sc = 0;
+        t = find_nal_unit(fmt, b3, sizeof(b3), 0, 1, &off, &sc);
+        CHECK(t == UNIT_VPS && off == 0 && sc == 3,
+              "h265 find_nal_unit reports a 3-byte start code (sc_len == 3)");
+    }
+
+    /* (e) Both IDR NAL types (IDR_W_RADL 19 and IDR_N_LP 20) must classify as a
+       keyframe. IDR_W_RADL is what real encoders emit; only mapping IDR_N_LP
+       left those keyframes as UNIT_INVALID, so this is the parity assertion. */
+    {
+        unsigned char w[8] = {0, 0, 0, 1, H265_NH0(H265_IDR_W_RADL), H265_NH1, 0xAB, 0xAB};
+        unsigned char l[8] = {0, 0, 0, 1, H265_NH0(H265_IDR_N_LP),   H265_NH1, 0xAB, 0xAB};
+        gsize off = 0, sc = 0;
+        int tw = find_nal_unit(fmt, w, sizeof(w), 0, 1, &off, &sc);
+        CHECK(tw == UNIT_FRAME_IDR, "h265 IDR_W_RADL (19) classifies as IDR");
+        off = 0;
+        sc = 0;
+        int tl = find_nal_unit(fmt, l, sizeof(l), 0, 1, &off, &sc);
+        CHECK(tl == UNIT_FRAME_IDR, "h265 IDR_N_LP (20) classifies as IDR");
+    }
+
+    return g_failures;
+}
+
+static int run_bounds_h265(void) {
+    enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H265;
+
+    /* (a) A dangling 4-byte start code at the very end (no header byte) must not
+       trigger a read past the buffer while looking for the NAL header. */
+    {
+        gsize size = (4 + 2 + 3) + 4;
+        unsigned char *buf = g_malloc(size);
+        gsize pos = append_nal_h265(buf, 0, 4, H265_IDR_W_RADL, 3);
+        buf[pos++] = 0x00; buf[pos++] = 0x00; buf[pos++] = 0x00; buf[pos++] = 0x01;
+        CHECK(pos == size, "h265 bounds(a): buffer filled exactly");
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 1, "h265 bounds(a): dangling 4-byte start code is not a unit");
+        nal_unit_t u[4];
+        gsize c = parse_nal_units(fmt, u, 4, buf, size);
+        CHECK(c == 1 && u[0].type == UNIT_FRAME_IDR,
+              "h265 bounds(a): the one complete unit is parsed");
+        g_free(buf);
+    }
+
+    /* (b) A trailing partial start code (00 00) must not be over-read. */
+    {
+        gsize size = (4 + 2 + 4) + 2;
+        unsigned char *buf = g_malloc(size);
+        gsize pos = append_nal_h265(buf, 0, 4, H265_IDR_W_RADL, 4);
+        buf[pos++] = 0x00; buf[pos++] = 0x00;
+        CHECK(pos == size, "h265 bounds(b): buffer filled exactly");
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 1, "h265 bounds(b): trailing partial start code is not a unit");
+        g_free(buf);
+    }
+
+    /* (c) Buffers shorter than a minimal unit (and a zero-length buffer) must
+       never index into the buffer at all. */
+    {
+        unsigned char *b = g_malloc(3);
+        b[0] = 0x00; b[1] = 0x00; b[2] = 0x01;
+        CHECK(count_nal_units(fmt, b, 3) == 0, "h265 bounds(c): 3-byte buffer yields no unit");
+        gsize off = 0, sc = 0;
+        CHECK(find_nal_unit(fmt, b, 3, 0, 1, &off, &sc) == -1,
+              "h265 bounds(c): find_nal_unit on 3 bytes returns -1");
+        g_free(b);
+
+        unsigned char *z = g_malloc(1);
+        CHECK(count_nal_units(fmt, z, 0) == 0, "h265 bounds(c): zero-length buffer yields no unit");
+        g_free(z);
+    }
+
+    /* (d) One oversized merged NAL (payload far larger than the SPS/PPS clamp
+       limit). The parser must report the whole span as one unit without reading
+       past the exact-size allocation; the frame_callback clamp is what later
+       refuses to copy it, not the parser. */
+    {
+        gsize pay = 5000;             /* > SPSPPSBUFSZ (1024) */
+        gsize size = 4 + 2 + pay;
+        unsigned char *buf = g_malloc(size);
+        gsize pos = append_nal_h265(buf, 0, 4, H265_VPS, pay);
+        CHECK(pos == size, "h265 bounds(d): oversized buffer filled exactly");
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 1, "h265 bounds(d): one oversized merged unit counted");
+        nal_unit_t u[1];
+        gsize c = parse_nal_units(fmt, u, 1, buf, size);
+        CHECK(c == 1 && u[0].len == size,
+              "h265 bounds(d): oversized unit length spans the whole buffer");
+        CHECK(c == 1 && u[0].len > SPSPPSBUFSZ,
+              "h265 bounds(d): oversized unit exceeds the SPS/PPS clamp limit");
+        g_free(buf);
+    }
+
+    /* (e) A malformed separator (00 00 02, not a real start code) must not split
+       the unit, and its bytes must not be over-read. */
+    {
+        gsize size = (4 + 2 + 6) + 5;
+        unsigned char *buf = g_malloc(size);
+        gsize pos = append_nal_h265(buf, 0, 4, H265_IDR_W_RADL, 6);
+        buf[pos++] = 0x00; buf[pos++] = 0x00; buf[pos++] = 0x02;
+        buf[pos++] = 0xAB; buf[pos++] = 0xAB;
+        CHECK(pos == size, "h265 bounds(e): buffer filled exactly");
+        gsize n = count_nal_units(fmt, buf, size);
+        CHECK(n == 1, "h265 bounds(e): malformed separator does not split the unit");
+        g_free(buf);
+    }
+
+    return g_failures;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <multislice|startcode|bounds>\n", argv[0]);
+        fprintf(stderr, "usage: %s <multislice|startcode|bounds|"
+                        "multislice_h265|startcode_h265|bounds_h265>\n", argv[0]);
         return 2;
     }
 
@@ -298,6 +579,15 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "bounds") == 0) {
         printf("nal_parse bounds:\n");
         failures = run_bounds();
+    } else if (strcmp(argv[1], "multislice_h265") == 0) {
+        printf("nal_parse multislice_h265:\n");
+        failures = run_multislice_h265();
+    } else if (strcmp(argv[1], "startcode_h265") == 0) {
+        printf("nal_parse startcode_h265:\n");
+        failures = run_startcode_h265();
+    } else if (strcmp(argv[1], "bounds_h265") == 0) {
+        printf("nal_parse bounds_h265:\n");
+        failures = run_bounds_h265();
     } else {
         fprintf(stderr, "unknown suite: %s\n", argv[1]);
         return 2;
