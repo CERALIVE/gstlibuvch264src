@@ -41,7 +41,31 @@ gst-launch-1.0 libuvch264src index=0 control-socket=true \
 # Read the resolved socket path back via g_object_get("control-socket-path")
 ```
 
-Rockchip decoder: kernel 5.10 → `mppvideodec`; kernel 6.6 → `v4l2slh264dec`.
+### Rockchip decoder/encoder reference
+
+| Kernel | H.264 decoder | H.265 decoder | Encoder (both codecs) |
+|--------|---------------|---------------|-----------------------|
+| 5.10   | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
+| 6.6    | `v4l2slh264dec` | `v4l2slh265dec` | `mpph264enc` / `mpph265enc` |
+
+On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP layer. On kernel 6.6, the V4L2 stateless decoders are codec-specific.
+
+### A/V-sync note (guidance only — no change to this element)
+
+This element stamps PTS as pipeline running-time (Option B). Residual A/V drift with a Bluetooth microphone is a downstream concern — the BT clock runs independently of the pipeline clock. Recommendation: add `audioresample` in the audio branch of cerastream to absorb BT clock drift. Optionally, clock-slave the audio source to the pipeline master clock. Neither change belongs in this element.
+
+### Control socket: reading back the resolved path
+
+After the element reaches `PAUSED`, read the resolved socket path in C:
+
+```c
+gchar *path = NULL;
+g_object_get(src, "control-socket-path", &path, NULL);
+/* use path, then: */
+g_free(path);
+```
+
+Or from a `gst-launch-1.0` pipeline, inspect the property after the pipeline reaches PAUSED state. The path follows the pattern `$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock`.
 
 ---
 
