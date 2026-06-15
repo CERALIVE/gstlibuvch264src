@@ -219,6 +219,7 @@ target_include_directories(test_cache PRIVATE
 
 add_test(NAME cache_path_safety COMMAND test_cache path)
 add_test(NAME cache_resolution_key COMMAND test_cache key)
+add_test(NAME cache_selector_key COMMAND test_cache selector)
 
 # -----------------------------------------------------------------------------
 # Mock streaming harness.
@@ -1364,3 +1365,35 @@ if(FFPROBE_EXECUTABLE AND BASH_EXECUTABLE)
 else()
   message(STATUS "av_mux_jitter QA disabled (ffprobe or bash not found)")
 endif()
+
+# -----------------------------------------------------------------------------
+# Compatibility regression suite (Task 5).
+#
+# The DURABLE guardrail for the libuvc/GStreamer compatibility boundary. Same
+# single-executable, statically-registered shape as test_negotiate so the
+# element TUs, the libuvc mock, and the driver link into ONE binary: the symbol
+# table in test_compat.c references the ~47-symbol libuvc/libusb contract whose
+# DECLARATIONS come from the real <libuvc/libuvc.h> + <libusb-1.0/libusb.h> on
+# the include path (uvc_* defined by the mock, libusb_* by the real libusb linked
+# below), so a future libuvc bump that drops/renames any symbol fails the BUILD
+# loudly here exactly as it would in the element TUs. The caps + pipeline-parse
+# cases then prove both factories register, the dual-codec pad template holds,
+# and the README-style fakesink pipelines negotiate video/x-h264 / video/x-h265
+# against the mock - kernel-independent (no decoder/encoder elements in graph).
+# -----------------------------------------------------------------------------
+add_static_gstcheck_exe(test_compat)
+
+# "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
+# The H.265 pipeline-parse case shapes the in-process mock via
+# mock_uvc_set_frame_format() in the test body, so no per-case env is needed.
+set(_compat_cases
+  "compat_api_surface:test_compat_api_surface"
+  "compat_caps_contract:test_compat_caps_contract"
+  "compat_pipeline_parse_h264:test_compat_pipeline_parse_h264"
+  "compat_pipeline_parse_h265:test_compat_pipeline_parse_h265"
+)
+# The pipeline-parse cases enter PLAYING -> start(), which may spawn the control
+# thread, so keep them off the shared control-socket resource like the other
+# start()-driven suites (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_compat "compat"
+  "${STATIC_SUITE_SANITIZER}" "${_compat_cases}")
