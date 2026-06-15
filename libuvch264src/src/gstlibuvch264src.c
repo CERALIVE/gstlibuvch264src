@@ -528,6 +528,8 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     return FALSE;
   }
 
+  gst_libuvc_h264_src_v4l2_probe(GST_ELEMENT(self), (int)device_ordinal);
+
   // Probe PTZ ranges so only axes the device actually exposes are driven (M6).
   gst_libuvc_h264_src_ptz_probe_capabilities(self);
 

@@ -902,3 +902,49 @@ foreach(_case ${_pts_monotonic_cases})
     TIMEOUT 120
   )
 endforeach()
+
+# -----------------------------------------------------------------------------
+# V4L2 capability probe tests (Task 23).
+#
+# Compiles uvc_device.c directly into the test executable (no plugin .so, no
+# mock) and calls gst_libuvc_h264_src_v4l2_probe() with indices guaranteed
+# absent on any CI host. Verifies the probe is non-fatal and does not crash
+# regardless of whether a real /dev/videoN node exists.
+# -----------------------------------------------------------------------------
+add_executable(test_v4l2_probe
+  test_v4l2_probe.c
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src/uvc_device.c
+)
+target_include_directories(test_v4l2_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_v4l2_probe PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::LIBUSB
+  ${LIBUVC_LINK_TARGET}
+)
+
+set(_probe_env
+  "GST_PLUGIN_SYSTEM_PATH="
+  "GST_REGISTRY=${CMAKE_BINARY_DIR}/v4l2probe-registry.bin"
+  "GST_REGISTRY_FORK=no"
+  "HOME=${CMAKE_BINARY_DIR}"
+)
+if(LIBUVC_RUNTIME_DIR)
+  list(APPEND _probe_env "LD_LIBRARY_PATH=${LIBUVC_RUNTIME_DIR}")
+endif()
+
+add_test(NAME v4l2_probe COMMAND test_v4l2_probe probe)
+set_tests_properties(v4l2_probe PROPERTIES
+  ENVIRONMENT "${_probe_env}"
+  TIMEOUT 30
+)
+
+add_test(NAME v4l2_probe_nonfatal COMMAND test_v4l2_probe nonfatal)
+set_tests_properties(v4l2_probe_nonfatal PROPERTIES
+  ENVIRONMENT "${_probe_env}"
+  TIMEOUT 30
+)
