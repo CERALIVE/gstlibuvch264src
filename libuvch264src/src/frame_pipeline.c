@@ -130,6 +130,33 @@ gsize parse_nal_units(enum uvc_frame_format format,
     return i;
 }
 
+/* Framerate-mismatch behavior (harden-v2 Task 9; Oracle Option B).
+ *
+ * The negotiated framerate (caps 1/fps, used for DURATION and the live-source
+ * latency report) is only a nominal contract with downstream. The device's real
+ * delivery cadence routinely differs from it: a "30 fps" camera may settle at
+ * ~24 fps, run jittery, or stall and burst. This element does NOT coerce the
+ * nominal cadence onto a non-conforming device. The policy is:
+ *
+ *   - PTS is stamped from the real running-time the frame arrived at
+ *     (ts = gst_clock_get_time(clock) - base_time, computed below), regardless
+ *     of the negotiated fps. A slow/fast/jittery device is reflected faithfully
+ *     in the timestamps instead of being snapped onto an idealized grid.
+ *   - DURATION stays the constant caps-derived 1/fps. It is a nominal hint, not
+ *     a measurement of the real inter-arrival delta, so it never tracks the
+ *     mismatched rate.
+ *   - The element never renegotiates caps and never drops or duplicates frames
+ *     to force the nominal cadence. Every delivered frame is forwarded exactly
+ *     once with a strictly monotonic GST_BUFFER_OFFSET, so downstream can still
+ *     detect real drops on the wire.
+ *   - A material, sustained divergence between the measured cadence and the
+ *     negotiated fps is surfaced once via a one-time GST_INFO/WARNING for
+ *     diagnostics; it does not change the stamping policy.
+ *
+ * Rationale: downstream (h264parse/mux/srt) wants honest arrival timing far more
+ * than a synthetic constant rate; rewriting PTS onto the nominal grid is what
+ * caused the historical skip/stall artifacts. Regression-guarded by
+ * tests/test_framerate_mismatch.c (and tests/test_pts_drift.c). */
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 

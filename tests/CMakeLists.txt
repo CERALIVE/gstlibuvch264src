@@ -1270,3 +1270,74 @@ add_pts_drift_variant("" "")
 if(ENABLE_SANITIZERS)
   add_pts_drift_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# Framerate-mismatch tolerance tests (Task 9, harden-v2).
+#
+# Same single-executable, statically-registered shape as test_pts_monotonic so
+# framerate_mismatch_pts can construct the element directly, install a
+# GstTestClock, and drive frame_callback()'s PTS arithmetic deterministically at
+# a cadence that differs from the negotiated framerate, while
+# framerate_mismatch_no_renegotiate drives a real PLAYING pipeline against the
+# mock feeder paced by MOCK_UVC_FRAME_INTERVAL_US.
+#
+#   framerate_mismatch_pts             negotiated 30 fps, frames injected at ~24
+#                                      fps: PTS tracks running-time within 5 ms,
+#                                      DURATION stays caps-derived (not the real
+#                                      cadence), OFFSET is a strict +1 sequence,
+#                                      no silent drops. RED under the estimator;
+#                                      green after Option B (Task 5).
+#   framerate_mismatch_no_renegotiate  the slower device must not trigger a caps
+#                                      renegotiation (exactly one CAPS event) or a
+#                                      silent drop over the streaming path.
+# -----------------------------------------------------------------------------
+add_executable(test_framerate_mismatch
+  test_framerate_mismatch.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_framerate_mismatch PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_framerate_mismatch PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+apply_sanitizer_flags(test_framerate_mismatch "${STATIC_SUITE_SANITIZER}")
+
+# "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
+# GST_CHECKS. The no-renegotiate case paces the mock feeder at ~24 fps
+# (1e6/24 us) via MOCK_UVC_FRAME_INTERVAL_US so the device delivers slower than
+# the advertised 30 fps - the mismatch under test.
+set(_framerate_mismatch_cases
+  "framerate_mismatch_pts:test_framerate_mismatch_pts:"
+  "framerate_mismatch_no_renegotiate:test_framerate_mismatch_no_renegotiate:MOCK_UVC_FRAME_INTERVAL_US=41667"
+)
+foreach(_case ${_framerate_mismatch_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+  list(GET _parts 2 _extraenv)
+
+  setup_gst_test_environment("framerate-mismatch-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_fm_env ${GST_TEST_ENV})
+  list(APPEND _fm_env "GST_CHECKS=${_testfn}")
+  if(NOT _extraenv STREQUAL "")
+    list(APPEND _fm_env "${_extraenv}")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_framerate_mismatch)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_fm_env}"
+    # framerate_mismatch_no_renegotiate enters PLAYING -> start(); keep both off
+    # the shared control-socket resource like the other start()-driven suites.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()
