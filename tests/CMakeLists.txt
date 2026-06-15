@@ -261,6 +261,7 @@ set(_device_select_cases
   "device_zero:test_device_zero"
   "index_validate:test_index_validate"
   "device_restart_leak:test_device_restart_leak"
+  "device_selector:test_device_selector"
 )
 foreach(_case ${_device_select_cases})
   string(REPLACE ":" ";" _parts ${_case})

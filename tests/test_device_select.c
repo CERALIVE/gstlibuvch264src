@@ -117,6 +117,11 @@ GST_START_TEST (test_index_validate)
     "-1",
     "12abc",
     "99999999999999999999",      /* overflows long -> ERANGE */
+    "zzzz:1234",                 /* vid:pid form, non-hex vendor */
+    "serial:",                   /* serial form, empty serial */
+    "bus:1",                     /* bus form, missing address */
+    "bus:x:y",                   /* bus form, non-numeric fields */
+    "bus:999:1",                 /* bus form, bus number > 255 */
   };
 
   for (gsize i = 0; i < G_N_ELEMENTS (bad); i++) {
@@ -183,6 +188,86 @@ GST_START_TEST (test_device_restart_leak)
 
 GST_END_TEST;
 
+/* Three mock devices with distinct descriptors so each selector form resolves to
+ * exactly one of them. */
+static void
+configure_three_devices (void)
+{
+  mock_uvc_reset ();
+  mock_uvc_set_device_count (3);
+  mock_uvc_set_device_descriptor (0, 0x1111, 0x1001, "CAM-A", 1, 5);
+  mock_uvc_set_device_descriptor (1, 0x2222, 0x2002, "CAM-B", 3, 7);
+  mock_uvc_set_device_descriptor (2, 0xabcd, 0x3003, "CAM-C", 2, 4);
+}
+
+/* Drive to PAUSED and report which enumerated device start() opened. Tears down
+ * to NULL before returning so a later fail_unless never longjmps past teardown
+ * (CK_FORK=no would otherwise leave a live element and hang to the timeout). */
+static int
+open_selected_device (GstElement * pipeline, gboolean * out_failed)
+{
+  GstStateChangeReturn sret = gst_element_set_state (pipeline, GST_STATE_PAUSED);
+  *out_failed = (sret == GST_STATE_CHANGE_FAILURE);
+  int opened = mock_uvc_opened_device_index ();
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  return opened;
+}
+
+GST_START_TEST (test_device_selector)
+{
+  const struct { const gchar *sel; int expect; } ok[] = {
+    { "0", 0 },                /* bare ordinal — cerastream's backward-compat path */
+    { "1", 1 },
+    { "2", 2 },
+    { "2222:2002", 1 },
+    { "abcd:3003", 2 },
+    { "ABCD:3003", 2 },        /* hex selector is case-insensitive */
+    { "serial:CAM-A", 0 },
+    { "serial:CAM-C", 2 },
+    { "bus:3:7", 1 },
+    { "bus:2:4", 2 },
+  };
+
+  for (gsize i = 0; i < G_N_ELEMENTS (ok); i++) {
+    configure_three_devices ();
+    GstElement *pipeline = build_pipeline (ok[i].sel);
+    gboolean failed = FALSE;
+    int opened = open_selected_device (pipeline, &failed);
+    gst_object_unref (pipeline);
+
+    fail_if (failed, "selector \"%s\": start() failed unexpectedly", ok[i].sel);
+    fail_unless (opened == ok[i].expect,
+        "selector \"%s\": opened device %d, expected %d", ok[i].sel, opened,
+        ok[i].expect);
+  }
+
+  /* A selector matching no enumerated device is a fatal RESOURCE/NOT_FOUND, not a
+   * silent fallback to device 0. */
+  const gchar *no_match[] = {
+    "5",
+    "9999:9999",
+    "2222:9999",               /* vid matches, pid does not */
+    "serial:NOPE",
+    "bus:9:9",
+  };
+
+  for (gsize i = 0; i < G_N_ELEMENTS (no_match); i++) {
+    configure_three_devices ();
+    GstElement *pipeline = build_pipeline (no_match[i]);
+    GError *gerr = expect_start_error (pipeline);
+    gboolean matched = g_error_matches (gerr, GST_RESOURCE_ERROR,
+        GST_RESOURCE_ERROR_NOT_FOUND);
+    g_clear_error (&gerr);
+    gst_element_set_state (pipeline, GST_STATE_NULL);
+    gst_object_unref (pipeline);
+
+    fail_unless (matched, "selector \"%s\": expected RESOURCE/NOT_FOUND",
+        no_match[i]);
+  }
+}
+
+GST_END_TEST;
+
 static Suite *
 device_select_suite (void)
 {
@@ -196,6 +281,7 @@ device_select_suite (void)
   tcase_add_test (tc, test_device_zero);
   tcase_add_test (tc, test_index_validate);
   tcase_add_test (tc, test_device_restart_leak);
+  tcase_add_test (tc, test_device_selector);
 
   return s;
 }

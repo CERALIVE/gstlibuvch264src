@@ -74,6 +74,20 @@ void mock_uvc_set_format_mode(mock_uvc_format_mode_t mode);
  * 0 makes uvc_find_devices() report UVC_ERROR_NO_DEVICE. */
 void mock_uvc_set_device_count(int count);
 
+/* Per-device USB descriptor the selector matchers read: vid/pid and serial via
+ * uvc_get_device_descriptor(), bus/addr via uvc_get_bus_number()/_address().
+ * idx is the device's position in the enumerated list (0-based). A NULL or empty
+ * serial makes uvc_get_device_descriptor() report serialNumber == NULL. Reset
+ * clears every slot to zero/none. */
+void mock_uvc_set_device_descriptor(int idx, uint16_t vid, uint16_t pid,
+                                    const char *serial, uint8_t bus,
+                                    uint8_t addr);
+
+/* Enumeration index of the device the last successful uvc_open() selected, or
+ * -1 if none has been opened since mock_uvc_reset(). Lets a selection test prove
+ * which device a given index selector resolved to. */
+int mock_uvc_opened_device_index(void);
+
 /* Pixel format the feeder crafts and uvc_get_format_descs() advertises. */
 void mock_uvc_set_frame_format(enum uvc_frame_format format);
 

@@ -103,6 +103,16 @@ static int32_t g_tilt_min = -90000, g_tilt_max = 90000, g_tilt_cur = 0;
 static uint16_t g_zoom_min = 0, g_zoom_max = 100, g_zoom_cur = 0;
 static bool g_ptz_supported = true; /* false -> uvc_*_abs() return NOT_SUPPORTED */
 
+/* Per-device USB descriptor, indexed by enumeration position; read back by the
+ * element's selector matchers via uvc_get_device_descriptor()/bus_number/
+ * device_address(). g_opened_device_index records which device uvc_open() took. */
+static uint16_t g_dev_vid[MOCK_MAX_DEVICES];
+static uint16_t g_dev_pid[MOCK_MAX_DEVICES];
+static char g_dev_serial[MOCK_MAX_DEVICES][64];
+static uint8_t g_dev_bus[MOCK_MAX_DEVICES];
+static uint8_t g_dev_addr[MOCK_MAX_DEVICES];
+static int g_opened_device_index = -1;
+
 /* Apply MOCK_UVC_* environment overrides. Idempotent: only touches a field when
  * its variable is set, so it never clobbers a programmatic setter. Call with
  * g_lock held. */
@@ -146,6 +156,12 @@ void mock_uvc_reset(void) {
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
   g_ptz_supported = true;
+  memset(g_dev_vid, 0, sizeof(g_dev_vid));
+  memset(g_dev_pid, 0, sizeof(g_dev_pid));
+  memset(g_dev_serial, 0, sizeof(g_dev_serial));
+  memset(g_dev_bus, 0, sizeof(g_dev_bus));
+  memset(g_dev_addr, 0, sizeof(g_dev_addr));
+  g_opened_device_index = -1;
   apply_env_overrides_locked();
   pthread_mutex_unlock(&g_lock);
 }
@@ -154,6 +170,32 @@ void mock_uvc_set_device_count(int count) {
   pthread_mutex_lock(&g_lock);
   g_device_count = count;
   pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_device_descriptor(int idx, uint16_t vid, uint16_t pid,
+                                    const char *serial, uint8_t bus,
+                                    uint8_t addr) {
+  if (idx < 0 || idx >= MOCK_MAX_DEVICES)
+    return;
+  pthread_mutex_lock(&g_lock);
+  g_dev_vid[idx] = vid;
+  g_dev_pid[idx] = pid;
+  if (serial != NULL) {
+    strncpy(g_dev_serial[idx], serial, sizeof(g_dev_serial[idx]) - 1);
+    g_dev_serial[idx][sizeof(g_dev_serial[idx]) - 1] = '\0';
+  } else {
+    g_dev_serial[idx][0] = '\0';
+  }
+  g_dev_bus[idx] = bus;
+  g_dev_addr[idx] = addr;
+  pthread_mutex_unlock(&g_lock);
+}
+
+int mock_uvc_opened_device_index(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_opened_device_index;
+  pthread_mutex_unlock(&g_lock);
+  return n;
 }
 
 void mock_uvc_set_frame_format(enum uvc_frame_format format) {
@@ -456,6 +498,56 @@ void uvc_free_device_list(uvc_device_t **list, uint8_t unref_devices) {
   pthread_mutex_unlock(&g_lock);
 }
 
+/* Models real libuvc: allocate a descriptor the caller releases with
+ * uvc_free_device_descriptor(). serialNumber is a heap copy (NULL when the
+ * device reports no serial), matching the lifetime the element's matcher frees. */
+uvc_error_t uvc_get_device_descriptor(uvc_device_t *dev,
+                                      uvc_device_descriptor_t **desc) {
+  if (!dev || !desc)
+    return UVC_ERROR_INVALID_PARAM;
+  uvc_device_descriptor_t *d = calloc(1, sizeof(*d));
+  if (!d)
+    return UVC_ERROR_NO_MEM;
+  pthread_mutex_lock(&g_lock);
+  int idx = dev->index;
+  if (idx >= 0 && idx < MOCK_MAX_DEVICES) {
+    d->idVendor = g_dev_vid[idx];
+    d->idProduct = g_dev_pid[idx];
+    if (g_dev_serial[idx][0] != '\0')
+      d->serialNumber = strdup(g_dev_serial[idx]);
+  }
+  pthread_mutex_unlock(&g_lock);
+  *desc = d;
+  return UVC_SUCCESS;
+}
+
+void uvc_free_device_descriptor(uvc_device_descriptor_t *desc) {
+  if (!desc)
+    return;
+  free((void *)desc->serialNumber);
+  free(desc);
+}
+
+uint8_t uvc_get_bus_number(uvc_device_t *dev) {
+  if (!dev)
+    return 0;
+  pthread_mutex_lock(&g_lock);
+  uint8_t b = (dev->index >= 0 && dev->index < MOCK_MAX_DEVICES)
+                  ? g_dev_bus[dev->index] : 0;
+  pthread_mutex_unlock(&g_lock);
+  return b;
+}
+
+uint8_t uvc_get_device_address(uvc_device_t *dev) {
+  if (!dev)
+    return 0;
+  pthread_mutex_lock(&g_lock);
+  uint8_t a = (dev->index >= 0 && dev->index < MOCK_MAX_DEVICES)
+                  ? g_dev_addr[dev->index] : 0;
+  pthread_mutex_unlock(&g_lock);
+  return a;
+}
+
 uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   if (!dev || !devh)
     return UVC_ERROR_INVALID_PARAM;
@@ -530,6 +622,7 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 
   pthread_mutex_lock(&g_lock);
   g_uvc_open_count++;
+  g_opened_device_index = dev->index;
   pthread_mutex_unlock(&g_lock);
 
   *devh = h;

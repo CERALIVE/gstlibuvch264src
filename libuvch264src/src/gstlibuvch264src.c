@@ -80,7 +80,9 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   gobject_class->get_property = gst_libuvc_h264_src_get_property;
 
   g_object_class_install_property(gobject_class, PROP_INDEX,
-    g_param_spec_string("index", "Index", "Device location, e.g., '0'",
+    g_param_spec_string("index", "Index",
+                        "Device selector: ordinal \"0\", \"vid:pid\" (hex, e.g. "
+                        "\"1234:5678\"), \"serial:<sn>\", or \"bus:<bus>:<addr>\"",
                         DEFAULT_DEVICE_INDEX, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* Native PTZ properties. Param-spec bounds cover the UVC arcsecond / focal
@@ -462,6 +464,155 @@ static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) 
   return GST_ELEMENT_CLASS(gst_libuvc_h264_src_parent_class)->set_clock(element, clock);
 }
 
+/* The `index` property selects ONE device from the libuvc enumeration. It stays
+ * a string (cerastream passes a bare ordinal via `i.to_string()`), but now also
+ * accepts richer, hardware-stable selectors. Parsed ONCE at start():
+ *   "N"            ordinal into the enumerated list (UNCHANGED, the default)
+ *   "vid:pid"      hex vendor:product id, e.g. "1234:5678"
+ *   "serial:<sn>"  exact USB serial-number string
+ *   "bus:<b>:<a>"  decimal USB bus number and device address */
+typedef enum {
+  UVC_SEL_ORDINAL,
+  UVC_SEL_VID_PID,
+  UVC_SEL_SERIAL,
+  UVC_SEL_BUS_ADDR,
+} GstLibuvcSelectorType;
+
+typedef struct {
+  GstLibuvcSelectorType type;
+  long ordinal;
+  guint16 vid, pid;
+  const gchar *serial;   /* borrows the index string, not owned */
+  guint8 bus, addr;
+} GstLibuvcDeviceSelector;
+
+/* Parse one integer token that MUST consume the whole string (no trailing junk,
+ * no overflow, within [min,max]). base 10 or 16. Mirrors the Task-6 strtol
+ * validation so the ordinal path is byte-for-byte as strict as before. */
+static gboolean
+gst_libuvc_h264_src_parse_uint(const gchar *s, int base, long min, long max,
+                               long *out) {
+  if (s == NULL || *s == '\0')
+    return FALSE;
+  errno = 0;
+  char *end = NULL;
+  long v = strtol(s, &end, base);
+  if (end == s || *end != '\0' || errno != 0 || v < min || v > max)
+    return FALSE;
+  *out = v;
+  return TRUE;
+}
+
+/* Parse the `index` property into a selector. Returns FALSE with a human-readable
+ * reason in *errmsg on a malformed selector (caller maps it to RESOURCE/SETTINGS).
+ * A bare, non-negative decimal is the ordinal — anything that is not one of the
+ * three prefixed forms falls back to the ordinal parse and so still fails loudly
+ * (the old atoi()-silently-selects-0 trap stays closed). */
+static gboolean
+gst_libuvc_h264_src_parse_selector(const gchar *index,
+                                   GstLibuvcDeviceSelector *sel,
+                                   const gchar **errmsg) {
+  if (index == NULL) {
+    *errmsg = "index is NULL";
+    return FALSE;
+  }
+
+  if (g_str_has_prefix(index, "serial:")) {
+    const gchar *sn = index + strlen("serial:");
+    if (*sn == '\0') {
+      *errmsg = "serial selector requires a non-empty serial number";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_SERIAL;
+    sel->serial = sn;
+    return TRUE;
+  }
+
+  if (g_str_has_prefix(index, "bus:")) {
+    const gchar *rest = index + strlen("bus:");
+    const gchar *colon = strchr(rest, ':');
+    if (colon == NULL) {
+      *errmsg = "bus selector requires \"bus:<bus>:<addr>\"";
+      return FALSE;
+    }
+    gchar *bus_str = g_strndup(rest, (gsize)(colon - rest));
+    long bus_v = 0, addr_v = 0;
+    gboolean ok = gst_libuvc_h264_src_parse_uint(bus_str, 10, 0, 255, &bus_v) &&
+                  gst_libuvc_h264_src_parse_uint(colon + 1, 10, 0, 255, &addr_v);
+    g_free(bus_str);
+    if (!ok) {
+      *errmsg = "bus selector requires \"bus:<bus>:<addr>\" (decimal 0..255 each)";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_BUS_ADDR;
+    sel->bus = (guint8)bus_v;
+    sel->addr = (guint8)addr_v;
+    return TRUE;
+  }
+
+  /* A colon with no recognised prefix is the hex vid:pid form. */
+  const gchar *colon = strchr(index, ':');
+  if (colon != NULL) {
+    gchar *vid_str = g_strndup(index, (gsize)(colon - index));
+    long vid_v = 0, pid_v = 0;
+    gboolean ok = gst_libuvc_h264_src_parse_uint(vid_str, 16, 0, 0xFFFF, &vid_v) &&
+                  gst_libuvc_h264_src_parse_uint(colon + 1, 16, 0, 0xFFFF, &pid_v);
+    g_free(vid_str);
+    if (!ok) {
+      *errmsg = "vid:pid selector requires hex \"<vid>:<pid>\" (0000..ffff each)";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_VID_PID;
+    sel->vid = (guint16)vid_v;
+    sel->pid = (guint16)pid_v;
+    return TRUE;
+  }
+
+  long ord = 0;
+  if (!gst_libuvc_h264_src_parse_uint(index, 10, 0, INT_MAX, &ord)) {
+    *errmsg = "index must be a non-negative integer ordinal, \"vid:pid\", "
+              "\"serial:<sn>\", or \"bus:<bus>:<addr>\"";
+    return FALSE;
+  }
+  sel->type = UVC_SEL_ORDINAL;
+  sel->ordinal = ord;
+  return TRUE;
+}
+
+/* Test one enumerated device against the parsed selector. `ordinal` is the
+ * device's position in the libuvc list. vid:pid and serial reads go through the
+ * libuvc descriptor (freed before returning); bus/addr read the cached topology.
+ * A device whose descriptor cannot be read simply does not match. */
+static gboolean
+gst_libuvc_h264_src_selector_matches(const GstLibuvcDeviceSelector *sel,
+                                     uvc_device_t *dev, int ordinal) {
+  switch (sel->type) {
+    case UVC_SEL_ORDINAL:
+      return (long)ordinal == sel->ordinal;
+    case UVC_SEL_VID_PID: {
+      uvc_device_descriptor_t *desc = NULL;
+      if (uvc_get_device_descriptor(dev, &desc) != UVC_SUCCESS || desc == NULL)
+        return FALSE;
+      gboolean ok = (desc->idVendor == sel->vid && desc->idProduct == sel->pid);
+      uvc_free_device_descriptor(desc);
+      return ok;
+    }
+    case UVC_SEL_SERIAL: {
+      uvc_device_descriptor_t *desc = NULL;
+      if (uvc_get_device_descriptor(dev, &desc) != UVC_SUCCESS || desc == NULL)
+        return FALSE;
+      gboolean ok = (desc->serialNumber != NULL &&
+                     g_strcmp0(desc->serialNumber, sel->serial) == 0);
+      uvc_free_device_descriptor(desc);
+      return ok;
+    }
+    case UVC_SEL_BUS_ADDR:
+      return (uvc_get_bus_number(dev) == sel->bus &&
+              uvc_get_device_address(dev) == sel->addr);
+  }
+  return FALSE;
+}
+
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
@@ -489,21 +640,17 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;
 
-  // Resolve the device index up-front, before touching libuvc. The `index`
-  // property stays a string so it can grow richer selectors later (vid:pid /
-  // serial), but today a bare, non-negative integer is an ordinal into the
-  // enumerated device list. Reject anything else loudly instead of silently
-  // selecting device 0 the way atoi() would have.
-  errno = 0;
-  char *index_end = NULL;
-  long device_ordinal = strtol(self->index ? self->index : "", &index_end, 10);
-  if (self->index == NULL || index_end == self->index || *index_end != '\0' ||
-      errno != 0 || device_ordinal < 0 || device_ordinal > INT_MAX) {
+  // Resolve the device selector up-front, before touching libuvc, so a
+  // malformed index fails loudly here instead of silently selecting device 0.
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
     GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
         ("Invalid device index \"%s\"", self->index ? self->index : "(null)"),
-        ("index must be a non-negative integer ordinal"));
+        ("%s", parse_err));
     return FALSE;
   }
+  long device_ordinal = -1;
 
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
@@ -524,16 +671,17 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   }
 
   for (int i = 0; dev_list[i] != NULL; ++i) {
-    if ((long)i == device_ordinal) {
+    if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
       self->uvc_dev = dev_list[i];
+      device_ordinal = i;
       break;
     }
   }
 
   if (!self->uvc_dev) {
     GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
-        ("No UVC device at index %ld", device_ordinal),
-        ("ordinal %ld matched none of the enumerated UVC devices", device_ordinal));
+        ("No UVC device matching \"%s\"", self->index ? self->index : "(null)"),
+        ("selector matched none of the enumerated UVC devices"));
     uvc_free_device_list(dev_list, 1);
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
