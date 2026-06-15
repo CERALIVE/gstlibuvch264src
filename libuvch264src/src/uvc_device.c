@@ -2,61 +2,69 @@
 #include "gstlibuvch264src_internal.h"
 #include "uvc_device.h"
 
-// Force USB device release by directly accessing libusb
+// Release the USB interfaces claimed for the open device so a subsequent
+// uvc_close() (and any later re-open) starts from a clean slate.
+//
+// This function MUST NOT close or reset the libusb handle: the handle is owned
+// by uvc_devh, and uvc_close() in stop() closes it exactly once. The previous
+// code called libusb_close() here and then stop() called uvc_close() on the
+// same (now freed) handle - a double-free/use-after-free. The post-close
+// libusb_reset_device() compounded it by touching the freed handle. Teardown is
+// uvc_close()'s job; we only drop interface claims while the handle is still open.
 void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self) {
-    GST_DEBUG_OBJECT(self, "Forcing USB device release");
-    
+    GST_DEBUG_OBJECT(self, "Releasing USB interfaces");
+
     if (!self->uvc_devh) return;
-    
-    // Get the underlying libusb handle
+
+    // Get the underlying libusb handle (kept OPEN - see note above).
     struct libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
     if (!usb_devh) {
         GST_WARNING_OBJECT(self, "Cannot get libusb handle from uvc");
         return;
     }
-    
-    // Get USB device info
+
     struct libusb_device *usb_dev = libusb_get_device(usb_devh);
     if (!usb_dev) {
         GST_WARNING_OBJECT(self, "Cannot get libusb device");
         return;
     }
-    
+
     int bus = libusb_get_bus_number(usb_dev);
     int addr = libusb_get_device_address(usb_dev);
     GST_INFO_OBJECT(self, "USB device at bus %d, address %d", bus, addr);
-    
-    // Try to release all interfaces
-    for (int interface = 0; interface < 8; interface++) {
+
+    // Query the real interface count from the active configuration instead of
+    // guessing a fixed 0..7 range (L8): a device may expose fewer or, in
+    // principle, more than eight interfaces.
+    int num_interfaces = 0;
+    struct libusb_config_descriptor *config = NULL;
+    if (libusb_get_active_config_descriptor(usb_dev, &config) == LIBUSB_SUCCESS && config) {
+        num_interfaces = config->bNumInterfaces;
+    } else {
+        GST_WARNING_OBJECT(self, "Cannot read active config descriptor; skipping interface release");
+    }
+
+    for (int interface = 0; interface < num_interfaces; interface++) {
         int ret = libusb_release_interface(usb_devh, interface);
         if (ret == LIBUSB_SUCCESS) {
             GST_DEBUG_OBJECT(self, "Released interface %d", interface);
-        } else if (ret == LIBUSB_ERROR_NOT_FOUND) {
-            // Interface doesn't exist, that's fine
-            break;
         }
     }
-    
-    // Try kernel detach if needed
+
+    // Reattach detached interfaces to the kernel where supported, so the device
+    // returns to a usable state for other consumers after we let go.
     #ifdef LIBUSB_OPTION_DETACH_KERNEL_DRIVER
-    for (int interface = 0; interface < 8; interface++) {
+    for (int interface = 0; interface < num_interfaces; interface++) {
         if (libusb_kernel_driver_active(usb_devh, interface) == 1) {
             GST_DEBUG_OBJECT(self, "Detaching kernel driver from interface %d", interface);
             libusb_detach_kernel_driver(usb_devh, interface);
         }
     }
     #endif
-    
-    // Force close the libusb handle
-    GST_DEBUG_OBJECT(self, "Force closing libusb handle");
-    libusb_close(usb_devh);
-    
-    // Reset the device if possible (requires newer libusb)
-    #ifdef LIBUSB_HAS_GET_DEVICE
-    // This forces a USB port reset
-    libusb_reset_device(usb_devh);
-    #endif
-    
-    // Clear the uvc handle pointer since we've closed it
-    // Note: uvc_close() will fail if we call it now, but that's OK
+
+    if (config) {
+        libusb_free_config_descriptor(config);
+    }
+
+    // Handle intentionally left OPEN: uvc_close() owns closing it.
 }

@@ -565,3 +565,86 @@ add_pts_safety_variant("" "")
 if(ENABLE_SANITIZERS)
   add_pts_safety_variant("tsan" "thread")
 endif()
+
+# -----------------------------------------------------------------------------
+# USB teardown tests (Task 11, H1 + L8).
+#
+# Links the element TUs, the libuvc mock, AND a dedicated libusb mock into one
+# executable - and deliberately does NOT link the real libusb, so mock_libusb.c
+# is the sole provider of the libusb-1.0 symbols force_usb_release() calls.
+# MOCK_LIBUSB_TEARDOWN switches the libuvc mock to hand back a real (mock) libusb
+# handle and to model uvc_close() closing it, so the old double-close (the handle
+# closed in force_usb_release() and again in uvc_close()) is observable. The ASAN
+# variant aborts on that double-free; the fixed teardown stays clean and the test
+# also asserts one close per open and that the interface count came from the
+# active config descriptor, not a hardcoded 0..7 range.
+# -----------------------------------------------------------------------------
+function(add_usb_teardown_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_usb_teardown${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe}
+    test_usb_teardown.c
+    ${_element_srcs}
+    mock_libuvc.c
+    mock_libusb.c
+  )
+  target_compile_definitions(${testexe} PRIVATE MOCK_LIBUSB_TEARDOWN)
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+    ${LIBUSB_INCLUDE_DIRS}
+  )
+  # No PkgConfig::LIBUSB: mock_libusb.c supplies every libusb symbol, and linking
+  # the real library too would multiply-define them.
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    Threads::Threads
+  )
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  set(_home "${CMAKE_BINARY_DIR}/usb-teardown-home${suffix}")
+  file(MAKE_DIRECTORY ${_home})
+  set(_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/usb-teardown-registry${suffix}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_home}"
+    "CK_FORK=no"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(sanitizer STREQUAL "address")
+    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME usb_teardown${suffix} COMMAND ${testexe})
+  set_tests_properties(usb_teardown${suffix} PROPERTIES
+    ENVIRONMENT "${_env}"
+    # start() binds the fixed /tmp/libuvc_control socket via the control thread,
+    # so this must not run concurrently with the other start()-driven suites.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endfunction()
+
+add_usb_teardown_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_usb_teardown_variant("asan" "address")
+endif()

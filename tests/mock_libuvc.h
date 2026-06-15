@@ -79,6 +79,12 @@ uint16_t mock_uvc_get_last_zoom(void);
  * (observability for assertions). */
 int mock_uvc_frames_delivered(void);
 
+/* uvc_open()/uvc_close() call counts since the last mock_uvc_reset(). A correct
+ * teardown closes exactly once per successful open, so across N start/stop
+ * cycles both counters reach N. */
+int mock_uvc_open_count(void);
+int mock_uvc_close_count(void);
+
 /* Device-list arrays handed out by uvc_find_devices() that have not yet been
  * released with uvc_free_device_list(). A correct caller leaves this at its
  * starting value; a leak makes it grow. */

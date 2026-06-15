@@ -13,8 +13,8 @@
  * NOTE (Task 4 spike): real libuvc does not deliver a NULL frame on disconnect
  * in callback mode - it just stops invoking the callback. DISCONNECT mode mirrors
  * that by stopping the feeder, never by passing NULL. uvc_get_libusb_handle()
- * returns NULL on purpose so the element's force_usb_release() (which has a
- * double-free bug) returns early and is never exercised by the mock.
+ * returns NULL by default so force_usb_release() short-circuits; the USB-teardown
+ * test (MOCK_LIBUSB_TEARDOWN) returns a mock handle to exercise the release path.
  *
  * No USB protocol, bandwidth, or timing is simulated - just the assembled-frame
  * contract the element consumes.
@@ -32,6 +32,15 @@
 
 #include <libuvc/libuvc.h>
 #include "mock_libuvc.h"
+
+/* The USB-teardown test (Task 11) links a separate libusb mock so the element's
+ * force_usb_release() actually exercises the libusb handle, and uvc_close()
+ * models libuvc closing that same handle - making a double-close observable.
+ * Every other target keeps the historic no-op (uvc_get_libusb_handle -> NULL). */
+#ifdef MOCK_LIBUSB_TEARDOWN
+#include <libusb-1.0/libusb.h>
+#include "mock_libusb.h"
+#endif
 
 /* -------------------------------------------------------------------------- */
 /* Opaque libuvc handles (real libuvc keeps these private; we define our own). */
@@ -70,6 +79,7 @@ struct uvc_device_handle {
   uvc_frame_callback_t *cb;
   void *user_ptr;
   uint8_t *frame_buf;
+  void *usb_handle; /* mock libusb handle; only set under MOCK_LIBUSB_TEARDOWN */
 };
 
 /* -------------------------------------------------------------------------- */
@@ -84,6 +94,8 @@ static mock_uvc_frame_mode_t g_frame_mode = MOCK_UVC_FRAME_VALID;
 static int g_max_frames = 0; /* 0 = until uvc_stop_streaming() */
 static int g_frames_delivered = 0;
 static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed */
+static int g_uvc_open_count = 0;  /* successful uvc_open() calls */
+static int g_uvc_close_count = 0; /* uvc_close() calls on a live handle */
 
 static int32_t g_pan_min = -180000, g_pan_max = 180000, g_pan_cur = 0;
 static int32_t g_tilt_min = -90000, g_tilt_max = 90000, g_tilt_cur = 0;
@@ -124,6 +136,8 @@ void mock_uvc_reset(void) {
   g_frame_mode = MOCK_UVC_FRAME_VALID;
   g_max_frames = 0;
   g_frames_delivered = 0;
+  g_uvc_open_count = 0;
+  g_uvc_close_count = 0;
   g_pan_min = -180000; g_pan_max = 180000; g_pan_cur = 0;
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
@@ -189,6 +203,20 @@ uint16_t mock_uvc_get_last_zoom(void) {
 int mock_uvc_frames_delivered(void) {
   pthread_mutex_lock(&g_lock);
   int n = g_frames_delivered;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+int mock_uvc_open_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_uvc_open_count;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+int mock_uvc_close_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_uvc_close_count;
   pthread_mutex_unlock(&g_lock);
   return n;
 }
@@ -448,6 +476,14 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   h->fmt_desc.frame_descs = &h->frame_desc;
   h->fmt_desc.next = NULL;
 
+#ifdef MOCK_LIBUSB_TEARDOWN
+  h->usb_handle = mock_libusb_alloc_handle();
+#endif
+
+  pthread_mutex_lock(&g_lock);
+  g_uvc_open_count++;
+  pthread_mutex_unlock(&g_lock);
+
   *devh = h;
   return UVC_SUCCESS;
 }
@@ -463,6 +499,20 @@ void uvc_close(uvc_device_handle_t *devh) {
     pthread_join(devh->feeder, NULL);
     devh->started = 0;
   }
+
+#ifdef MOCK_LIBUSB_TEARDOWN
+  /* Model real libuvc: uvc_close() closes the underlying libusb handle. If
+   * force_usb_release() already closed it, this is the double-close ASan catches. */
+  if (devh->usb_handle) {
+    libusb_close((struct libusb_device_handle *)devh->usb_handle);
+    devh->usb_handle = NULL;
+  }
+#endif
+
+  pthread_mutex_lock(&g_lock);
+  g_uvc_close_count++;
+  pthread_mutex_unlock(&g_lock);
+
   pthread_mutex_destroy(&devh->lock);
   free(devh->frame_buf);
   free(devh);
@@ -527,11 +577,16 @@ void uvc_stop_streaming(uvc_device_handle_t *devh) {
   devh->started = 0;
 }
 
-/* The element passes the result straight to libusb; returning NULL makes
- * force_usb_release() (which has a double-free bug) bail out immediately. */
+/* The element passes the result straight to libusb. Returns NULL by default so
+ * force_usb_release() short-circuits (no libusb in this build); the USB-teardown
+ * test returns a mock handle instead so the real release path is exercised. */
 struct libusb_device_handle *uvc_get_libusb_handle(uvc_device_handle_t *devh) {
+#ifdef MOCK_LIBUSB_TEARDOWN
+  return devh ? (struct libusb_device_handle *)devh->usb_handle : NULL;
+#else
   (void)devh;
   return NULL;
+#endif
 }
 
 const char *uvc_strerror(uvc_error_t err) {
