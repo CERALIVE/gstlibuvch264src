@@ -51,11 +51,40 @@ Do not use upstream `main` or re-tag from a later upstream commit. The fork base
 
 ---
 
-## Fork URL (placeholder)
+## Fork URL (filled by Task 11)
 
-`[TO BE FILLED BY TASK 11: https://github.com/CeraLive/libuvc]`
+- **Fork URL:** `https://github.com/CeraLive/libuvc`
+- **Clone (HTTPS):** `https://github.com/CeraLive/libuvc.git`
+- **Visibility:** PUBLIC (no auth required to clone)
+- **Default branch:** `main`
+- **Release tag:** `ceralive-v0.0.7.1`
+- **Tag/HEAD commit SHA:** `21bc89ab1010e2bcce90d846a19134500065965e`
+- **Base SHA (provenance only):** `68d07a00e11d1944e27b7295ee69673239c00b4b` — confirmed ancestor of HEAD.
 
-Tasks 11/17/22/23 must not hardcode a real URL until Task 11 creates the repo and writes it back here.
+**Pin downstream builds by SHA**, not by branch or tag name (tags/branches are mutable):
+
+```
+GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
+GIT_TAG        21bc89ab1010e2bcce90d846a19134500065965e   # ceralive-v0.0.7.1
+```
+
+Commit history on the fork (base → HEAD):
+
+| SHA | Commit |
+|-----|--------|
+| `68d07a00` | `version 0.0.7` (upstream base, provenance only) |
+| `2f32812`  | `feat(uvc): add UVC 1.5 support and configurable auto-detach kernel driver` |
+| `d460f97`  | `feat(uvc): add H.265/HEVC format support` |
+| `21bc89a`  | `docs(ceralive): record fork provenance and document auto-detach option` |
+
+The `LIBUVC_AUTO_DETACH_KERNEL_DRIVER` CMake option (Hunk A caveat) is implemented
+in commit `2f32812` (default `ON`); the UVC 1.5 header (Hunk B) and H.265 support
+(Hunk C) are unconditional. `LICENSE.txt` is byte-identical to the base (BSD-3-Clause
+preserved verbatim). Standalone build verified (`cmake . && make`).
+
+Evidence: `.omo/evidence/task-11-fork-build.txt`, `.omo/evidence/task-11-license.txt`.
+
+Tasks 17/22/23 may now pin the SHA above.
 
 ---
 
