@@ -715,3 +715,80 @@ add_usb_teardown_variant("" "")
 if(ENABLE_SANITIZERS)
   add_usb_teardown_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# PTS clamp + restart-state tests (Task 14).
+#
+# Same single-executable, statically-registered shape as test_device_select so
+# the element's frame_callback() PTS arithmetic and the start() restart-state
+# reset run in the test process with the mock feeder driving frame_callback().
+#
+#   pts_monotonic  The mock feeds access units far faster than the negotiated
+#                  frame interval, so the running PTS outruns the wall clock and
+#                  the resync offset goes strongly negative; assert every buffer
+#                  PTS is strictly increasing and every DURATION is sane (M4).
+#   restart_idr    Lead each stream with non-IDR slices before the first IDR,
+#                  stream once to latch had_idr, restart, and assert the first
+#                  buffer after the restart is never a forwarded non-IDR (M5).
+# -----------------------------------------------------------------------------
+add_executable(test_pts_monotonic
+  test_pts_monotonic.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_pts_monotonic PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_pts_monotonic PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_pts_monotonic PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_pts_monotonic PRIVATE -fsanitize=address)
+endif()
+
+# "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
+set(_pts_monotonic_cases
+  "pts_monotonic:test_pts_monotonic"
+  "restart_idr:test_restart_idr"
+)
+foreach(_case ${_pts_monotonic_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_pm_home "${CMAKE_BINARY_DIR}/pts-monotonic-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_pm_home})
+
+  set(_pm_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/pts-monotonic-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_pm_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _pm_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_pts_monotonic)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_pm_env}"
+    # start() binds the fixed /tmp/libuvc_control socket via the control thread,
+    # so these must not run concurrently with each other or the other
+    # start()-driven suites under `ctest -j`.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()

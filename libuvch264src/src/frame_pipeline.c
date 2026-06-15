@@ -218,9 +218,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                so the buffer alloc/fill and the queue push stay outside it. */
             GST_OBJECT_LOCK(self);
 
-            // We'll set the first PTS to the current timestamp ts
+            // We'll set the first PTS to the current timestamp ts. Guard the
+            // subtraction: if the first frame arrives less than one interval
+            // after the clock baseline, ts - frame_interval would underflow the
+            // unsigned baseline into a huge value and poison the first PTS.
             if (self->prev_pts == G_MAXUINT64) {
-                self->prev_pts = ts - self->frame_interval;
+                self->prev_pts = (ts > (GstClockTime)self->frame_interval)
+                                 ? ts - self->frame_interval : 0;
             }
 
             // Update the PTS calculation on the first IDR after MIN_FRAMES_CALC_INTERVAL frames
@@ -284,10 +288,30 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->prev_int_ts = ts;
             }
 
+            // The interval, stretch and resync offset are signed deltas added
+            // to an unsigned PTS. Early in the stream prev_pts is small, so a
+            // strongly negative resync offset could drive the sum below zero and
+            // wrap the guint64 into a huge timestamp that stalls downstream.
+            // Bound the offset so the running PTS can never underflow.
+            int64_t pts_base = (int64_t)self->prev_pts + self->frame_interval + self->pts_stretch;
+            if (timestamp_offset < -pts_base) {
+                timestamp_offset = -pts_base;
+            }
+
             timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
+
+            // Keep PTSes strictly increasing: a backwards or repeated PTS makes
+            // players skip or stall, so clamp to at least one tick past prev_pts.
+            if (timestamp <= self->prev_pts) {
+                timestamp = self->prev_pts + 1;
+            }
+
             offset = ts - timestamp;
             self->pts_offset_sum += offset;
             duration = timestamp - self->prev_pts;
+            if (duration == 0) {
+                duration = 1;
+            }
             self->prev_pts = timestamp;
 
             GST_OBJECT_UNLOCK(self);

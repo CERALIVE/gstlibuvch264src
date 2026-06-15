@@ -120,6 +120,8 @@ static void apply_env_overrides_locked(void) {
       g_frame_mode = MOCK_UVC_FRAME_OVERSIZED_SPS;
     else if (strcmp(s, "disconnect") == 0)
       g_frame_mode = MOCK_UVC_FRAME_DISCONNECT;
+    else if (strcmp(s, "nonidr_lead") == 0)
+      g_frame_mode = MOCK_UVC_FRAME_NONIDR_LEAD;
     else
       g_frame_mode = MOCK_UVC_FRAME_VALID;
   }
@@ -253,11 +255,23 @@ static size_t append_nal_h265(uint8_t *p, uint8_t nal_type, size_t payload_len) 
   return n;
 }
 
+/* Number of bare non-IDR slices MOCK_UVC_FRAME_NONIDR_LEAD emits before the
+ * first real IDR access unit (models a stream joined mid-GOP). */
+#define MOCK_NONIDR_LEAD_COUNT 5
+
 /* Build one access unit into buf (capacity MOCK_FRAME_BUF_CAP). Returns length.
- * H264: SPS(7) + PPS(8) + IDR(5). H265: VPS(32) + SPS(33) + PPS(34) + IDR(20). */
+ * H264: SPS(7) + PPS(8) + IDR(5). H265: VPS(32) + SPS(33) + PPS(34) + IDR(20).
+ * In NONIDR_LEAD mode the first MOCK_NONIDR_LEAD_COUNT frames are a single bare
+ * non-IDR slice (type 1) with no SPS/PPS/IDR, so the element must drop them. */
 static size_t craft_access_unit(uint8_t *buf, enum uvc_frame_format fmt,
-                                mock_uvc_frame_mode_t mode) {
+                                mock_uvc_frame_mode_t mode, int frame_index) {
   size_t n = 0;
+
+  if (mode == MOCK_UVC_FRAME_NONIDR_LEAD && frame_index < MOCK_NONIDR_LEAD_COUNT) {
+    if (fmt == UVC_FRAME_FORMAT_H265)
+      return append_nal_h265(buf, 1, 48); /* TRAIL non-IDR slice */
+    return append_nal_h264(buf, 1, 48);   /* non-IDR slice */
+  }
   /* OVERSIZED_SPS overflows the element's fixed 1024 B SPS buffer. The payload
    * must exceed the whole SPS+PPS+control tail of the instance struct so an
    * unclamped copy runs off the END of the GObject allocation (where ASan's
@@ -308,7 +322,7 @@ static void *feeder_main(void *arg) {
       break;
     }
 
-    size_t len = craft_access_unit(h->frame_buf, fmt, mode);
+    size_t len = craft_access_unit(h->frame_buf, fmt, mode, delivered);
 
     uvc_frame_t frame;
     memset(&frame, 0, sizeof(frame));

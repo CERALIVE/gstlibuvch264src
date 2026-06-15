@@ -40,6 +40,10 @@ typedef enum {
    * Real libuvc does NOT pass a NULL frame on disconnect in callback mode -
    * the callback simply stops being invoked (spike verdict, Task 4). */
   MOCK_UVC_FRAME_DISCONNECT,
+  /* Mid-GOP join: the feeder leads each stream with a few bare non-IDR slices
+   * (no SPS/PPS/IDR) before the first IDR access unit. Lets a test prove the
+   * element drops them until a fresh IDR, including across a stop/start cycle. */
+  MOCK_UVC_FRAME_NONIDR_LEAD,
 } mock_uvc_frame_mode_t;
 
 /* Restore every mock knob to its default (1 device, H264, valid frames,

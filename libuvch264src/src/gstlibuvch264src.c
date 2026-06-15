@@ -408,6 +408,19 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     usleep(1000000); // Wait 1 second for USB to settle
   }
 
+  // Reset per-session frame state so a restart never forwards stale non-IDR
+  // frames (or a stale PTS baseline) before a fresh IDR re-establishes the
+  // stream. had_idr/send_sps_pps gate NAL forwarding in frame_callback(),
+  // frame_count/prev_int_ts seed the PTS interval estimator, and prev_pts/
+  // base_time use G_MAXUINT64 as the "latch on first frame" sentinel that
+  // frame_callback() and create() test for.
+  self->had_idr = FALSE;
+  self->send_sps_pps = FALSE;
+  self->frame_count = 0;
+  self->prev_int_ts = 0;
+  self->prev_pts = G_MAXUINT64;
+  self->base_time = G_MAXUINT64;
+
   // Resolve the device index up-front, before touching libuvc. The `index`
   // property stays a string so it can grow richer selectors later (vid:pid /
   // serial), but today a bare, non-negative integer is an ordinal into the
