@@ -1344,3 +1344,52 @@ foreach(_case ${_framerate_mismatch_cases})
     TIMEOUT 120
   )
 endforeach()
+
+# -----------------------------------------------------------------------------
+# PAUSED->PLAYING PTS rebaseline continuity test (Task 13, harden-v2).
+#
+# Same single-executable, statically-registered shape as test_pts_drift /
+# test_framerate_mismatch: constructs the element directly, installs a
+# GstTestClock, and drives frame_callback()'s PTS arithmetic in-process across a
+# simulated PLAYING -> PAUSED -> PLAYING cycle. The real change_state vmethod
+# (called through the class vtable) resets the base_time + prev_pts latches on
+# PAUSED->PLAYING (Task 5); the pipeline's base_time re-assignment is modelled by
+# gst_element_set_base_time() advanced by the pause gap. Asserts the first
+# post-resume PTS re-latches to the new running-time (now - new base_time) rather
+# than being clamped to prev_pts + 1 or jumping the whole pause gap ahead, and
+# that subsequent PTS stay strictly monotonic within the drift bound relative to
+# the new base_time. Guards the Metis Option B rebaseline fix.
+# -----------------------------------------------------------------------------
+add_executable(test_pts_resume
+  test_pts_resume.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_pts_resume PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_pts_resume PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+apply_sanitizer_flags(test_pts_resume "${STATIC_SUITE_SANITIZER}")
+
+# No RESOURCE_LOCK: the test never enters PLAYING via the pipeline and never
+# calls start(), so it spawns no control thread and binds no socket - it can run
+# concurrently with everything else under `ctest -j`. (change_state is invoked
+# directly for the PAUSED->PLAYING transition, which does not call start().)
+setup_gst_test_environment("pts-resume" "${STATIC_SUITE_SANITIZER}")
+set(_resume_env ${GST_TEST_ENV})
+list(APPEND _resume_env "GST_CHECKS=test_paused_playing_rebaseline")
+
+add_test(NAME paused_playing_rebaseline COMMAND test_pts_resume)
+set_tests_properties(paused_playing_rebaseline PROPERTIES
+  ENVIRONMENT "${_resume_env}"
+  TIMEOUT 120
+)
