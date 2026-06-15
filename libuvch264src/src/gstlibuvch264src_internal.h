@@ -26,8 +26,7 @@ struct _GstLibuvcH264Src {
   gint negotiated_width;
   gint negotiated_height;
   /* The framerate negotiate() resolved, kept so the opt-in reconnect path can
-   * re-run uvc_get_stream_ctrl_format_size() with the original geometry. Unlike
-   * frame_interval (mutated by the PTS estimator), this stays the negotiated value. */
+   * re-run uvc_get_stream_ctrl_format_size() with the original geometry. */
   gint negotiated_framerate;
   GAsyncQueue *frame_queue;
   gboolean streaming;
@@ -39,16 +38,16 @@ struct _GstLibuvcH264Src {
   gint consecutive_timeouts;
   gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
   GstClock *clock;
-  int64_t pts_offset_sum;
-  int64_t pts_stretch;
   GstClockTime base_time;
   GstClockTime prev_pts;
+  /* Nominal frame interval (1/fps in ns) resolved by negotiate() from the
+   * fixated caps framerate. Set once and never mutated while streaming (Option B
+   * stamps PTS = arrival running-time directly, with no interval estimator); read
+   * by the LATENCY query and stamped as GST_BUFFER_DURATION (always the nominal
+   * caps interval, never an inter-arrival delta). */
   gint64 frame_interval; // in ns
-  guint64 prev_int_ts;
-  gint frame_count;
-  /* Monotonic per-session output counter for GST_BUFFER_OFFSET. Distinct from
-   * frame_count, which is periodically reset by the PTS estimator and so is not
-   * monotonic. Reset in start(); only touched on the feeder thread. */
+  /* Monotonic per-session output counter for GST_BUFFER_OFFSET. Reset in
+   * start(); only touched on the feeder thread. */
   guint64 frame_offset;
   gboolean had_idr;
   gboolean send_sps_pps;
