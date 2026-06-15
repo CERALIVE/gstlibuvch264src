@@ -76,14 +76,16 @@ endif()
 # -----------------------------------------------------------------------------
 set(GST_PLUGIN_BUILD_DIR ${CMAKE_BINARY_DIR}/gstreamer-1.0)
 
-add_library(gstlibuvch264src MODULE
-  libuvch264src/src/gstlibuvch264src.c
-  libuvch264src/src/uvc_device.c
-  libuvch264src/src/frame_pipeline.c
-  libuvch264src/src/ptz_control.c
-  libuvch264src/src/spspps_cache.c
-  libuvch264src/src/gstlibuvch264src_error.c
-)
+# Single source of truth for the element's .c files, shared verbatim with the
+# Meson production build (libuvch264src/src/meson.build) and tests/CMakeLists.txt.
+# sources.txt holds bare filenames; prefix each with the src dir for add_library.
+file(STRINGS "${CMAKE_SOURCE_DIR}/libuvch264src/src/sources.txt" _element_src_names)
+set(_element_srcs "")
+foreach(_src ${_element_src_names})
+  list(APPEND _element_srcs "${CMAKE_SOURCE_DIR}/libuvch264src/src/${_src}")
+endforeach()
+
+add_library(gstlibuvch264src MODULE ${_element_srcs})
 set_target_properties(gstlibuvch264src PROPERTIES
   PREFIX "lib"
   LIBRARY_OUTPUT_DIRECTORY ${GST_PLUGIN_BUILD_DIR}

@@ -143,14 +143,15 @@ endif()
 # The element sources, compiled verbatim into the mock-backed module.
 # gstlibuvch264src_error.c is included because ptz_control.c posts bus errors via
 # gst_libuvc_h264_src_post_error(); every mock-linked executable needs the symbol.
-set(_element_srcs
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src.c
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/uvc_device.c
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.c
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/ptz_control.c
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/spspps_cache.c
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
-)
+# Single source of truth: read the .c list from libuvch264src/src/sources.txt,
+# shared verbatim with the top-level CMakeLists.txt and the Meson production build
+# (libuvch264src/src/meson.build). sources.txt holds bare filenames; prefix each
+# with the src dir to form the absolute paths the test targets expect.
+file(STRINGS "${CMAKE_SOURCE_DIR}/libuvch264src/src/sources.txt" _element_src_names)
+set(_element_srcs "")
+foreach(_src ${_element_src_names})
+  list(APPEND _element_srcs "${CMAKE_SOURCE_DIR}/libuvch264src/src/${_src}")
+endforeach()
 
 # add_mock_harness_variant(<variant> <sanitizer>)
 #   <variant>   "" for the plain build, else a suffix ("asan", "tsan")
