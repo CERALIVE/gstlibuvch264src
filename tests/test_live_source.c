@@ -174,12 +174,62 @@ GST_START_TEST (test_live_source_polish)
   fail_unless (min_latency == fi,
       "min latency %" G_GUINT64_FORMAT " != frame interval %" G_GUINT64_FORMAT,
       (guint64) min_latency, (guint64) fi);
+  /* Option B: max latency must be a finite bound (the element does not buffer
+     ahead, so the handler sets max == min == the caps-derived frame interval),
+     never GST_CLOCK_TIME_NONE, and never below min. */
+  fail_unless (GST_CLOCK_TIME_IS_VALID (max_latency),
+      "max latency is GST_CLOCK_TIME_NONE; expected a finite bound");
+  fail_unless (max_latency >= min_latency,
+      "max latency %" G_GUINT64_FORMAT " < min latency %" G_GUINT64_FORMAT,
+      (guint64) max_latency, (guint64) min_latency);
   fail_unless (msg_type == GST_MESSAGE_EOS,
       "expected EOS, got %s", gst_message_type_get_name (msg_type));
   fail_unless (g_atomic_int_get (&offset_checked) >= 10,
       "only %d buffers carried an OFFSET", g_atomic_int_get (&offset_checked));
   fail_unless (!g_atomic_int_get (&offset_violation),
       "GST_BUFFER_OFFSET was not a strict +1 sequence (or OFFSET_END mismatch)");
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
+/* latency_pre_negotiate: LATENCY query before negotiate() defers gracefully */
+/* ------------------------------------------------------------------------- */
+
+GST_START_TEST (test_latency_pre_negotiate)
+{
+  register_element ();
+
+  GstElement *src = gst_element_factory_make ("libuvch264src", "src");
+  fail_unless (src != NULL, "failed to create libuvch264src");
+
+  /* frame_interval is 0 until negotiate() derives it from the caps fps, so the
+     handler's frame_interval>0 branch is skipped and the query defers to the
+     GstBaseSrc default. The graceful contract: the query is still answered for a
+     live source, and the element fabricates NO caps-derived latency — min stays
+     at the base-class default of 0, never EXPECTED_FRAME_INTERVAL_NS (that value
+     only appears once negotiate() runs, asserted by live_source_polish). */
+  GstQuery *q = gst_query_new_latency ();
+  GstPad *srcpad = gst_element_get_static_pad (src, "src");
+  gboolean queried = gst_pad_query (srcpad, q);
+  gst_object_unref (srcpad);
+
+  gboolean live = FALSE;
+  GstClockTime min_latency = 0, max_latency = 0;
+  if (queried)
+    gst_query_parse_latency (q, &live, &min_latency, &max_latency);
+  gst_query_unref (q);
+
+  gst_object_unref (src);
+
+  fail_unless (queried, "src pad refused the pre-negotiate LATENCY query");
+  fail_unless (live, "pre-negotiate LATENCY query did not report a live source");
+  fail_unless (min_latency == 0,
+      "pre-negotiate min latency %" G_GUINT64_FORMAT
+      " != base-class default 0 (handler fabricated a latency)",
+      (guint64) min_latency);
+  fail_unless (min_latency != EXPECTED_FRAME_INTERVAL_NS,
+      "pre-negotiate latency leaked the caps-derived frame interval");
 }
 
 GST_END_TEST;
@@ -456,6 +506,11 @@ live_source_suite (void)
   tcase_set_timeout (tc_polish, 60);
   tcase_add_test (tc_polish, test_live_source_polish);
   suite_add_tcase (s, tc_polish);
+
+  TCase *tc_latency = tcase_create ("latency_pre_negotiate");
+  tcase_set_timeout (tc_latency, 60);
+  tcase_add_test (tc_latency, test_latency_pre_negotiate);
+  suite_add_tcase (s, tc_latency);
 
   TCase *tc_write = tcase_create ("spspps_write_on_change");
   tcase_set_timeout (tc_write, 60);

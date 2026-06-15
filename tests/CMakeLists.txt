@@ -911,6 +911,7 @@ apply_sanitizer_flags(test_live_source "${STATIC_SUITE_SANITIZER}")
 # MOCK_UVC_FRAME_FORMAT=H265 to declare the codec the case exercises.
 set(_live_source_cases
   "live_source_polish:test_live_source_polish:"
+  "live_source_latency_pre_negotiate:test_latency_pre_negotiate:"
   "spspps_write_on_change:test_spspps_write_on_change:"
   "cache_h265_vps_write_on_change:test_h265_vps_write_on_change:MOCK_UVC_FRAME_FORMAT=H265"
 )
