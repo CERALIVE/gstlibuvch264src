@@ -42,8 +42,8 @@ jobs:
           echo "**Architecture:** ${{ matrix.config.arch }}" >> $GITHUB_STEP_SUMMARY
           echo "**Runner:** ${{ matrix.config.runner }}" >> $GITHUB_STEP_SUMMARY
 
-  smoke-test:
-    name: Plugin-load smoke test (ctest)
+  functional-test:
+    name: Functional suite + TSan/ASAN (ctest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -63,17 +63,20 @@ jobs:
             libjpeg-dev \
             libusb-1.0-0-dev
 
-      - name: Configure and build
+      # ENABLE_SANITIZERS is load-bearing: without it ctest runs only the plain
+      # variants, dropping all ASan (SPS/PPS overflow) and TSan (frame/PTS race)
+      # coverage. Keep it on so the full hardware-independent suite is gated.
+      - name: Configure and build (with sanitizers)
         run: |
-          cmake -B build
+          cmake -B build -DENABLE_SANITIZERS=ON
           cmake --build build
 
-      - name: Run ctest
+      - name: Run ctest (full suite incl. TSan/ASAN)
         run: ctest --test-dir build --output-on-failure
 
-      - name: Smoke Test Summary
+      - name: Functional Test Summary
         if: always()
         run: |
-          echo "## 🔌 Plugin-load smoke test" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔌 Functional test suite (ctest + TSan/ASAN)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo '`ctest --test-dir build` ran the gst-check smoke suite (plugin registers, factories/pad-templates/properties present). Hardware-independent.' >> $GITHUB_STEP_SUMMARY
+          echo '`ctest --test-dir build` ran the full hardware-independent suite against the libuvc mock: plugin-load smoke, mock streaming, lifecycle, device selection, negotiate edges, SPS/PPS overflow (ASan), frame/PTS thread-safety (TSan), and the consolidated functional caps (H.264/H.265) + backpressure suite.' >> $GITHUB_STEP_SUMMARY
