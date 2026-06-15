@@ -480,23 +480,43 @@ function(add_sps_bounds_variant variant sanitizer)
 
   # Standard ASAN_OPTIONS (detect_leaks=0) comes from the helper; this suite adds
   # G_SLICE=always-malloc so each GObject instance is a plain malloc with an ASan
-  # redzone right after it - otherwise the SPS overflow would land inside the
-  # instance (intra-object) where ASan cannot see it.
+  # redzone right after it - otherwise the oversized NAL copy would land inside
+  # the instance (intra-object) where ASan cannot see it.
   setup_gst_test_environment("bounds${suffix}" "${sanitizer}")
-  set(_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
-  list(APPEND _env "MOCK_UVC_FRAME_MODE=oversized_sps")
+  set(_base_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
   if(sanitizer STREQUAL "address")
-    list(APPEND _env "G_SLICE=always-malloc")
+    list(APPEND _base_env "G_SLICE=always-malloc")
   endif()
 
-  add_test(NAME ${ctestname} COMMAND ${testexe})
-  set_tests_properties(${ctestname} PROPERTIES
-    ENVIRONMENT "${_env}"
-    # Shares the element's fixed /tmp/libuvc_control socket with the other mock
-    # variants, so it must not run concurrently with them under `ctest -j`.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
+  # "<ctest name>:<gst-check test fn>:<feeder mode>:<codec>" - one ctest entry
+  # each via GST_CHECKS. The SPS case overflows the H.264 SPS buffer (default
+  # codec); the VPS case overflows the H.265-only VPS buffer, so it selects H265.
+  set(_bounds_cases
+    "${ctestname}:test_oversized_sps_is_clamped_no_overflow:oversized_sps:"
+    "vps_bounds${suffix}:test_oversized_vps_is_clamped_no_overflow:oversized_vps:MOCK_UVC_FRAME_FORMAT=H265"
   )
+  foreach(_case ${_bounds_cases})
+    string(REPLACE ":" ";" _parts ${_case})
+    list(GET _parts 0 _bctestname)
+    list(GET _parts 1 _btestfn)
+    list(GET _parts 2 _bmode)
+    list(GET _parts 3 _bcodec)
+
+    set(_env ${_base_env})
+    list(APPEND _env "MOCK_UVC_FRAME_MODE=${_bmode}" "GST_CHECKS=${_btestfn}")
+    if(NOT _bcodec STREQUAL "")
+      list(APPEND _env "${_bcodec}")
+    endif()
+
+    add_test(NAME ${_bctestname} COMMAND ${testexe})
+    set_tests_properties(${_bctestname} PROPERTIES
+      ENVIRONMENT "${_env}"
+      # Shares the element's fixed /tmp/libuvc_control socket with the other mock
+      # variants, so it must not run concurrently with them under `ctest -j`.
+      RESOURCE_LOCK uvc_control_socket
+      TIMEOUT 120
+    )
+  endforeach()
 endfunction()
 
 add_sps_bounds_variant("" "")
@@ -697,6 +717,10 @@ function(add_negotiate_variant variant sanitizer)
     "negotiate_edge_zero_format${suffix}:test_negotiate_zero_format"
     "negotiate_edge_framerate${suffix}:test_negotiate_framerate_zero"
     "negotiate_edge_zero_interval${suffix}:test_negotiate_zero_interval"
+    "negotiate_extreme_fps_low${suffix}:test_negotiate_extreme_fps_low"
+    "negotiate_extreme_fps_high${suffix}:test_negotiate_extreme_fps_high"
+    "negotiate_extreme_res_low${suffix}:test_negotiate_extreme_res_low"
+    "negotiate_extreme_res_high${suffix}:test_negotiate_extreme_res_high"
   )
   if(NOT sanitizer STREQUAL "")
     list(APPEND _neg_cases "negotiate_leak:test_negotiate_leak")
@@ -1075,6 +1099,9 @@ apply_sanitizer_flags(test_reconnect "${STATIC_SUITE_SANITIZER}")
 set(_reconnect_cases
   "disconnect_error:test_disconnect_error"
   "reconnect_resume:test_reconnect_resume"
+  "reconnect_exhaustion:test_reconnect_exhaustion"
+  "reconnect_backoff_sequence:test_reconnect_backoff_sequence"
+  "reconnect_backoff_interrupt:test_reconnect_backoff_interrupt"
 )
 foreach(_case ${_reconnect_cases})
   string(REPLACE ":" ";" _parts ${_case})
@@ -1094,6 +1121,71 @@ foreach(_case ${_reconnect_cases})
     TIMEOUT 120
   )
 endforeach()
+
+# -----------------------------------------------------------------------------
+# Reconnect exhaustion teardown-order test (Task 8, harden-v2).
+#
+# Reuses test_reconnect.c but, like test_usb_teardown, links a dedicated libusb
+# mock (MOCK_LIBUSB_TEARDOWN) and deliberately does NOT link the real libusb, so
+# uvc_close() models the single libusb_close() and the close counters are
+# observable. With every reopen forced to fail (mock open-fail injection), the
+# bounded backoff loop exhausts; the test then proves uvc_close() owned the one
+# libusb_close() (balanced, no double-close) and that force_usb_release() never
+# ran on the reconnect path (config-query count == 0) - i.e. it never preceded
+# uvc_close() on any retry. The ASAN variant additionally aborts on a double-free
+# if the teardown order ever regresses.
+# -----------------------------------------------------------------------------
+function(add_reconnect_teardown_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_reconnect_teardown${suffix}")
+
+  add_executable(${testexe}
+    test_reconnect.c
+    ${_element_srcs}
+    mock_libuvc.c
+    mock_libusb.c
+  )
+  target_compile_definitions(${testexe} PRIVATE MOCK_LIBUSB_TEARDOWN)
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+    ${LIBUSB_INCLUDE_DIRS}
+  )
+  # No PkgConfig::LIBUSB: mock_libusb.c supplies every libusb symbol, and linking
+  # the real library too would multiply-define them.
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    Threads::Threads
+  )
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
+
+  setup_gst_test_environment("reconnect-teardown${suffix}" "${sanitizer}")
+  set(_rt_env ${GST_TEST_ENV})
+  list(APPEND _rt_env "GST_CHECKS=test_reconnect_teardown_order")
+
+  add_test(NAME reconnect_teardown_order${suffix} COMMAND ${testexe})
+  set_tests_properties(reconnect_teardown_order${suffix} PROPERTIES
+    ENVIRONMENT "${_rt_env}"
+    # start() binds the fixed control socket via the control thread, so keep this
+    # off the shared socket resource like the other start()-driven suites.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endfunction()
+
+add_reconnect_teardown_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_reconnect_teardown_variant("asan" "address")
+endif()
 
 # -----------------------------------------------------------------------------
 # PTS drift-bound regression guard (Task 1, harden-v2). Committed RED.
