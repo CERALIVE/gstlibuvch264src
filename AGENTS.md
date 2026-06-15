@@ -126,6 +126,10 @@ The `<seq>` counter is per-process-atomic, so two instances in the same process 
 
 Read this property back after `PAUSED` to discover the resolved path.
 
+### `reconnect` (boolean, default `false`)
+
+Opt-in in-element auto-reconnect on a mid-stream disconnect. Default is **off**: a disconnect always posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and ends the stream. When set to `true`, the element first attempts a bounded-backoff teardown/reopen (see DISCONNECT / RECONNECT BEHAVIOR) and only errors out if every retry is exhausted. Gated on the Task 4 spike verdict (`libuvch264src/docs/notes/reconnect-spike.md`).
+
 ### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
 
 Drives all three PTZ axes in one emission. Each axis is applied only when the device reports it. Returns `TRUE` if at least one supported axis was driven and every attempted set succeeded.
@@ -146,11 +150,11 @@ Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_T
 
 ## DISCONNECT / RECONNECT BEHAVIOR
 
-**Disconnect:** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently (no NULL-frame callback in callback mode). The element detects this via a bounded `g_async_queue_timeout_pop` in `create()`. On timeout with no frames, it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` to the bus and returns `GST_FLOW_ERROR`. Downstream (cerastream) handles the error.
+**Disconnect detection (always on):** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently — in callback mode it does **not** invoke the callback with a NULL frame, it simply goes quiet (Task 4 spike). `create()` therefore infers a disconnect from sustained silence: it counts consecutive `g_async_queue_timeout_pop` timeouts (each `TIMEOUT_DURATION` = 1 s), and after `DISCONNECT_TIMEOUT_COUNT` (5) in a row — i.e. ~5 s with no frame — it treats the device as gone. The counter resets on every real frame and in `start()`, so an isolated gap never trips it. On a confirmed disconnect with `reconnect=false` (the default), it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and returns `GST_FLOW_ERROR`; downstream (cerastream) handles the error.
 
-**Reconnect:** Opt-in, default off. The reconnect spike (`libuvch264src/docs/notes/reconnect-spike.md`) confirmed that native libuvc teardown after `LIBUSB_TRANSFER_NO_DEVICE` is **SAFE** — `uvc_stop_streaming()` → `uvc_close()` does not deadlock, the callback thread joins cleanly, and the libusb handle is closed exactly once. In-element reconnect is therefore feasible when enabled.
+**Reconnect (opt-in, default off):** With the `reconnect` property set to `true`, a confirmed disconnect first triggers an in-element reconnect before any error is posted. The path uses the spike's verified **native** teardown — `uvc_stop_streaming()` → `uvc_close()` → `uvc_unref_device()` (the callback thread joins cleanly and the libusb handle is closed exactly once) — then re-enumerates and re-resolves the `index` selector against a fresh device list (bus/address can change across a replug; a `vid:pid`/`serial:` selector survives it, a `bus:`/ordinal one may resolve to a different device), reopens, re-runs `uvc_get_stream_ctrl_format_size` with the negotiated geometry, and restarts streaming. Retries use bounded exponential backoff (1, 2, 4, 8, 16 s; `RECONNECT_MAX_RETRIES` = 5); the backoff is interruptible so a state change to NULL/PAUSED tears down promptly. If every retry is exhausted, it falls back to the disconnect error above. On success the IDR gate and PTS baseline are re-armed so the resumed stream waits for a fresh IDR.
 
-**Critical teardown constraint:** `force_usb_release()` must NOT be called before `uvc_close()`. The element's teardown now lets `uvc_close()` own the single `libusb_close()` call; `force_usb_release()` only drops interface claims on the still-open handle.
+**Critical teardown constraint:** `force_usb_release()` must NOT be called before `uvc_close()` — including on the reconnect path. The spike proved `force_usb_release()` + `uvc_close()` double-closes the libusb handle. The element's teardown (in `stop()` and reconnect) lets `uvc_close()` own the single `libusb_close()` call; `force_usb_release()` only drops interface claims on the still-open handle.
 
 ---
 

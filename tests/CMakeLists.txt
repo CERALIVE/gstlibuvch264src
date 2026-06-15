@@ -1173,3 +1173,75 @@ if(ENABLE_SANITIZERS)
   add_functional_variant("asan" "address")
   add_functional_variant("tsan" "thread")
 endif()
+
+# -----------------------------------------------------------------------------
+# Disconnect-detection + opt-in reconnect tests (Task 18).
+#
+# Same single-executable, statically-registered shape as test_pts_monotonic so
+# the mock feeder drives the real create() disconnect path in-process and the
+# mock's uvc_open() counter is observable (mock_uvc_open_count). Each case is its
+# own ctest entry via GST_CHECKS so it gets its own mock configuration.
+#   disconnect_error  reconnect off (default): a silent source posts a
+#                     RESOURCE/READ bus error within the timeout window.
+#   reconnect_resume  reconnect on: the element reopens the device and frames
+#                     resume after a simulated replug instead of erroring.
+# -----------------------------------------------------------------------------
+add_executable(test_reconnect
+  test_reconnect.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_reconnect PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_reconnect PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_reconnect PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_reconnect PRIVATE -fsanitize=address)
+endif()
+
+set(_reconnect_cases
+  "disconnect_error:test_disconnect_error"
+  "reconnect_resume:test_reconnect_resume"
+)
+foreach(_case ${_reconnect_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_rc_home "${CMAKE_BINARY_DIR}/reconnect-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_rc_home})
+
+  set(_rc_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/reconnect-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_rc_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _rc_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_reconnect)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_rc_env}"
+    # start() may spawn the control thread, so keep these off the shared socket
+    # resource like the other start()-driven suites under `ctest -j`.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()

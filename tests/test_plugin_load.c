@@ -7,6 +7,7 @@
  *   - the documented "index" property is present with its default,
  *   - the native "pan"/"tilt"/"zoom" PTZ properties are present (int, default 0),
  *   - the opt-in "control-socket" property is present (boolean, default off),
+ *   - the opt-in "reconnect" property is present (boolean, default off),
  *   - the ALWAYS "src" pad template advertises H.264 AND H.265 caps.
  *
  * No UVC device is opened: gst_element_factory_make() only runs class/instance
@@ -129,6 +130,28 @@ GST_START_TEST (test_element_has_control_socket_property)
 
 GST_END_TEST;
 
+/* Opt-in in-element auto-reconnect (Task 18): boolean, default FALSE so a
+ * mid-stream disconnect always errors out unless reconnect is explicitly on. */
+GST_START_TEST (test_element_has_reconnect_property)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL);
+
+  GParamSpec *pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (element),
+      "reconnect");
+  fail_unless (pspec != NULL, "expected 'reconnect' property is missing");
+  fail_unless (pspec->value_type == G_TYPE_BOOLEAN,
+      "'reconnect' should be boolean");
+
+  gboolean val = TRUE;
+  g_object_get (element, "reconnect", &val, NULL);
+  fail_unless (val == FALSE, "default 'reconnect' should be FALSE");
+
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_src_pad_template)
 {
   GstElementFactory *factory = gst_element_factory_find (ELEMENT_NAME);
@@ -180,6 +203,7 @@ plugin_load_suite (void)
   tcase_add_test (tc, test_element_has_index_property);
   tcase_add_test (tc, test_element_has_ptz_properties);
   tcase_add_test (tc, test_element_has_control_socket_property);
+  tcase_add_test (tc, test_element_has_reconnect_property);
   tcase_add_test (tc, test_src_pad_template);
 
   return s;

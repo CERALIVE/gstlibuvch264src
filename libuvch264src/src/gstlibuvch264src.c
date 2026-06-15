@@ -26,8 +26,18 @@ enum {
   PROP_ZOOM,
   PROP_CONTROL_SOCKET,
   PROP_CONTROL_SOCKET_PATH,
+  PROP_RECONNECT,
   PROP_LAST
 };
+
+/* Sustained-silence disconnect detection. libuvc delivers no NULL frame on
+ * unplug in callback mode (Task 4 spike), so create() infers a disconnect after
+ * this many consecutive TIMEOUT_DURATION (1 s) pop timeouts with no frame. */
+#define DISCONNECT_TIMEOUT_COUNT 5
+
+/* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
+#define RECONNECT_MAX_RETRIES 5
+#define RECONNECT_BACKOFF_INITIAL_S 1
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -113,6 +123,15 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                         "per-instance path under $XDG_RUNTIME_DIR",
                         NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Opt-in in-element auto-reconnect (Task 18). Default OFF: a mid-stream
+   * disconnect always posts a RESOURCE/READ error; only with this enabled does
+   * the element first attempt a bounded-backoff teardown/reopen before erroring. */
+  g_object_class_install_property(gobject_class, PROP_RECONNECT,
+    g_param_spec_boolean("reconnect", "Reconnect",
+                         "Attempt bounded in-element auto-reconnect when the "
+                         "device disconnects mid-stream",
+                         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -145,6 +164,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
   self->flushing = 0;
+  self->consecutive_timeouts = 0;
+  self->reconnect_enabled = FALSE;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -309,9 +330,12 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GST_OBJECT_UNLOCK(self);
 
     /* Persist the negotiated resolution so the SPS/PPS cache key (L5) reflects
-     * the active format; load_spspps/store_spspps read these. */
+     * the active format; load_spspps/store_spspps read these. The framerate is
+     * also kept so the opt-in reconnect path can re-run
+     * uvc_get_stream_ctrl_format_size() with the original geometry. */
     self->negotiated_width = width;
     self->negotiated_height = height;
+    self->negotiated_framerate = framerate;
 
     gst_base_src_set_caps(basesrc, best_caps);
 
@@ -384,6 +408,9 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       self->control_socket_path = (path && *path) ? g_strdup(path) : NULL;
       break;
     }
+    case PROP_RECONNECT:
+      self->reconnect_enabled = g_value_get_boolean(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -412,6 +439,9 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       break;
     case PROP_CONTROL_SOCKET_PATH:
       g_value_set_string(value, self->control_socket_path);
+      break;
+    case PROP_RECONNECT:
+      g_value_set_boolean(value, self->reconnect_enabled);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -641,6 +671,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   self->prev_int_ts = 0;
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;
+  self->consecutive_timeouts = 0;
 
   // Resolve the device selector up-front, before touching libuvc, so a
   // malformed index fails loudly here instead of silently selecting device 0.
@@ -843,6 +874,131 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
   return TRUE;
 }
 
+/* Opt-in in-element reconnect (Task 18), gated on the Task 4 spike verdict.
+ *
+ * Runs on the streaming thread from inside create() after a sustained-silence
+ * disconnect is detected, so it never races stop() (GstBaseSrc serialises them;
+ * unlock() only sets the flushing flag). Tears the dead handle down with the
+ * spike's verified NATIVE sequence and re-resolves the `index` selector against
+ * a fresh enumeration (bus/address can change across a replug), then reopens and
+ * restarts streaming with bounded exponential backoff. Returns TRUE once
+ * streaming has resumed, FALSE if every retry was exhausted or a concurrent
+ * unlock() asked us to bail.
+ *
+ * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
+ * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
+ * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
+static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
+    GST_ERROR_OBJECT(self, "Reconnect: invalid index \"%s\": %s",
+                     self->index ? self->index : "(null)", parse_err);
+    return FALSE;
+  }
+
+  // Native teardown of the dead handle (NO force_usb_release — double-free).
+  if (self->uvc_devh) {
+    uvc_stop_streaming(self->uvc_devh);
+    self->streaming = FALSE;
+    uvc_close(self->uvc_devh);
+    self->uvc_devh = NULL;
+  }
+  if (self->uvc_dev) {
+    uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
+  }
+
+  // Drop anything left in the queue so a resumed stream never forwards a frame
+  // captured before the disconnect (offset/PTS would be inconsistent).
+  gpointer stale;
+  while ((stale = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+    if (stale != FLUSH_SENTINEL) {
+      gst_buffer_unref(stale);
+    }
+  }
+
+  guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
+  for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
+    // Interruptible backoff: bail at once if unlock() flagged a flush, so
+    // teardown never blocks for the full (up to 16 s) backoff window.
+    for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
+      if (g_atomic_int_get(&self->flushing)) {
+        return FALSE;
+      }
+      g_usleep(100 * 1000);
+    }
+
+    GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
+                     attempt + 1, RECONNECT_MAX_RETRIES, backoff_s);
+    backoff_s *= 2;
+
+    uvc_device_t **dev_list = NULL;
+    if (uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL) < 0 ||
+        dev_list == NULL) {
+      continue;
+    }
+
+    uvc_device_t *selected = NULL;
+    for (int i = 0; dev_list[i] != NULL; i++) {
+      if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
+        selected = dev_list[i];
+        break;
+      }
+    }
+    if (selected == NULL) {
+      uvc_free_device_list(dev_list, 1);
+      continue;
+    }
+
+    // Ref the chosen device before freeing the list (free unrefs every entry).
+    uvc_ref_device(selected);
+    uvc_free_device_list(dev_list, 1);
+
+    if (uvc_open(selected, &self->uvc_devh) < 0) {
+      self->uvc_devh = NULL;
+      uvc_unref_device(selected);
+      continue;
+    }
+    self->uvc_dev = selected;
+
+    if (uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+            self->frame_format, self->negotiated_width, self->negotiated_height,
+            self->negotiated_framerate) < 0) {
+      uvc_close(self->uvc_devh);
+      self->uvc_devh = NULL;
+      uvc_unref_device(self->uvc_dev);
+      self->uvc_dev = NULL;
+      continue;
+    }
+
+    // Re-arm the stream state BEFORE the feeder spawns so frame_callback sees the
+    // reset (pthread_create in uvc_start_streaming is the happens-before edge):
+    // re-latch the PTS baseline and re-engage the IDR gate after the gap.
+    self->had_idr = FALSE;
+    self->send_sps_pps = FALSE;
+    self->base_time = G_MAXUINT64;
+    self->prev_pts = G_MAXUINT64;
+
+    if (uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback,
+                            self, 0) < 0) {
+      uvc_close(self->uvc_devh);
+      self->uvc_devh = NULL;
+      uvc_unref_device(self->uvc_dev);
+      self->uvc_dev = NULL;
+      continue;
+    }
+
+    self->streaming = TRUE;
+    GST_INFO_OBJECT(self, "Reconnect succeeded on attempt %d", attempt + 1);
+    return TRUE;
+  }
+
+  GST_WARNING_OBJECT(self, "Reconnect exhausted after %d attempts",
+                     RECONNECT_MAX_RETRIES);
+  return FALSE;
+}
+
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
@@ -876,12 +1032,44 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       return GST_FLOW_FLUSHING;
     }
 
-    if (item == NULL || item == FLUSH_SENTINEL) {
-      // Plain timeout, or a stale sentinel from a finished flush: keep waiting
-      // rather than ending the stream on a transient gap.
+    if (item == NULL) {
+      // A real pop timeout. libuvc delivers no NULL frame on unplug in callback
+      // mode (it just goes silent, per the Task 4 spike), so sustained silence
+      // is how a disconnect is detected. Count consecutive timeouts; a single
+      // gap is tolerated, but DISCONNECT_TIMEOUT_COUNT in a row means the device
+      // is gone.
+      if (++self->consecutive_timeouts < DISCONNECT_TIMEOUT_COUNT) {
+        continue;
+      }
+
+      GST_WARNING_OBJECT(self, "Device silent for %d s, assuming disconnect",
+                         DISCONNECT_TIMEOUT_COUNT);
+
+      // Opt-in reconnect: try to resume before erroring. Default off, so a
+      // disconnect always surfaces as a RESOURCE/READ error downstream.
+      if (self->reconnect_enabled && gst_libuvc_h264_src_reconnect(self)) {
+        self->consecutive_timeouts = 0;
+        continue;
+      }
+
+      // A flush raced in during the reconnect backoff: honour it over the error.
+      if (g_atomic_int_get(&self->flushing)) {
+        return GST_FLOW_FLUSHING;
+      }
+
+      gst_libuvc_h264_src_post_disconnect_error(GST_ELEMENT(self));
+      return GST_FLOW_ERROR;
+    }
+
+    if (item == FLUSH_SENTINEL) {
+      // A stale sentinel from a finished flush: not silence, so reset the
+      // disconnect counter and keep waiting.
+      self->consecutive_timeouts = 0;
       continue;
     }
 
+    // A real frame arrived: silence is broken.
+    self->consecutive_timeouts = 0;
     *buf = item;
     return GST_FLOW_OK;
   }

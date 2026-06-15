@@ -25,9 +25,19 @@ struct _GstLibuvcH264Src {
   enum uvc_frame_format frame_format;
   gint negotiated_width;
   gint negotiated_height;
+  /* The framerate negotiate() resolved, kept so the opt-in reconnect path can
+   * re-run uvc_get_stream_ctrl_format_size() with the original geometry. Unlike
+   * frame_interval (mutated by the PTS estimator), this stays the negotiated value. */
+  gint negotiated_framerate;
   GAsyncQueue *frame_queue;
   gboolean streaming;
   gint flushing; /* atomic: set by unlock(), checked by create() to bail out */
+  /* Sustained-silence disconnect detection + opt-in reconnect (Task 18). libuvc
+   * delivers no NULL frame on unplug in callback mode (it goes silent), so
+   * create() infers a disconnect after DISCONNECT_TIMEOUT_COUNT consecutive 1s
+   * timeouts. Reset in start() and whenever a real frame arrives. */
+  gint consecutive_timeouts;
+  gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
   GstClock *clock;
   int64_t pts_offset_sum;
   int64_t pts_stretch;
