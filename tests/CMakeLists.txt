@@ -881,18 +881,27 @@ target_link_libraries(test_live_source PRIVATE
 )
 apply_sanitizer_flags(test_live_source "${STATIC_SUITE_SANITIZER}")
 
+# "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
+# GST_CHECKS. cache_h265_vps_write_on_change is named with the "cache" stem so
+# `ctest -R cache` covers it alongside the path-builder suites; it exports
+# MOCK_UVC_FRAME_FORMAT=H265 to declare the codec the case exercises.
 set(_live_source_cases
-  "live_source_polish:test_live_source_polish"
-  "spspps_write_on_change:test_spspps_write_on_change"
+  "live_source_polish:test_live_source_polish:"
+  "spspps_write_on_change:test_spspps_write_on_change:"
+  "cache_h265_vps_write_on_change:test_h265_vps_write_on_change:MOCK_UVC_FRAME_FORMAT=H265"
 )
 foreach(_case ${_live_source_cases})
   string(REPLACE ":" ";" _parts ${_case})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
+  list(GET _parts 2 _extraenv)
 
   setup_gst_test_environment("live-source-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
   set(_ls_env ${GST_TEST_ENV})
   list(APPEND _ls_env "GST_CHECKS=${_testfn}")
+  if(NOT _extraenv STREQUAL "")
+    list(APPEND _ls_env "${_extraenv}")
+  endif()
 
   add_test(NAME ${_ctestname} COMMAND test_live_source)
   set_tests_properties(${_ctestname} PROPERTIES
