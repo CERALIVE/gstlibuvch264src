@@ -405,7 +405,7 @@ add_gstcheck_multicase_test(test_ptz "ptz"
   "${STATIC_SUITE_SANITIZER}" "${_ptz_cases}")
 
 # -----------------------------------------------------------------------------
-# Opt-in hardened control-socket tests (Task 16).
+# Opt-in hardened control-socket tests (Task 16 + Task 4 harden-v3).
 #
 # Same single-executable, statically-registered shape as test_ptz so start()/
 # stop() run the REAL socket bind/unbind against the filesystem (only libuvc is
@@ -413,17 +413,59 @@ add_gstcheck_multicase_test(test_ptz "ptz"
 # its own private $XDG_RUNTIME_DIR (created in the test), so nothing collides on
 # the old fixed /tmp/libuvc_control path - which is gone now that the socket is
 # opt-in and per-instance.
+#
+# Built in plain, ASAN, and TSAN variants. The TSAN variant is the gate for the
+# control-socket lifecycle race (close_during_select): the element TUs and the
+# mock link into one -fsanitize=thread binary so TSan observes the control thread
+# against stop()/unbind(). It uses the STANDARD tsan.suppressions (third-party
+# blind spots only) - NOT tsan_pts.suppressions - and that file has had its
+# control_thread/process_control_command baselines removed now that this task
+# locks the path, so a regression reappears as a reported race.
 # -----------------------------------------------------------------------------
-add_static_gstcheck_exe(test_socket)
+function(add_socket_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
 
-set(_socket_cases
-  "socket_default_off:test_socket_default_off"
-  "socket_hardened:test_socket_hardened"
-)
-# No RESOURCE_LOCK: each case binds a per-instance path under its own private
-# $XDG_RUNTIME_DIR, so nothing collides and they can run concurrently.
-add_gstcheck_multicase_test(test_socket "socket"
-  "${STATIC_SUITE_SANITIZER}" "${_socket_cases}" NO_RESOURCE_LOCK)
+  set(testexe "test_socket${suffix}")
+
+  add_executable(${testexe} test_socket.c ${_element_srcs} mock_libuvc.c)
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
+
+  # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS.
+  set(_socket_cases
+    "socket_default_off${suffix}:test_socket_default_off"
+    "socket_hardened${suffix}:test_socket_hardened"
+    "socket_command_framing${suffix}:test_socket_command_framing"
+    "socket_command_oversized${suffix}:test_socket_command_oversized"
+    "socket_close_during_select${suffix}:test_socket_close_during_select"
+  )
+  # No RESOURCE_LOCK: each case binds a per-instance path under its own private
+  # $XDG_RUNTIME_DIR, so nothing collides and they can run concurrently.
+  add_gstcheck_multicase_test(${testexe} "socket${suffix}" "${sanitizer}"
+    "${_socket_cases}" NO_RESOURCE_LOCK)
+endfunction()
+
+add_socket_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_socket_variant("asan" "address")
+  add_socket_variant("tsan" "thread")
+endif()
 
 # -----------------------------------------------------------------------------
 # Error-mapping unit test (gst-check). Compiles the standalone error TU directly
@@ -911,7 +953,8 @@ function(add_nal_parse_variant variant sanitizer)
   endif()
 
   foreach(_suite multislice startcode bounds
-                 multislice_h265 startcode_h265 bounds_h265)
+                 multislice_h265 startcode_h265 bounds_h265
+                 store_bounds fuzz_seed)
     add_test(NAME nal_parse_${_suite}${suffix} COMMAND ${testexe} ${_suite})
     if(_nal_env)
       set_tests_properties(nal_parse_${_suite}${suffix} PROPERTIES ENVIRONMENT "${_nal_env}")
@@ -922,6 +965,77 @@ endfunction()
 add_nal_parse_variant("" "")
 if(ENABLE_SANITIZERS)
   add_nal_parse_variant("asan" "address")
+endif()
+
+# -----------------------------------------------------------------------------
+# libFuzzer NAL-parser harness (Task 11 harden). Opt-in: -DENABLE_FUZZERS=ON.
+#
+# libFuzzer needs -fsanitize=fuzzer, which conflicts with the suite's
+# -fsanitize=thread and is clang-only, so the fuzz target is built by an explicit
+# clang invocation (a custom command) independent of the project compiler (which
+# may be gcc) rather than a normal add_executable. It links fuzz_nal.c + the real
+# frame_pipeline.c with -fsanitize=fuzzer,address into <build>/tests/fuzz_nal.
+#
+# The fixed-iteration (20000-run) ctest smoke replays the seed corpus and proves
+# nothing crashes; it runs against a build-local COPY of the corpus so the fuzzer
+# never writes new finds back into the source tree. It is NOT in the default
+# ctest path - the target and the test exist only when ENABLE_FUZZERS=ON.
+# -----------------------------------------------------------------------------
+option(ENABLE_FUZZERS "Build the libFuzzer NAL-parser harness (clang only)" OFF)
+if(ENABLE_FUZZERS)
+  find_program(CLANG_FOR_FUZZ NAMES clang clang-20 clang-19 clang-18 clang-17)
+  if(NOT CLANG_FOR_FUZZ)
+    message(FATAL_ERROR
+      "ENABLE_FUZZERS=ON requires clang (libFuzzer); none found in PATH")
+  endif()
+
+  execute_process(
+    COMMAND ${PKG_CONFIG_EXECUTABLE} --cflags gstreamer-1.0 gstreamer-base-1.0
+    OUTPUT_VARIABLE _fuzz_pkg_cflags OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(
+    COMMAND ${PKG_CONFIG_EXECUTABLE} --libs gstreamer-1.0 gstreamer-base-1.0
+    OUTPUT_VARIABLE _fuzz_pkg_libs OUTPUT_STRIP_TRAILING_WHITESPACE)
+  separate_arguments(_fuzz_pkg_cflags)
+  separate_arguments(_fuzz_pkg_libs)
+
+  set(_fuzz_incs -I${CMAKE_SOURCE_DIR}/libuvch264src/src)
+  if(LIBUVC_EXTRA_INCLUDES)
+    list(APPEND _fuzz_incs -I${LIBUVC_EXTRA_INCLUDES})
+  endif()
+  foreach(_d ${LIBUVC_INCLUDE_DIRS})
+    list(APPEND _fuzz_incs -I${_d})
+  endforeach()
+
+  set(_fuzz_bin ${CMAKE_CURRENT_BINARY_DIR}/fuzz_nal)
+  add_custom_command(
+    OUTPUT ${_fuzz_bin}
+    COMMAND ${CLANG_FOR_FUZZ} -g -O1 -fno-omit-frame-pointer
+            -fsanitize=fuzzer,address
+            ${_fuzz_incs} ${_fuzz_pkg_cflags}
+            ${CMAKE_CURRENT_SOURCE_DIR}/fuzz_nal.c
+            ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.c
+            ${_fuzz_pkg_libs}
+            -o ${_fuzz_bin}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fuzz_nal.c
+            ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.c
+            ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.h
+            ${CMAKE_SOURCE_DIR}/libuvch264src/src/spspps_cache.h
+    COMMENT "Building libFuzzer NAL harness (clang -fsanitize=fuzzer,address)"
+    VERBATIM)
+  add_custom_target(fuzz_nal ALL DEPENDS ${_fuzz_bin})
+
+  # Build-local corpus copy so the smoke run never writes new finds into the
+  # source tree (libFuzzer treats the positional dir as a writable corpus).
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus)
+  file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/corpus/nal
+       DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus)
+
+  add_test(NAME fuzz_nal_smoke
+    COMMAND ${_fuzz_bin} -runs=20000 -timeout=20
+            ${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus/nal)
+  set_tests_properties(fuzz_nal_smoke PROPERTIES
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1"
+    TIMEOUT 120)
 endif()
 
 # -----------------------------------------------------------------------------

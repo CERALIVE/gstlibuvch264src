@@ -8,17 +8,42 @@
 #include "spspps_path.h"
 
 #define DIRBUFLEN 4096
-__thread char dir_buf[DIRBUFLEN];
-char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
+static __thread char dir_buf[DIRBUFLEN];
+
+/* Copy the cache-key fields out of the instance under GST_OBJECT_LOCK. This is
+ * the writer-vs-reader handshake for self->index: set_property(PROP_INDEX) takes
+ * the same lock to g_free()/replace it, so copying it here turns the historical
+ * callback-thread use-after-free into a plain value copy. The lock is dropped
+ * before any file I/O - it must NEVER be held across fopen/fread/fwrite. */
+void spspps_key_snapshot(GstLibuvcH264Src *self, spspps_key_t *key) {
+    GST_OBJECT_LOCK(self);
+    if (self->index) {
+        g_strlcpy(key->index, self->index, sizeof(key->index));
+        key->have_index = TRUE;
+    } else {
+        key->index[0] = '\0';
+        key->have_index = FALSE;
+    }
+    key->is_h265 = (self->frame_format == UVC_FRAME_FORMAT_H265);
+    key->width = self->negotiated_width;
+    key->height = self->negotiated_height;
+    GST_OBJECT_UNLOCK(self);
+}
+
+static const char *spspps_home_dir(GstLibuvcH264Src *self) {
     const char *home_dir = getenv("HOME");
     if (home_dir == NULL) {
         GST_WARNING_OBJECT(self, "HOME environment variable not set.");
         home_dir = "";
     }
+    return home_dir;
+}
 
-    int is_h265 = (self->frame_format == UVC_FRAME_FORMAT_H265);
-    int ret = spspps_build_path(dir_buf, DIRBUFLEN, home_dir, index, is_h265,
-                                self->negotiated_width, self->negotiated_height);
+/* Build the cache FILE path from the immutable snapshot (no self->index read). */
+static char *get_spspps_path(GstLibuvcH264Src *self, const spspps_key_t *key) {
+    const char *index = key->have_index ? key->index : NULL;
+    int ret = spspps_build_path(dir_buf, DIRBUFLEN, spspps_home_dir(self), index,
+                                key->is_h265, key->width, key->height);
     if (ret < 0) {
         GST_ERROR_OBJECT(self, "Error building SPS/PPS path");
         return NULL;
@@ -27,12 +52,14 @@ char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
     return dir_buf;
 }
 
-void create_hidden_directory(GstLibuvcH264Src *self) {
-    char *hidden_dir = get_spspps_path(self, NULL);
-    if (hidden_dir == NULL) {
+static void create_hidden_directory(GstLibuvcH264Src *self) {
+    int ret = spspps_build_path(dir_buf, DIRBUFLEN, spspps_home_dir(self), NULL,
+                                0, 0, 0);
+    if (ret < 0) {
         GST_WARNING_OBJECT(self, "SPS/PPS cache directory path unavailable; skipping creation.");
         return;
     }
+    char *hidden_dir = dir_buf;
 
     struct stat st;
     if (stat(hidden_dir, &st) == -1) {
@@ -44,14 +71,14 @@ void create_hidden_directory(GstLibuvcH264Src *self) {
         GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
 }
 
-FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
+static FILE *open_spspps_file(GstLibuvcH264Src *self, const spspps_key_t *key, char mode) {
     if (mode == 'w' || mode == 'a') {
         create_hidden_directory(self);
     }
 
     char m[3];
-    sprintf(m, "%cb", mode);
-    char *file_name = get_spspps_path(self, self->index);
+    snprintf(m, sizeof(m), "%cb", mode);
+    char *file_name = get_spspps_path(self, key);
     if (file_name == NULL) {
         GST_WARNING_OBJECT(self, "SPS/PPS cache path unavailable; skipping cache I/O.");
         return NULL;
@@ -61,8 +88,8 @@ FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
 }
 
 // Must only be called after the caps have been negotiated and the format is known
-void load_spspps(GstLibuvcH264Src *self) {
-    FILE* fp = open_spspps_file(self, 'r');
+void load_spspps(GstLibuvcH264Src *self, const spspps_key_t *key) {
+    FILE* fp = open_spspps_file(self, key, 'r');
     if (fp) {
         unsigned char buf[SPSPPSBUFSZ*3];
         gsize read_bytes = fread(buf, 1, sizeof(buf), fp);
@@ -112,14 +139,14 @@ void load_spspps(GstLibuvcH264Src *self) {
     }
 }
 
-void store_spspps(GstLibuvcH264Src *self) {
-    FILE* fp = open_spspps_file(self, 'w');
+void store_spspps(GstLibuvcH264Src *self, const spspps_key_t *key) {
+    FILE* fp = open_spspps_file(self, key, 'w');
 	if (fp) {
-		if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-			fwrite(self->vps, 1, self->vps_length, fp);
+		if (key->is_h265) {
+			fwrite(self->vps, 1, spspps_clamp_len(self->vps_length), fp);
 		}
-		fwrite(self->sps, 1, self->sps_length, fp);
-		fwrite(self->pps, 1, self->pps_length, fp);
+		fwrite(self->sps, 1, spspps_clamp_len(self->sps_length), fp);
+		fwrite(self->pps, 1, spspps_clamp_len(self->pps_length), fp);
 		fclose(fp);
 	}
 }

@@ -67,6 +67,7 @@ int find_nal_unit(enum uvc_frame_format format,
             hdr = i + 4;
             code_len = 4;
         } else if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1) {
+            if (i + 3 >= buflen) break;   /* 3-byte start code with no header byte */
             hdr = i + 3;
             code_len = 3;
         } else {
@@ -360,6 +361,12 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     g_free(units);
 
     if (updated_sps_pps) {
-        store_spspps(self);
+        /* store_spspps() runs on the libuvc callback thread; self->index is a
+         * gchar* that set_property(PROP_INDEX) can g_free()/replace on the app
+         * thread. Snapshot the cache key once under GST_OBJECT_LOCK here, then
+         * write the cache off the immutable copy with the lock released. */
+        spspps_key_t key;
+        spspps_key_snapshot(self, &key);
+        store_spspps(self, &key);
     }
 }

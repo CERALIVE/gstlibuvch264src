@@ -39,14 +39,19 @@ gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self) {
         return FALSE;
     }
 
-    self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (self->control_socket < 0) {
+    /* Build the listening fd on a LOCAL until it is fully ready, then publish it
+     * to self->control_socket under control_mutex (the same lock the control
+     * thread snapshots it through and unbind() closes it under). A half-built fd
+     * is never visible to the thread, and the fd's whole lifecycle is serialised
+     * on one lock so the thread can never select()/accept() a torn-down fd. */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
         GST_ERROR_OBJECT(self, "Failed to create control socket");
         return FALSE;
     }
 
-    int flags = fcntl(self->control_socket, F_GETFL, 0);
-    fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -55,11 +60,10 @@ gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self) {
     /* Drop a socket left by an unclean prior exit; bind to a live path fails. */
     unlink(self->control_socket_path);
 
-    if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         GST_ERROR_OBJECT(self, "Failed to bind control socket at %s",
                          self->control_socket_path);
-        close(self->control_socket);
-        self->control_socket = -1;
+        close(fd);
         return FALSE;
     }
 
@@ -68,29 +72,38 @@ gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self) {
     if (chmod(self->control_socket_path, S_IRUSR | S_IWUSR) < 0) {
         GST_ERROR_OBJECT(self, "Failed to chmod control socket %s to 0600",
                          self->control_socket_path);
-        close(self->control_socket);
-        self->control_socket = -1;
+        close(fd);
         unlink(self->control_socket_path);
         return FALSE;
     }
 
-    if (listen(self->control_socket, 5) < 0) {
+    if (listen(fd, 5) < 0) {
         GST_ERROR_OBJECT(self, "Failed to listen on control socket");
-        close(self->control_socket);
-        self->control_socket = -1;
+        close(fd);
         unlink(self->control_socket_path);
         return FALSE;
     }
+
+    g_mutex_lock(&self->control_mutex);
+    self->control_socket = fd;
+    g_mutex_unlock(&self->control_mutex);
 
     GST_INFO_OBJECT(self, "Control socket listening on %s", self->control_socket_path);
     return TRUE;
 }
 
 void gst_libuvc_h264_src_control_socket_unbind(GstLibuvcH264Src *self) {
+    /* Close and invalidate the listening fd under control_mutex so a concurrent
+     * control-thread snapshot sees either a live fd or -1, never a reused one.
+     * stop() has already joined the thread before calling this, so in the normal
+     * path there is no contention; the lock makes the invariant hold regardless. */
+    g_mutex_lock(&self->control_mutex);
     if (self->control_socket >= 0) {
         close(self->control_socket);
         self->control_socket = -1;
     }
+    g_mutex_unlock(&self->control_mutex);
+
     if (self->control_socket_path != NULL) {
         unlink(self->control_socket_path);
     }
@@ -101,52 +114,83 @@ void gst_libuvc_h264_src_control_socket_unbind(GstLibuvcH264Src *self) {
 // race where the listening fd was assigned from inside this thread.
 gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
-    int client_fd;
     char buffer[256];
-    fd_set read_fds;
-    struct timeval timeout;
 
-    while (self->control_running) {
+    /* control_running is read atomically: stop() flips it (atomically) and
+     * self-connects to break the select(), so the thread observes the shutdown
+     * on its very next loop turn without relying on the wakeup landing first. */
+    while (g_atomic_int_get(&self->control_running)) {
+        /* Snapshot the listening fd under control_mutex. bind() publishes it and
+         * unbind() closes+invalidates it under the same lock, so the snapshot is
+         * either a live listening fd or -1 - never a closed-then-reused one. */
+        g_mutex_lock(&self->control_mutex);
+        int listen_fd = self->control_socket;
+        g_mutex_unlock(&self->control_mutex);
+
+        if (listen_fd < 0)
+            break;
+
+        fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(self->control_socket, &read_fds);
-        
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        
-        int result = select(self->control_socket + 1, &read_fds, NULL, NULL, &timeout);
-        
-        if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
-            client_fd = accept(self->control_socket, NULL, NULL);
-            if (client_fd >= 0) {
-                ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
-                if (len > 0) {
-                    buffer[len] = 0;
-                    GST_INFO_OBJECT(self, "Received control command: %s", buffer);
-                    char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
-                    if (response) {
-                        if (write(client_fd, response, strlen(response)) < 0) {
-                            GST_WARNING_OBJECT(self, "Failed to write response to control socket");
-                        }
-                        g_free(response);
-                    } else {
-                        const char *default_response = "OK";
-                        if (write(client_fd, default_response, strlen(default_response)) < 0) {
-                            GST_WARNING_OBJECT(self, "Failed to write default response to control socket");
-                        }
-                    }
-                }
-                close(client_fd);
-            }
-        } else if (result == 0) {
-            continue;
-        } else {
-            if (self->control_running) {
+        FD_SET(listen_fd, &read_fds);
+
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+        int result = select(listen_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (result < 0) {
+            if (g_atomic_int_get(&self->control_running))
                 GST_WARNING_OBJECT(self, "Select error in control thread");
-            }
             break;
         }
+        if (result == 0 || !FD_ISSET(listen_fd, &read_fds))
+            continue;
+
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0)
+            continue;
+
+        ssize_t len = read(client_fd, buffer, sizeof(buffer) - 1);
+        if (len > 0) {
+            /* Explicit framing: the command runs from buffer[0] up to the first
+             * line terminator (LF/CR) or embedded NUL, whichever comes first.
+             * This strips the trailing newline a line-oriented client sends and
+             * bounds the token strcmp()/sscanf() inspect to clean bytes. */
+            size_t cmd_len = 0;
+            while (cmd_len < (size_t) len &&
+                   buffer[cmd_len] != '\n' &&
+                   buffer[cmd_len] != '\r' &&
+                   buffer[cmd_len] != '\0') {
+                cmd_len++;
+            }
+            gboolean terminated = (cmd_len < (size_t) len);
+
+            char *response;
+            if (!terminated && len == (ssize_t) (sizeof(buffer) - 1)) {
+                /* The read filled the buffer with no terminator in sight: the
+                 * command is longer than we accept (or unframed garbage). Reject
+                 * it cleanly instead of letting sscanf() latch onto a valid
+                 * prefix of an unbounded blob and drive the device. */
+                response = g_strdup("ERROR: command too long");
+            } else {
+                /* NUL-terminate at the ACTUAL framed length, never at
+                 * sizeof(buffer)-1, so a non-terminated or embedded-NUL read can
+                 * never run strcmp()/sscanf() past the command's real bytes. */
+                buffer[cmd_len] = '\0';
+                GST_INFO_OBJECT(self, "Received control command: %s", buffer);
+                response = gst_libuvc_h264_src_process_control_command(self, buffer);
+                if (response == NULL)
+                    response = g_strdup("OK");
+            }
+
+            /* MSG_NOSIGNAL: a client that disconnected before reading must not
+             * raise SIGPIPE and tear the whole element down. */
+            if (send(client_fd, response, strlen(response), MSG_NOSIGNAL) < 0)
+                GST_WARNING_OBJECT(self, "Failed to write response to control socket");
+            g_free(response);
+        }
+        close(client_fd);
     }
-    
+
     GST_DEBUG_OBJECT(self, "Control thread exiting");
     return NULL;
 }

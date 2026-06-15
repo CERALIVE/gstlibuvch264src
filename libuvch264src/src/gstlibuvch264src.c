@@ -465,7 +465,9 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     GST_INFO_OBJECT(basesrc, "Negotiated caps: %" GST_PTR_FORMAT, best_caps);
 
-    load_spspps(self);
+    spspps_key_t cache_key;
+    spspps_key_snapshot(self, &cache_key);
+    load_spspps(self, &cache_key);
 
     result = TRUE;
 
@@ -511,8 +513,13 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
 
   switch (prop_id) {
     case PROP_INDEX:
+      /* self->index is read on the libuvc callback thread (the SPS/PPS cache key
+       * snapshot). Mutate it under the object lock so that free/replace and the
+       * snapshot's read form a proper happens-before instead of a use-after-free. */
+      GST_OBJECT_LOCK(self);
       g_free(self->index);
       self->index = g_value_dup_string(value);
+      GST_OBJECT_UNLOCK(self);
       break;
     case PROP_PAN:
       gst_libuvc_h264_src_ptz_set_pan(self, g_value_get_int(value));
@@ -556,7 +563,9 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
 
   switch (prop_id) {
     case PROP_INDEX:
+      GST_OBJECT_LOCK(self);
       g_value_set_string(value, self->index);
+      GST_OBJECT_UNLOCK(self);
       break;
     case PROP_PAN:
       g_value_set_int(value, self->pan_cur);
@@ -904,7 +913,9 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   // exists before any accept(); a bind failure is non-fatal to the media path.
   if (self->control_socket_enabled) {
     if (gst_libuvc_h264_src_control_socket_bind(self)) {
-      self->control_running = TRUE;
+      /* Atomic so the control thread sees TRUE before it ever runs (g_thread_new
+       * is the publish edge) and observes the stop() FALSE without a data race. */
+      g_atomic_int_set(&self->control_running, TRUE);
       self->control_thread = g_thread_new("uvc-control",
                                           gst_libuvc_h264_src_control_thread,
                                           self);
@@ -918,16 +929,18 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   return TRUE;
 }
 
-// FIXED: Proper cleanup with libusb handle release
+// Teardown: stop streaming, drain the frame queue, then let uvc_close() own the
+// single libusb_close() (libuvc's native release path). Runs on every restart
+// and is re-entered from start()'s cleanup path, so it must stay idempotent.
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
 
   GST_DEBUG_OBJECT(self, "Stopping libuvc source");
 
   // Stop control thread
-  if (self->control_running) {
+  if (g_atomic_int_get(&self->control_running)) {
     GST_DEBUG_OBJECT(self, "Stopping control thread");
-    self->control_running = FALSE;
+    g_atomic_int_set(&self->control_running, FALSE);
 
     // Nudge the thread out of its select() at once by self-connecting to the
     // bound path; the 1s select timeout is the fallback if this misses.
@@ -953,12 +966,14 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   // Close the listening fd and unlink the per-instance socket path.
   gst_libuvc_h264_src_control_socket_unbind(self);
 
-  // CRITICAL FIX: Stop streaming and force USB release
+  // Stop streaming. uvc_stop_streaming() is synchronous: it clears running,
+  // broadcasts cb_cond, and pthread_join()s the callback thread before it
+  // returns (Task 4 spike, reconnect-spike.md §2/§3), so no post-stop settle
+  // delay is needed - the old usleep(100ms) here was unnecessary.
   if (self->streaming && self->uvc_devh) {
     GST_DEBUG_OBJECT(self, "Stopping UVC streaming");
     uvc_stop_streaming(self->uvc_devh);
     self->streaming = FALSE;
-    usleep(100000); // 100ms for streaming to stop
   }
 
   // Clear frame queue
@@ -969,12 +984,14 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     }
   }
 
-  // FIXED: Release USB device BEFORE uvc_close
+  // Let uvc_close() own the single libusb_close(). libuvc's native teardown
+  // (uvc_close -> uvc_release_if -> libusb_release_interface, then exactly one
+  // libusb_close) releases the interfaces and closes the handle once. Do NOT
+  // call a bare libusb_close()/interface release before this: the Task 4 spike
+  // (reconnect-spike.md §3) proved that double-closes the libusb handle (heap
+  // corruption). This mirrors the reconnect path's native teardown.
   if (self->uvc_devh) {
-    GST_DEBUG_OBJECT(self, "Force releasing USB device");
-    gst_libuvc_h264_src_force_usb_release(self);
-    
-    // Now call uvc_close (it may fail but that's OK since we already released)
+    GST_DEBUG_OBJECT(self, "Closing UVC device handle");
     uvc_close(self->uvc_devh);
     self->uvc_devh = NULL;
   }
@@ -1056,9 +1073,11 @@ void gst_libuvc_h264_src_set_reconnect_backoff_hook(
  * streaming has resumed, FALSE if every retry was exhausted or a concurrent
  * unlock() asked us to bail.
  *
- * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
- * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
- * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
+ * CRITICAL: tear the dead handle down with the native sequence ONLY
+ * (uvc_stop_streaming()->uvc_close()->uvc_unref_device()); uvc_close() owns the
+ * single libusb_close(). Never reintroduce a bare libusb_close()/interface
+ * release before uvc_close() — the Task 4 spike proved that double-closes the
+ * libusb handle. */
 gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   GstLibuvcDeviceSelector selector = {0};
   const gchar *parse_err = NULL;
@@ -1068,7 +1087,7 @@ gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
     return FALSE;
   }
 
-  // Native teardown of the dead handle (NO force_usb_release — double-free).
+  // Native teardown of the dead handle: uvc_close() owns the single libusb_close().
   if (self->uvc_devh) {
     uvc_stop_streaming(self->uvc_devh);
     self->streaming = FALSE;
@@ -1149,7 +1168,7 @@ gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
 
     if (uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
             self->frame_format, self->negotiated_width, self->negotiated_height,
-            self->negotiated_framerate) < 0) {
+             self->negotiated_framerate) < 0) {
       uvc_close(self->uvc_devh);
       self->uvc_devh = NULL;
       uvc_unref_device(self->uvc_dev);
