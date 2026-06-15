@@ -82,6 +82,7 @@ add_library(gstlibuvch264src MODULE
   libuvch264src/src/frame_pipeline.c
   libuvch264src/src/ptz_control.c
   libuvch264src/src/spspps_cache.c
+  libuvch264src/src/gstlibuvch264src_error.c
 )
 set_target_properties(gstlibuvch264src PROPERTIES
   PREFIX "lib"

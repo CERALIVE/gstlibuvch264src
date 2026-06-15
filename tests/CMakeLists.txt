@@ -173,3 +173,39 @@ if(ENABLE_SANITIZERS)
   add_mock_harness_variant("asan" "address")
   add_mock_harness_variant("tsan" "thread")
 endif()
+
+# -----------------------------------------------------------------------------
+# Error-mapping unit test (gst-check). Compiles the standalone error TU directly
+# and asserts each uvc_error_t -> GST_ELEMENT_ERROR domain/code on the bus.
+# No plugin and no UVC device are involved; only the helper + libuvc's error
+# enum/strerror are linked.
+# -----------------------------------------------------------------------------
+add_executable(test_error_map
+  test_error_map.c
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
+)
+target_include_directories(test_error_map PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_error_map PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  ${LIBUVC_LINK_TARGET}
+)
+
+# Isolate the GStreamer registry/HOME, and make a vendored libuvc resolvable at
+# run time when it was built via FetchContent (see top-level CMakeLists.txt).
+set(_errmap_env
+  "GST_REGISTRY=${CMAKE_BINARY_DIR}/errmap-registry.bin"
+  "GST_REGISTRY_FORK=no"
+  "HOME=${CMAKE_BINARY_DIR}"
+)
+if(LIBUVC_RUNTIME_DIR)
+  list(APPEND _errmap_env "LD_LIBRARY_PATH=${LIBUVC_RUNTIME_DIR}")
+endif()
+
+add_test(NAME error_map COMMAND test_error_map)
+set_tests_properties(error_map PROPERTIES ENVIRONMENT "${_errmap_env}")

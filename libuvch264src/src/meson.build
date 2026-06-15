@@ -12,6 +12,8 @@ sources = [
   'ptz_control.h',
   'spspps_cache.c',
   'spspps_cache.h',
+  'gstlibuvch264src_error.c',
+  'gstlibuvch264src_error.h',
 ]
 
 shared_library(library_name, sources,
