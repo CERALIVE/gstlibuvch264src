@@ -8,11 +8,20 @@ Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths
 
 ## Example Pipelines
 
+### H.264 — Basic Capture
+
 **Display on HDMI output (Rockchip, kernel 6.6):**
 ```
 gst-launch-1.0 libuvch264src index=0 \
   ! video/x-h264,width=1920,height=1080,framerate=30/1 \
   ! queue ! h264parse ! queue ! v4l2slh264dec ! queue ! videoconvert ! kmssink
+```
+
+**Display on HDMI output (Rockchip, kernel 5.10):**
+```
+gst-launch-1.0 libuvch264src index=0 \
+  ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h264parse ! queue ! mppvideodec ! queue ! videoconvert ! kmssink
 ```
 
 **Select device by USB serial number:**
@@ -34,12 +43,222 @@ gst-launch-1.0 libuvch264src index=0 pan=18000 tilt=0 zoom=100 \
   ! video/x-h264 ! fakesink
 ```
 
+---
+
+### H.265 — Capture and Decode
+
+Use the `libuvch26xsrc` alias when working with H.265. It registers the same element under a dual-codec name that makes the codec intent explicit.
+
+**H.265 decode to display (Rockchip, kernel 6.6):**
+```
+gst-launch-1.0 libuvch26xsrc index=0 \
+  ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h265parse ! queue ! v4l2slh265dec ! queue ! videoconvert ! kmssink
+```
+
+**H.265 decode to display (Rockchip, kernel 5.10):**
+```
+gst-launch-1.0 libuvch26xsrc index=0 \
+  ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h265parse ! queue ! mppvideodec ! queue ! videoconvert ! kmssink
+```
+
+**H.265 capture by serial number — pipe to fakesink for testing:**
+```
+gst-launch-1.0 libuvch26xsrc index="serial:CAM-002" \
+  ! video/x-h265,width=3840,height=2160,framerate=30/1 \
+  ! queue ! h265parse ! fakesink
+```
+
+---
+
+### A/V Mux to MPEG-TS (AAC audio)
+
+These examples wire a separate `alsasrc` for audio. The element itself carries video only.
+
+ALSA device numbering varies by platform. Check `aplay -l` to confirm the correct card index.
+Common values: `hw:2` on generic Linux desktops, `hw:5` on RK3588-based boards.
+
+**H.265 video + AAC audio muxed to MPEG-TS file:**
+```
+gst-launch-1.0 \
+  libuvch26xsrc index=0 \
+    ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+    ! h265parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mpegtsmux name=mux ! filesink location=output.ts
+```
+
+**RK3588 variant (ALSA card 5):**
+```
+gst-launch-1.0 \
+  libuvch26xsrc index="serial:CAM-001" \
+    ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+    ! h265parse ! queue ! mux. \
+  alsasrc device=hw:5 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mpegtsmux name=mux ! filesink location=output.ts
+```
+
+**H.264 video + AAC audio muxed to MPEG-TS file:**
+```
+gst-launch-1.0 \
+  libuvch264src index=0 \
+    ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+    ! h264parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mpegtsmux name=mux ! filesink location=output.ts
+```
+
+> **Note:** Opus audio is not compatible with MPEG-TS. Use `voaacenc` for any `mpegtsmux`
+> pipeline. If you need Opus, mux into Matroska instead (see the MKV recording example below).
+
+---
+
+### SRT Streaming
+
+**H.265 + AAC streamed over SRT (listener mode):**
+```
+gst-launch-1.0 \
+  libuvch26xsrc index=0 \
+    ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+    ! h265parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mpegtsmux name=mux \
+    ! srtserversink uri="srt://0.0.0.0:9000?mode=listener" latency=200
+```
+
+**H.264 streamed over SRT (caller mode, connecting to a remote server):**
+```
+gst-launch-1.0 \
+  libuvch264src index=0 \
+    ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+    ! h264parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mpegtsmux name=mux \
+    ! srtsink uri="srt://192.168.1.100:9000?mode=caller" latency=200
+```
+
+---
+
+### Local Recording
+
+**Record H.265 + AAC to MP4:**
+```
+gst-launch-1.0 \
+  libuvch26xsrc index=0 \
+    ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+    ! h265parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! voaacenc bitrate=128000 ! queue ! mux. \
+  mp4mux name=mux ! filesink location=recording.mp4
+```
+
+**Record H.265 + Opus to Matroska (MKV) — Opus is valid here:**
+```
+gst-launch-1.0 \
+  libuvch26xsrc index=0 \
+    ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+    ! h265parse ! queue ! mux. \
+  alsasrc device=hw:2 \
+    ! audioconvert ! audioresample \
+    ! audio/x-raw,rate=48000,channels=2 \
+    ! opusenc ! queue ! mux. \
+  matroskamux name=mux ! filesink location=recording.mkv
+```
+
+**Record H.264 video only to MKV:**
+```
+gst-launch-1.0 libuvch264src index="1234:5678" \
+  ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+  ! h264parse ! matroskamux ! filesink location=recording.mkv
+```
+
+---
+
+### Reconnect on Disconnect
+
+Set `reconnect=true` to enable in-element auto-reconnect when the device is unplugged
+mid-stream. The element retries with exponential backoff (1, 2, 4, 8, 16 s; up to 5
+attempts) before posting an error. Default is `false` — a disconnect immediately ends
+the stream.
+
+A `vid:pid` or `serial:` selector survives a replug (bus address can change). An ordinal
+or `bus:` selector may resolve to a different physical device after replug.
+
+**H.264 with reconnect enabled (serial selector survives replug):**
+```
+gst-launch-1.0 libuvch264src reconnect=true index="serial:CAM-001" \
+  ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h264parse ! fakesink
+```
+
+**H.265 with reconnect enabled (vid:pid selector):**
+```
+gst-launch-1.0 libuvch26xsrc reconnect=true index="1234:5678" \
+  ! video/x-h265,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h265parse ! fakesink
+```
+
+---
+
+### PTZ Control Socket
+
+The Unix-domain PTZ control socket is off by default. Set `control-socket=true` to
+enable it. The element auto-selects a per-instance path under `$XDG_RUNTIME_DIR`:
+
+```
+$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock
+```
+
+Read the resolved path back after the element reaches PAUSED. Two instances in the same
+process get distinct paths automatically.
+
 **Enable the opt-in PTZ control socket:**
 ```
 gst-launch-1.0 libuvch264src index=0 control-socket=true \
   ! video/x-h264 ! fakesink
-# Read the resolved socket path back via g_object_get("control-socket-path")
+# After PAUSED: g_object_get(element, "control-socket-path", &path, NULL)
 ```
+
+**Explicit socket path (useful in containers where XDG_RUNTIME_DIR is unset):**
+```
+gst-launch-1.0 libuvch264src index=0 \
+  control-socket=true \
+  control-socket-path=/run/ceralive/ptz.sock \
+  ! video/x-h264 ! fakesink
+```
+
+The socket accepts JSON commands for `PAN_TILT`, `ZOOM`, `GET_POSITION`, and
+`GET_CAPABILITIES`. It routes through the same helpers as the native `pan`/`tilt`/`zoom`
+properties — same clamping, same capability gate, same locking.
+
+In C, read the resolved path after PAUSED:
+
+```c
+gchar *path = NULL;
+g_object_get(src, "control-socket-path", &path, NULL);
+/* use path, then: */
+g_free(path);
+```
+
+---
 
 ### Rockchip decoder/encoder reference
 
@@ -50,22 +269,11 @@ gst-launch-1.0 libuvch264src index=0 control-socket=true \
 
 On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP layer. On kernel 6.6, the V4L2 stateless decoders are codec-specific.
 
-### A/V-sync note (guidance only — no change to this element)
+---
 
-This element stamps PTS as pipeline running-time (Option B). Residual A/V drift with a Bluetooth microphone is a downstream concern — the BT clock runs independently of the pipeline clock. Recommendation: add `audioresample` in the audio branch of cerastream to absorb BT clock drift. Optionally, clock-slave the audio source to the pipeline master clock. Neither change belongs in this element.
+### A/V-sync note
 
-### Control socket: reading back the resolved path
-
-After the element reaches `PAUSED`, read the resolved socket path in C:
-
-```c
-gchar *path = NULL;
-g_object_get(src, "control-socket-path", &path, NULL);
-/* use path, then: */
-g_free(path);
-```
-
-Or from a `gst-launch-1.0` pipeline, inspect the property after the pipeline reaches PAUSED state. The path follows the pattern `$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock`.
+This element stamps PTS as pipeline running-time. Residual A/V drift with a Bluetooth microphone is a downstream concern — the BT clock runs independently of the pipeline clock. Add `audioresample` in the audio branch to absorb BT clock drift, or clock-slave the audio source to the pipeline master clock.
 
 ---
 
@@ -79,6 +287,7 @@ Or from a `gst-launch-1.0` pipeline, inspect the property after the pipeline rea
 | `zoom` | int | `0` | Absolute zoom as UVC focal length (0..65535); capability-gated |
 | `control-socket` | bool | `false` | Enable opt-in Unix-domain PTZ control socket (default off) |
 | `control-socket-path` | string | `null` | Explicit socket path; auto-selects `$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock` when null |
+| `reconnect` | bool | `false` | Auto-reconnect on mid-stream disconnect with exponential backoff (default off) |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 
