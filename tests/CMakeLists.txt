@@ -48,6 +48,19 @@ set_tests_properties(plugin_load_smoke PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
+# SPS/PPS cache path-builder unit tests. Pure C against spspps_path.h (no GST,
+# no device, no filesystem) - they assert M8 traversal blocking, M7 NULL-path
+# safety, and the L5 codec+resolution cache key. One executable, two suites.
+# -----------------------------------------------------------------------------
+add_executable(test_cache test_cache.c)
+target_include_directories(test_cache PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+)
+
+add_test(NAME cache_path_safety COMMAND test_cache path)
+add_test(NAME cache_resolution_key COMMAND test_cache key)
+
+# -----------------------------------------------------------------------------
 # Mock streaming harness.
 #
 # A second, mock-backed copy of the plugin links the element's own translation

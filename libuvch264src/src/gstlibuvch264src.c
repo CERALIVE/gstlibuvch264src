@@ -215,6 +215,11 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     self->frame_interval = (1000L * 1000L * 1000L) / framerate;
 
+    /* Persist the negotiated resolution so the SPS/PPS cache key (L5) reflects
+     * the active format; load_spspps/store_spspps read these. */
+    self->negotiated_width = width;
+    self->negotiated_height = height;
+
     gst_base_src_set_caps(basesrc, best_caps);
 
     GST_INFO_OBJECT(basesrc, "Negotiated caps: %" GST_PTR_FORMAT, best_caps);

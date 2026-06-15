@@ -23,6 +23,8 @@ struct _GstLibuvcH264Src {
   uvc_device_handle_t *uvc_devh;
   uvc_stream_ctrl_t uvc_ctrl;
   enum uvc_frame_format frame_format;
+  gint negotiated_width;
+  gint negotiated_height;
   GAsyncQueue *frame_queue;
   gboolean streaming;
   GstClock *clock;

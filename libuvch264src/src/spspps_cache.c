@@ -5,31 +5,34 @@
 #include "gstlibuvch264src_internal.h"
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
+#include "spspps_path.h"
 
 #define DIRBUFLEN 4096
 __thread char dir_buf[DIRBUFLEN];
 char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
     const char *home_dir = getenv("HOME");
     if (home_dir == NULL) {
-        GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
+        GST_WARNING_OBJECT(self, "HOME environment variable not set.");
         home_dir = "";
     }
 
-	int ret = snprintf(dir_buf, DIRBUFLEN, "%s/.spspps%s%s%s",
-	                   home_dir,
-	                   index ? "/" : "",
-	                   index ? index : "",
-	                   (index && self->frame_format == UVC_FRAME_FORMAT_H265) ? ".h265" : "");
-	if (ret >= DIRBUFLEN) {
-	    GST_ERROR_OBJECT(self, "Error building SPS/PPS path\n");
-	    return NULL;
-	}
+    int is_h265 = (self->frame_format == UVC_FRAME_FORMAT_H265);
+    int ret = spspps_build_path(dir_buf, DIRBUFLEN, home_dir, index, is_h265,
+                                self->negotiated_width, self->negotiated_height);
+    if (ret < 0) {
+        GST_ERROR_OBJECT(self, "Error building SPS/PPS path");
+        return NULL;
+    }
 
-	return dir_buf;
+    return dir_buf;
 }
 
 void create_hidden_directory(GstLibuvcH264Src *self) {
     char *hidden_dir = get_spspps_path(self, NULL);
+    if (hidden_dir == NULL) {
+        GST_WARNING_OBJECT(self, "SPS/PPS cache directory path unavailable; skipping creation.");
+        return;
+    }
 
     struct stat st;
     if (stat(hidden_dir, &st) == -1) {
@@ -49,6 +52,10 @@ FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
     char m[3];
     sprintf(m, "%cb", mode);
     char *file_name = get_spspps_path(self, self->index);
+    if (file_name == NULL) {
+        GST_WARNING_OBJECT(self, "SPS/PPS cache path unavailable; skipping cache I/O.");
+        return NULL;
+    }
     FILE *fp = fopen(file_name, m);
     return fp;
 }
