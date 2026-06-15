@@ -1020,3 +1020,62 @@ foreach(_case ${_live_source_cases})
     TIMEOUT 120
   )
 endforeach()
+
+# -----------------------------------------------------------------------------
+# NAL parser unit tests (Task 15). Pure C against the real parser in
+# frame_pipeline.c: no UVC device, no GStreamer runtime, no mock feeder. The TU
+# is linked whole, so frame_callback()'s only element-internal references (the
+# debug category and store_spspps) are satisfied by stubs in test_nal_parse.c;
+# the parser functions under test touch neither. Three argv-selected suites; the
+# ASAN variant is the teeth for the bounds suite (over-read on truncated /
+# oversized / merged NAL buffers).
+# -----------------------------------------------------------------------------
+function(add_nal_parse_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_nal_parse${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe}
+    test_nal_parse.c
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+  )
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  set(_nal_env "")
+  if(sanitizer STREQUAL "address")
+    set(_nal_env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  foreach(_suite multislice startcode bounds)
+    add_test(NAME nal_parse_${_suite}${suffix} COMMAND ${testexe} ${_suite})
+    if(_nal_env)
+      set_tests_properties(nal_parse_${_suite}${suffix} PROPERTIES ENVIRONMENT "${_nal_env}")
+    endif()
+  endforeach()
+endfunction()
+
+add_nal_parse_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_nal_parse_variant("asan" "address")
+endif()

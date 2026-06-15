@@ -65,37 +65,40 @@ void load_spspps(GstLibuvcH264Src *self) {
     FILE* fp = open_spspps_file(self, 'r');
     if (fp) {
         unsigned char buf[SPSPPSBUFSZ*3];
-        gint read_bytes = fread(buf, 1, sizeof(buf), fp);
+        gsize read_bytes = fread(buf, 1, sizeof(buf), fp);
         fclose(fp);
 
         #define MAX_UNITS_LOAD 3
         nal_unit_t units[MAX_UNITS_LOAD];
-        int c = parse_nal_units(self->frame_format, units, MAX_UNITS_LOAD, buf, read_bytes);
+        gsize c = parse_nal_units(self->frame_format, units, MAX_UNITS_LOAD, buf, read_bytes);
 
-        for (int i = 0; i < c; i++) {
+        for (gsize i = 0; i < c; i++) {
             switch (units[i].type) {
                 case UNIT_VPS:
-                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                    if (units[i].len == 0 || units[i].len > SPSPPSBUFSZ) {
                         GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached VPS NAL "
-                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                            "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                            units[i].len, SPSPPSBUFSZ);
                         break;
                     }
                     memcpy(self->vps, units[i].ptr, units[i].len);
                     self->vps_length = units[i].len;
                     break;
                 case UNIT_SPS:
-                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                    if (units[i].len == 0 || units[i].len > SPSPPSBUFSZ) {
                         GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached SPS NAL "
-                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                            "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                            units[i].len, SPSPPSBUFSZ);
                         break;
                     }
                     memcpy(self->sps, units[i].ptr, units[i].len);
                     self->sps_length = units[i].len;
                     break;
                 case UNIT_PPS:
-                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                    if (units[i].len == 0 || units[i].len > SPSPPSBUFSZ) {
                         GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached PPS NAL "
-                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                            "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                            units[i].len, SPSPPSBUFSZ);
                         break;
                     }
                     memcpy(self->pps, units[i].ptr, units[i].len);

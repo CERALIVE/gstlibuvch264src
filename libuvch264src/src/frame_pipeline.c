@@ -34,42 +34,89 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
     return UNIT_INVALID;
 }
 
+/* Locate the next Annex-B NAL unit at or after `start`.
+ *
+ * Detects BOTH the 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes. The
+ * 3-byte form is legal Annex-B and is emitted by real DJI/UVC cameras; missing
+ * it merges two slices into one oversized NAL (L3). With search != 0 the scan
+ * walks forward to the first start code anywhere in the buffer, so a frame that
+ * does not begin exactly at offset 0 is found rather than dropped.
+ *
+ * On success returns the NAL type, sets *offset to the first byte of the start
+ * code and *sc_len to its length (3 or 4). Lengths are gsize so a frame larger
+ * than INT_MAX cannot wrap to a negative length and be skipped (L4). */
 int find_nal_unit(enum uvc_frame_format format,
-                  unsigned char *buf, int buflen, int start, int search, int *offset) {
+                  unsigned char *buf, gsize buflen, gsize start, int search,
+                  gsize *offset, gsize *sc_len) {
     if (format != UVC_FRAME_FORMAT_H264 && format != UVC_FRAME_FORMAT_H265) return -1;
-    if (buflen < (start + 5)) return -1;
+    if (buf == NULL) return -1;
+    /* A unit needs at least a 3-byte start code plus one NAL header byte. */
+    if (buflen < 4 || start > buflen - 4) return -1;
 
-    int i = start;
-    do {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1) {
-            if (offset) *offset = i;
-            if (format == UVC_FRAME_FORMAT_H264) {
-              return convert_unit_type(format, buf[i+4] & 0x1F);
-            } else if (format == UVC_FRAME_FORMAT_H265) {
-              return convert_unit_type(format, (buf[i+4] >> 1) & 0x3F);
-            }
+    for (gsize i = start; i <= buflen - 4; i++) {
+        gsize hdr;
+        gsize code_len;
+
+        if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1) {
+            if (i + 4 >= buflen) break;   /* 4-byte start code with no header byte */
+            hdr = i + 4;
+            code_len = 4;
+        } else if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1) {
+            hdr = i + 3;
+            code_len = 3;
+        } else {
+            if (!search) break;
+            continue;
         }
-        i++;
-    } while (search && i < (buflen - 4));
+
+        if (offset) *offset = i;
+        if (sc_len) *sc_len = code_len;
+        if (format == UVC_FRAME_FORMAT_H264) {
+            return convert_unit_type(format, buf[hdr] & 0x1F);
+        }
+        return convert_unit_type(format, (buf[hdr] >> 1) & 0x3F);
+    }
 
     return -1;
 }
 
-int parse_nal_units(enum uvc_frame_format format,
-                    nal_unit_t *units, int max, unsigned char *buf, int buflen) {
-    int i = 0;
+/* Count the NAL units in `buf` so the caller can size an exact allocation and
+ * never drop slices past a fixed cap (L2). */
+gsize count_nal_units(enum uvc_frame_format format,
+                      unsigned char *buf, gsize buflen) {
+    gsize count = 0;
+    gsize nal_offset = 0;
+    gsize sc_len = 0;
+    int next_type = find_nal_unit(format, buf, buflen, 0, 1, &nal_offset, &sc_len);
+    while (next_type >= 0) {
+        count++;
+        next_type = find_nal_unit(format, buf, buflen, nal_offset + sc_len, 1,
+                                  &nal_offset, &sc_len);
+    }
+    return count;
+}
 
-    int nal_offset = 0;
-    int next_type = find_nal_unit(format, buf, buflen, 0, 0, &nal_offset);
+gsize parse_nal_units(enum uvc_frame_format format,
+                      nal_unit_t *units, gsize max, unsigned char *buf, gsize buflen) {
+    gsize i = 0;
+    gsize nal_offset = 0;
+    gsize sc_len = 0;
+
+    /* First scan searches (search=1) so an offset-shifted frame is still found
+       rather than dropped when it does not start exactly at offset 0 (L3). */
+    int next_type = find_nal_unit(format, buf, buflen, 0, 1, &nal_offset, &sc_len);
     while (next_type >= 0 && i < max) {
         int type = next_type;
-        int start = nal_offset;
-        next_type = find_nal_unit(format, buf, buflen, nal_offset + 5, 1, &nal_offset);
-        int end = (next_type >= 0) ? nal_offset : buflen;
-        int length = end - start;
+        gsize start = nal_offset;
+
+        /* Advance past THIS start code only, so a 3-byte code sitting right
+           after a 4-byte one is not skipped. */
+        next_type = find_nal_unit(format, buf, buflen, nal_offset + sc_len, 1,
+                                  &nal_offset, &sc_len);
+        gsize end = (next_type >= 0) ? nal_offset : buflen;
 
         units[i].type = type;
-        units[i].len = length;
+        units[i].len = end - start;
         units[i].ptr = &buf[start];
 
         i++;
@@ -85,13 +132,19 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
         GST_WARNING_OBJECT(self, "Empty or invalid frame received.");
         return;
     }
-	
-	unsigned char* data = frame->data;
-    gboolean updated_sps_pps = FALSE;
 
-    #define MAX_UNITS_MAIN 10
-    nal_unit_t units[MAX_UNITS_MAIN];
-    int c = parse_nal_units(self->frame_format, units, MAX_UNITS_MAIN, data, frame->data_bytes);
+    /* data_bytes is a size_t; a frame larger than INT_MAX would historically
+       truncate to a negative int length and be silently dropped. Such a frame
+       is corrupt/absurd, so reject it explicitly up front (L4). */
+    if (frame->data_bytes > (gsize)G_MAXINT) {
+        GST_WARNING_OBJECT(self, "Dropping oversized frame (%" G_GSIZE_FORMAT
+                           " bytes; exceeds G_MAXINT).", (gsize)frame->data_bytes);
+        return;
+    }
+
+    unsigned char* data = frame->data;
+    gsize data_bytes = frame->data_bytes;
+    gboolean updated_sps_pps = FALSE;
 
     /* The clock and the PTS baseline are shared with set_clock(), which can swap
        the clock or reset the baseline from another thread. Snapshot the clock
@@ -122,16 +175,24 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     }
     GstClockTime ts = now - base_time;
 
-    for (int i = 0; i < c; i++) {
+    /* Size the array to the actual NAL count so a multi-slice frame (4K can
+       carry well over a dozen slices) delivers every slice instead of dropping
+       units past a fixed cap (L2). */
+    gsize unit_count = count_nal_units(self->frame_format, data, data_bytes);
+    nal_unit_t *units = g_new(nal_unit_t, unit_count ? unit_count : 1);
+    gsize c = parse_nal_units(self->frame_format, units, unit_count, data, data_bytes);
+
+    for (gsize i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
         GstBuffer *buffer = NULL;
         gsize buffer_offset = 0;
 
         switch (unit->type) {
             case UNIT_VPS:
-                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
                     GST_WARNING_OBJECT(self, "Dropping oversized/invalid VPS NAL "
-                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                        unit->len, SPSPPSBUFSZ);
                     continue;
                 }
                 // L10: only flag a disk write when the parameter set actually
@@ -139,7 +200,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 // unconditional store rewrites the cache file each GOP and wears
                 // the flash for nothing. send_sps_pps still latches every time so
                 // the sets are re-prepended in-band; only the cache write is gated.
-                if (self->vps_length != unit->len ||
+                if ((gsize)self->vps_length != unit->len ||
                     memcmp(self->vps, unit->ptr, unit->len) != 0) {
                     self->vps_length = unit->len;
                     memcpy(self->vps, unit->ptr, self->vps_length);
@@ -148,12 +209,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->send_sps_pps = TRUE;
                 continue;
             case UNIT_SPS:
-                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
                     GST_WARNING_OBJECT(self, "Dropping oversized/invalid SPS NAL "
-                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                        unit->len, SPSPPSBUFSZ);
                     continue;
                 }
-                if (self->sps_length != unit->len ||
+                if ((gsize)self->sps_length != unit->len ||
                     memcmp(self->sps, unit->ptr, unit->len) != 0) {
                     self->sps_length = unit->len;
                     memcpy(self->sps, unit->ptr, self->sps_length);
@@ -162,12 +224,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->send_sps_pps = TRUE;
                 continue;
             case UNIT_PPS:
-                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
                     GST_WARNING_OBJECT(self, "Dropping oversized/invalid PPS NAL "
-                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
+                        unit->len, SPSPPSBUFSZ);
                     continue;
                 }
-                if (self->pps_length != unit->len ||
+                if ((gsize)self->pps_length != unit->len ||
                     memcmp(self->pps, unit->ptr, unit->len) != 0) {
                     self->pps_length = unit->len;
                     memcpy(self->pps, unit->ptr, self->pps_length);
@@ -341,6 +404,8 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
         g_async_queue_push(self->frame_queue, buffer);
     }
+
+    g_free(units);
 
     if (updated_sps_pps) {
         store_spspps(self);
