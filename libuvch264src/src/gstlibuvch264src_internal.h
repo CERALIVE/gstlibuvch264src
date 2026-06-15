@@ -37,6 +37,13 @@ struct _GstLibuvcH264Src {
    * timeouts. Reset in start() and whenever a real frame arrives. */
   gint consecutive_timeouts;
   gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
+  /* Interruptible reconnect backoff (Task 7). The backoff between retries parks
+   * in g_cond_wait_until() on reconnect_cond; unlock() sets flushing and
+   * broadcasts the cond so a state change to NULL/PAUSED tears the element down
+   * promptly instead of waiting out the full (up to 16 s) backoff window.
+   * Initialised in init(), cleared in finalize(). */
+  GMutex reconnect_lock;
+  GCond reconnect_cond;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;
@@ -77,6 +84,19 @@ struct _GstLibuvcH264Src {
   gboolean pan_supported, tilt_supported, zoom_supported;
   gboolean ptz_supported;
 };
+
+/* Test seam for the reconnect backoff (Task 7). A hook is invoked at the start
+ * of every backoff interval with the attempt index and the nominal backoff
+ * seconds, and returns the microseconds to actually wait; returning 0 collapses
+ * the wall-clock wait so a test never sleeps the full 1+2+4+8+16 s. A NULL hook
+ * (production default) waits the full nominal backoff. The hook also lets a test
+ * record the interval sequence to assert the exponential 1,2,4,8,16 s schedule. */
+typedef gint64 (*GstLibuvcReconnectBackoffHook)(GstLibuvcH264Src *self,
+                                                gint attempt, guint backoff_s);
+void gst_libuvc_h264_src_set_reconnect_backoff_hook(
+    GstLibuvcReconnectBackoffHook hook);
+
+gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self);
 
 G_END_DECLS
 

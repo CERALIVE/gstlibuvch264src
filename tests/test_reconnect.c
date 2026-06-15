@@ -28,6 +28,13 @@
 #include "gstlibuvch264src.h"
 #include "mock_libuvc.h"
 
+/* gstcheck.h installs its own GST_CAT_DEFAULT (check_debug); drop it so the
+ * element's internal header can install the element category without a warning.
+ * The internal header exposes the instance struct, the reconnect() entry point,
+ * and the backoff test seam the backoff-timing tests below drive directly. */
+#undef GST_CAT_DEFAULT
+#include "gstlibuvch264src_internal.h"
+
 /* The harness blanks GST_PLUGIN_SYSTEM_PATH; load just core-elements so fakesink
  * is available without scanning unrelated plugins. */
 static void
@@ -236,6 +243,169 @@ GST_START_TEST (test_reconnect_resume)
 
 GST_END_TEST;
 
+/* ------------------------------------------------------------------------- */
+/* test_reconnect_backoff_sequence (Task 7)                                  */
+/*                                                                           */
+/* White-box assertion of the backoff schedule. Unlike the exhaustion test   */
+/* above - which pays the real ~5 s detection plus the full 1+2+4+8+16 s      */
+/* backoff through a live pipeline - this calls reconnect() directly and      */
+/* installs a seam that records each interval and collapses the wall-clock    */
+/* wait to zero, so the exponential schedule and the 5-retry cap are asserted */
+/* in well under a second. With no device enumerable on any retry every       */
+/* reopen fails, so all RECONNECT_MAX_RETRIES backoffs run and reconnect()    */
+/* returns FALSE.                                                            */
+/* ------------------------------------------------------------------------- */
+
+/* RECONNECT_MAX_RETRIES (5) and the 1,2,4,8,16 s schedule are private to the
+ * element; EXPECTED_RETRIES pins that contract and must track the element's
+ * RECONNECT_MAX_RETRIES define. */
+#define EXPECTED_RETRIES 5
+
+static guint recorded_backoffs[16];
+static gint recorded_backoff_count;
+
+static gint64
+record_and_skip_backoff (GstLibuvcH264Src * self, gint attempt, guint backoff_s)
+{
+  (void) self;
+  (void) attempt;
+  if (recorded_backoff_count < (gint) G_N_ELEMENTS (recorded_backoffs))
+    recorded_backoffs[recorded_backoff_count] = backoff_s;
+  recorded_backoff_count++;
+  return 0;
+}
+
+GST_START_TEST (test_reconnect_backoff_sequence)
+{
+  mock_uvc_reset ();
+
+  GstLibuvcH264Src *self =
+      GST_LIBUVC_H264_SRC (g_object_new (GST_TYPE_LIBUVC_H264_SRC, NULL));
+
+  /* A context plus one open handle stands in for the live (about-to-be-dead)
+   * device, so reconnect()'s native teardown runs its uvc_close() before the
+   * retry loop. */
+  fail_unless (uvc_init (&self->uvc_ctx, NULL) == UVC_SUCCESS,
+      "mock uvc_init failed");
+  uvc_device_t **list = NULL;
+  fail_unless (uvc_find_devices (self->uvc_ctx, &list, 0, 0, NULL)
+      == UVC_SUCCESS && list != NULL, "mock uvc_find_devices failed");
+  uvc_ref_device (list[0]);
+  fail_unless (uvc_open (list[0], &self->uvc_devh) == UVC_SUCCESS,
+      "mock uvc_open failed");
+  self->uvc_dev = list[0];
+  uvc_free_device_list (list, 1);
+
+  /* The device is now gone: every reopen on the retry path fails, so all five
+   * backoffs run and reconnect() exhausts. */
+  mock_uvc_set_device_count (0);
+
+  recorded_backoff_count = 0;
+  gst_libuvc_h264_src_set_reconnect_backoff_hook (record_and_skip_backoff);
+
+  gboolean ok = gst_libuvc_h264_src_reconnect (self);
+
+  gint count = recorded_backoff_count;
+  guint seq[EXPECTED_RETRIES] = { 0 };
+  for (int i = 0; i < EXPECTED_RETRIES && i < count; i++)
+    seq[i] = recorded_backoffs[i];
+  gint opens = mock_uvc_open_count ();
+  gint closes = mock_uvc_close_count ();
+
+  gst_libuvc_h264_src_set_reconnect_backoff_hook (NULL);
+  gst_object_unref (self);
+
+  fail_unless (!ok,
+      "reconnect() with no enumerable device must exhaust and return FALSE");
+  fail_unless (count == EXPECTED_RETRIES,
+      "expected exactly %d backoff intervals (RECONNECT_MAX_RETRIES), got %d",
+      EXPECTED_RETRIES, count);
+  fail_unless (seq[0] == 1 && seq[1] == 2 && seq[2] == 4 && seq[3] == 8
+      && seq[4] == 16,
+      "backoff not exponential 1,2,4,8,16 s: got %u,%u,%u,%u,%u",
+      seq[0], seq[1], seq[2], seq[3], seq[4]);
+  /* The reconnect teardown must let uvc_close() own the single close (never
+   * force_usb_release() before it): one open, one matching close, no double. */
+  fail_unless (closes == opens,
+      "teardown imbalance: %d uvc_close vs %d uvc_open (double-close risk)",
+      closes, opens);
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
+/* test_reconnect_backoff_interrupt (Task 7)                                 */
+/*                                                                           */
+/* The backoff must be interruptible: a NULL/PAUSED transition (which runs    */
+/* the unlock() vmethod) has to wake the wait at once rather than sleeping    */
+/* out the interval. A seam returns a 30 s would-be wait, so any wall-clock   */
+/* dependence would hang; the real unlock() vmethod must instead return       */
+/* reconnect() within a few ms.                                              */
+/* ------------------------------------------------------------------------- */
+
+static gint64
+long_backoff (GstLibuvcH264Src * self, gint attempt, guint backoff_s)
+{
+  (void) self;
+  (void) attempt;
+  (void) backoff_s;
+  return (gint64) 30 * G_USEC_PER_SEC;
+}
+
+typedef struct
+{
+  GstLibuvcH264Src *self;
+  gboolean ret;
+} ReconnectThreadArgs;
+
+static gpointer
+reconnect_thread_main (gpointer data)
+{
+  ReconnectThreadArgs *args = data;
+  args->ret = gst_libuvc_h264_src_reconnect (args->self);
+  return NULL;
+}
+
+GST_START_TEST (test_reconnect_backoff_interrupt)
+{
+  mock_uvc_reset ();
+  /* No enumerable device, so without the interrupt the loop would block on the
+   * 30 s backoff every retry - the interrupt is the only thing that returns. */
+  mock_uvc_set_device_count (0);
+
+  GstLibuvcH264Src *self =
+      GST_LIBUVC_H264_SRC (g_object_new (GST_TYPE_LIBUVC_H264_SRC, NULL));
+
+  gst_libuvc_h264_src_set_reconnect_backoff_hook (long_backoff);
+
+  ReconnectThreadArgs args = { self, TRUE };
+  GThread *t = g_thread_new ("reconnect", reconnect_thread_main, &args);
+
+  /* Let reconnect() reach the cond wait, then trip the real unlock() vmethod -
+   * exactly what a state change to NULL/PAUSED invokes. */
+  g_usleep (100 * G_TIME_SPAN_MILLISECOND);
+  gint64 t0 = g_get_monotonic_time ();
+  GST_BASE_SRC_GET_CLASS (self)->unlock (GST_BASE_SRC (self));
+  g_thread_join (t);
+  gint64 dt = g_get_monotonic_time () - t0;
+  gboolean ret = args.ret;
+
+  /* unlock() pushed a flush sentinel that no create() loop consumed here; drain
+   * it via unlock_stop() (the resume path) so finalize() never unrefs it. */
+  GST_BASE_SRC_GET_CLASS (self)->unlock_stop (GST_BASE_SRC (self));
+
+  gst_libuvc_h264_src_set_reconnect_backoff_hook (NULL);
+  gst_object_unref (self);
+
+  fail_unless (!ret,
+      "an interrupted reconnect() must return FALSE, not resume");
+  fail_unless (dt < 500 * G_TIME_SPAN_MILLISECOND,
+      "interrupt took %" G_GINT64_FORMAT " us, expected < 500 ms - the backoff "
+      "wait was not woken by unlock()", dt);
+}
+
+GST_END_TEST;
+
 static Suite *
 reconnect_suite (void)
 {
@@ -250,6 +420,16 @@ reconnect_suite (void)
   tcase_set_timeout (tc_recon, 60);
   tcase_add_test (tc_recon, test_reconnect_resume);
   suite_add_tcase (s, tc_recon);
+
+  TCase *tc_backoff = tcase_create ("backoff_sequence");
+  tcase_set_timeout (tc_backoff, 30);
+  tcase_add_test (tc_backoff, test_reconnect_backoff_sequence);
+  suite_add_tcase (s, tc_backoff);
+
+  TCase *tc_interrupt = tcase_create ("backoff_interrupt");
+  tcase_set_timeout (tc_interrupt, 30);
+  tcase_add_test (tc_interrupt, test_reconnect_backoff_interrupt);
+  suite_add_tcase (s, tc_interrupt);
 
   return s;
 }

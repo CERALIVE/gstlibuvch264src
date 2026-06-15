@@ -180,6 +180,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->control_thread = NULL;
   self->control_running = FALSE;
   g_mutex_init(&self->control_mutex);
+  g_mutex_init(&self->reconnect_lock);
+  g_cond_init(&self->reconnect_cond);
 
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
   self->sps_length = sizeof(sps);
@@ -872,6 +874,13 @@ static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src) {
   g_atomic_int_set(&self->flushing, 1);
   g_async_queue_push(self->frame_queue, FLUSH_SENTINEL);
 
+  // Wake a reconnect backoff parked in g_cond_wait_until() (Task 7). The flag is
+  // set before the broadcast and re-checked by the waiter under reconnect_lock,
+  // so the broadcast is serialised by the lock and no wakeup is lost.
+  g_mutex_lock(&self->reconnect_lock);
+  g_cond_broadcast(&self->reconnect_cond);
+  g_mutex_unlock(&self->reconnect_lock);
+
   return TRUE;
 }
 
@@ -894,6 +903,13 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
   return TRUE;
 }
 
+static GstLibuvcReconnectBackoffHook gst_libuvc_reconnect_backoff_hook = NULL;
+
+void gst_libuvc_h264_src_set_reconnect_backoff_hook(
+    GstLibuvcReconnectBackoffHook hook) {
+  gst_libuvc_reconnect_backoff_hook = hook;
+}
+
 /* Opt-in in-element reconnect (Task 18), gated on the Task 4 spike verdict.
  *
  * Runs on the streaming thread from inside create() after a sustained-silence
@@ -908,7 +924,7 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
  * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
  * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
  * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
-static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   GstLibuvcDeviceSelector selector = {0};
   const gchar *parse_err = NULL;
   if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
@@ -940,13 +956,27 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
 
   guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
   for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
-    // Interruptible backoff: bail at once if unlock() flagged a flush, so
-    // teardown never blocks for the full (up to 16 s) backoff window.
-    for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
-      if (g_atomic_int_get(&self->flushing)) {
-        return FALSE;
+    gint64 wait_us = (gint64) backoff_s * G_USEC_PER_SEC;
+    if (gst_libuvc_reconnect_backoff_hook != NULL) {
+      wait_us = gst_libuvc_reconnect_backoff_hook(self, attempt, backoff_s);
+    }
+
+    // Interruptible backoff: park in g_cond_wait_until() so unlock() (which sets
+    // flushing and broadcasts reconnect_cond) wakes us at once on a NULL/PAUSED
+    // transition instead of blocking for the full (up to 16 s) backoff window.
+    if (wait_us > 0) {
+      gint64 deadline = g_get_monotonic_time() + wait_us;
+      g_mutex_lock(&self->reconnect_lock);
+      while (!g_atomic_int_get(&self->flushing)) {
+        if (!g_cond_wait_until(&self->reconnect_cond, &self->reconnect_lock,
+                               deadline)) {
+          break;
+        }
       }
-      g_usleep(100 * 1000);
+      g_mutex_unlock(&self->reconnect_lock);
+    }
+    if (g_atomic_int_get(&self->flushing)) {
+      return FALSE;
     }
 
     GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
@@ -1125,6 +1155,8 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
     // Sole clear point for control_mutex (paired with g_mutex_init in init): the
     // control thread was already joined by stop() above, so this is race-free.
     g_mutex_clear(&self->control_mutex);
+    g_cond_clear(&self->reconnect_cond);
+    g_mutex_clear(&self->reconnect_lock);
 
     GST_DEBUG_OBJECT(self, "Libuvc source finalized");
 
