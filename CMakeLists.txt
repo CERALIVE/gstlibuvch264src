@@ -30,21 +30,23 @@ pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0>=1.0.20)
 # -----------------------------------------------------------------------------
 # libuvc dependency.
 #
-# Prefer a system/pkg-config libuvc; otherwise vendor it at build time exactly
-# like the Dockerfile does. LIBUVC_RUNTIME_DIR is exported to the test so the
-# vendored shared object is resolvable at dlopen() time.
+# Prefer a system/pkg-config libuvc; otherwise vendor it at build time by
+# invoking scripts/build-libuvc.sh — the SAME script the Dockerfile runs, so the
+# pinned SHAs, the CMake options, and the fallback patch steps live in exactly
+# ONE place (no SHA/URL/patch duplication between this file and the Dockerfile).
+# LIBUVC_RUNTIME_DIR is exported to the test so the vendored shared object is
+# resolvable at dlopen() time.
 #
-# Two vendoring modes, selected by LIBUVC_USE_FORK (see
-# libuvch264src/docs/notes/libuvc-fork-adr.md):
+# Two vendoring modes, selected by LIBUVC_USE_FORK and forwarded to the script as
+# --mode (see libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
-#   ON  (default): fetch the CeraLive/libuvc fork at a pinned SHA. The UVC 1.5,
-#                  H.265, and configurable auto-detach changes live as commits
-#                  on the fork, so NO build-time patching is needed.
-#   OFF (rollback): fetch upstream libuvc v0.0.7 at its pinned SHA and apply the
-#                  UVC 1.5 + H.265 patches at build time (the pre-fork path).
-#                  The patches/ directory is retained as the rollback artifact.
-#
-# Keep both SHAs (and the fork/upstream URLs) in sync with the Dockerfile.
+#   ON  (default): fork mode — the CeraLive/libuvc fork at a pinned SHA. The
+#                  UVC 1.5, H.265, and configurable auto-detach changes live as
+#                  commits on the fork, so NO build-time patching is needed.
+#   OFF (rollback): upstream mode — upstream libuvc v0.0.7 at its pinned SHA with
+#                  the UVC 1.5 + H.265 patches applied at build time (the pre-fork
+#                  path). The patches/ directory is retained as the rollback
+#                  artifact.
 # -----------------------------------------------------------------------------
 option(LIBUVC_USE_FORK "Use CeraLive/libuvc fork instead of upstream+patches" ON)
 
@@ -55,46 +57,46 @@ if(LIBUVC_FOUND)
   set(LIBUVC_EXTRA_INCLUDES "")
   set(LIBUVC_RUNTIME_DIR "")
 else()
-  include(FetchContent)
-
-  # Both the fork and upstream v0.0.7 ship pre-3.5 CMake policies; allow them
-  # under modern CMake. The fork keeps cmake_minimum_required(VERSION 3.1),
-  # which CMake 4.x hard-errors on without this. Applies to both paths.
-  set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-  set(BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-  set(BUILD_TEST OFF CACHE BOOL "" FORCE)
-  set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
-
+  # Vendor libuvc through the single-source build script
+  # (scripts/build-libuvc.sh) shared verbatim with the Dockerfile, so the pinned
+  # SHAs, the CMake options, and the fallback patch steps live in exactly ONE
+  # place. The script clones (and, on the LIBUVC_USE_FORK=OFF rollback, patches)
+  # libuvc and installs it into a build-local prefix. LIBUVC_USE_FORK selects
+  # fork vs upstream+patches and is forwarded as --mode.
   if(LIBUVC_USE_FORK)
-    message(STATUS "libuvc not found via pkg-config; vendoring CeraLive/libuvc fork (no build-time patches)")
-    FetchContent_Declare(libuvc
-      GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
-      # Pinned to the ceralive-v0.0.7.1 tag's commit SHA (tags are mutable). The
-      # UVC 1.5 / H.265 / configurable auto-detach changes are commits on the
-      # fork, so no PATCH_COMMAND is needed. Keep in sync with the Dockerfile.
-      GIT_TAG 21bc89ab1010e2bcce90d846a19134500065965e
-      UPDATE_DISCONNECTED 1
-    )
+    set(_libuvc_mode "fork")
+    message(STATUS "libuvc not found via pkg-config; vendoring CeraLive/libuvc fork via scripts/build-libuvc.sh (no build-time patches)")
   else()
-    message(STATUS "libuvc not found via pkg-config; vendoring upstream v0.0.7 + patches (LIBUVC_USE_FORK=OFF rollback)")
-    FetchContent_Declare(libuvc
-      GIT_REPOSITORY https://github.com/libuvc/libuvc.git
-      # Pinned to the v0.0.7 commit SHA (tags are mutable). Keep in sync with the Dockerfile.
-      GIT_TAG 68d07a00e11d1944e27b7295ee69673239c00b4b
-      PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/uvc15-support.patch
-        && patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/libuvc-h265-support.patch
-      UPDATE_DISCONNECTED 1
-    )
+    set(_libuvc_mode "upstream")
+    message(STATUS "libuvc not found via pkg-config; vendoring upstream v0.0.7 + patches via scripts/build-libuvc.sh (LIBUVC_USE_FORK=OFF rollback)")
   endif()
-  FetchContent_MakeAvailable(libuvc)
 
-  set(LIBUVC_LINK_TARGET uvc)
-  # v0.0.7 uses directory-level include_directories, so expose them explicitly.
-  set(LIBUVC_EXTRA_INCLUDES
-    ${libuvc_SOURCE_DIR}/include
-    ${libuvc_BINARY_DIR}/include
-  )
-  set(LIBUVC_RUNTIME_DIR ${libuvc_BINARY_DIR})
+  set(_libuvc_prefix "${CMAKE_BINARY_DIR}/libuvc-install")
+  set(_libuvc_srcdir "${CMAKE_BINARY_DIR}/libuvc-src")
+
+  # Run at configure time so the headers and shared object exist before any
+  # element/test target compiles — keeping every existing LIBUVC_* consumer
+  # below working with no per-target add_dependencies wiring. Idempotent: skip
+  # when the shared object is already present (delete <build>/libuvc-install to
+  # force a rebuild).
+  if(NOT EXISTS "${_libuvc_prefix}/lib/libuvc.so")
+    execute_process(
+      COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/build-libuvc.sh
+              --mode=${_libuvc_mode}
+              --prefix=${_libuvc_prefix}
+              --src-dir=${_libuvc_srcdir}
+      RESULT_VARIABLE _libuvc_rc
+    )
+    if(NOT _libuvc_rc EQUAL 0)
+      message(FATAL_ERROR "scripts/build-libuvc.sh failed (mode=${_libuvc_mode}, rc=${_libuvc_rc})")
+    endif()
+  endif()
+
+  set(LIBUVC_LINK_TARGET "${_libuvc_prefix}/lib/libuvc.so")
+  # The install lays libuvc.h and the generated libuvc_config.h side by side
+  # under one include root, so a single include dir suffices.
+  set(LIBUVC_EXTRA_INCLUDES "${_libuvc_prefix}/include")
+  set(LIBUVC_RUNTIME_DIR "${_libuvc_prefix}/lib")
 endif()
 
 # -----------------------------------------------------------------------------
