@@ -179,6 +179,38 @@ function(add_mock_harness_variant variant sanitizer)
     RESOURCE_LOCK uvc_control_socket
     TIMEOUT 120
   )
+
+  # --- lifecycle regression tests (unlock/unlock_stop + control_mutex) ---
+  # Reuses the same mock-backed plugin and isolated env as the smoke test; a
+  # per-test GST_CHECKS selects one case so each gets its own mock config.
+  set(lifecycleexe "test_lifecycle${suffix}")
+  add_executable(${lifecycleexe} test_lifecycle.c)
+  target_link_libraries(${lifecycleexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+  )
+  add_dependencies(${lifecycleexe} ${plugin})
+  if(san_opts)
+    target_compile_options(${lifecycleexe} PRIVATE ${san_opts})
+    target_link_options(${lifecycleexe} PRIVATE ${san_opts})
+  endif()
+
+  # DISCONNECT mode (one frame, then silence) makes create() block, so the test
+  # exercises unlock() interrupting it on teardown.
+  add_test(NAME unlock_shutdown${suffix} COMMAND ${lifecycleexe})
+  set_tests_properties(unlock_shutdown${suffix} PROPERTIES
+    ENVIRONMENT "${_env};GST_CHECKS=test_unlock_shutdown;MOCK_UVC_FRAME_MODE=disconnect"
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+
+  add_test(NAME mutex_restart${suffix} COMMAND ${lifecycleexe})
+  set_tests_properties(mutex_restart${suffix} PROPERTIES
+    ENVIRONMENT "${_env};GST_CHECKS=test_mutex_restart"
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
 endfunction()
 
 add_mock_harness_variant("" "")

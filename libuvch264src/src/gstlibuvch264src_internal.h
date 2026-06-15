@@ -27,6 +27,7 @@ struct _GstLibuvcH264Src {
   gint negotiated_height;
   GAsyncQueue *frame_queue;
   gboolean streaming;
+  gint flushing; /* atomic: set by unlock(), checked by create() to bail out */
   GstClock *clock;
   int64_t pts_offset_sum;
   int64_t pts_stretch;

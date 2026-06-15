@@ -46,8 +46,16 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
 static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock);
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
+static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src);
+static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
 static void gst_libuvc_h264_src_finalize(GObject *object);
+
+/* GAsyncQueue forbids NULL payloads, so create() can never receive a NULL
+ * "no more frames" marker. unlock() instead pushes this dedicated address to
+ * wake a blocked create(); its value is irrelevant, only its identity matters. */
+static const gchar flush_sentinel = 0;
+#define FLUSH_SENTINEL ((gpointer) &flush_sentinel)
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -73,6 +81,8 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   element_class->set_clock = gst_libuvc_h264_set_clock;
   base_src_class->start = gst_libuvc_h264_src_start;
   base_src_class->stop = gst_libuvc_h264_src_stop;
+  base_src_class->unlock = gst_libuvc_h264_src_unlock;
+  base_src_class->unlock_stop = gst_libuvc_h264_src_unlock_stop;
   push_src_class->create = gst_libuvc_h264_src_create;
   gobject_class->finalize = gst_libuvc_h264_src_finalize;
 }
@@ -85,6 +95,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->clock = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
+  self->flushing = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
   
@@ -420,10 +431,43 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     self->uvc_ctx = NULL;
   }
 
-  // Clear mutex
-  g_mutex_clear(&self->control_mutex);
+  // control_mutex is NOT cleared here: stop() runs on every restart and is even
+  // re-entered from start()'s cleanup path, so clearing it would leave the
+  // control thread locking a destroyed mutex. It is cleared once in finalize().
 
   GST_DEBUG_OBJECT(self, "Libuvc source fully stopped");
+  return TRUE;
+}
+
+// Interrupt a create() that is blocked waiting for a frame (e.g. on disconnect
+// or shutdown), so state changes and teardown never deadlock on a silent source.
+static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
+
+  GST_DEBUG_OBJECT(self, "Unlock: interrupting create()");
+
+  g_atomic_int_set(&self->flushing, 1);
+  g_async_queue_push(self->frame_queue, FLUSH_SENTINEL);
+
+  return TRUE;
+}
+
+static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
+
+  GST_DEBUG_OBJECT(self, "Unlock stop: resuming create()");
+
+  g_atomic_int_set(&self->flushing, 0);
+
+  // Drop sentinels (and any frames buffered during the flush) so the next
+  // create() resumes from a clean queue.
+  gpointer item;
+  while ((item = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+    if (item != FLUSH_SENTINEL) {
+      gst_buffer_unref(item);
+    }
+  }
+
   return TRUE;
 }
 
@@ -448,13 +492,27 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
     }
   }
 
-  *buf = g_async_queue_pop(self->frame_queue);
-  if (*buf == NULL) {
-    GST_ERROR_OBJECT(self, "No frame available.");
-    return GST_FLOW_ERROR;
-  }
+  // Bounded wait so unlock() can interrupt a stalled capture: the timeout is a
+  // backstop for a silent source, while unlock()'s sentinel wakes us at once.
+  while (TRUE) {
+    gpointer item = g_async_queue_timeout_pop(self->frame_queue, TIMEOUT_DURATION);
 
-  return GST_FLOW_OK;
+    if (g_atomic_int_get(&self->flushing)) {
+      if (item != NULL && item != FLUSH_SENTINEL) {
+        gst_buffer_unref(item);
+      }
+      return GST_FLOW_FLUSHING;
+    }
+
+    if (item == NULL || item == FLUSH_SENTINEL) {
+      // Plain timeout, or a stale sentinel from a finished flush: keep waiting
+      // rather than ending the stream on a transient gap.
+      continue;
+    }
+
+    *buf = item;
+    return GST_FLOW_OK;
+  }
 }
 
 static void gst_libuvc_h264_src_finalize(GObject *object) {
@@ -479,6 +537,10 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
         g_async_queue_unref(self->frame_queue);
         self->frame_queue = NULL;
     }
+
+    // Sole clear point for control_mutex (paired with g_mutex_init in init): the
+    // control thread was already joined by stop() above, so this is race-free.
+    g_mutex_clear(&self->control_mutex);
 
     GST_DEBUG_OBJECT(self, "Libuvc source finalized");
 
