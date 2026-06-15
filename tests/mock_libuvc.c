@@ -83,6 +83,7 @@ static enum uvc_frame_format g_frame_format = UVC_FRAME_FORMAT_H264;
 static mock_uvc_frame_mode_t g_frame_mode = MOCK_UVC_FRAME_VALID;
 static int g_max_frames = 0; /* 0 = until uvc_stop_streaming() */
 static int g_frames_delivered = 0;
+static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed */
 
 static int32_t g_pan_min = -180000, g_pan_max = 180000, g_pan_cur = 0;
 static int32_t g_tilt_min = -90000, g_tilt_max = 90000, g_tilt_cur = 0;
@@ -166,6 +167,13 @@ void mock_uvc_set_ptz_range(int32_t pan_min, int32_t pan_max,
 int mock_uvc_frames_delivered(void) {
   pthread_mutex_lock(&g_lock);
   int n = g_frames_delivered;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+int mock_uvc_device_lists_outstanding(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_device_lists_outstanding;
   pthread_mutex_unlock(&g_lock);
   return n;
 }
@@ -305,8 +313,8 @@ uvc_error_t uvc_init(uvc_context_t **ctx, struct libusb_context *usb_ctx) {
 void uvc_exit(uvc_context_t *ctx) {
   if (!ctx)
     return;
-  for (int i = 0; i < ctx->list_count; i++)
-    free(ctx->lists[i]);
+  /* Device-list arrays are released by uvc_free_device_list(); the context owns
+   * only the device objects. */
   for (int i = 0; i < ctx->device_count; i++)
     free(ctx->devices[i]);
   free(ctx);
@@ -336,10 +344,12 @@ uvc_error_t uvc_find_devices(uvc_context_t *ctx, uvc_device_t ***devs,
     list[i] = mock_new_device(ctx, i);
   list[n] = NULL;
 
-  /* The element never calls uvc_free_device_list(); the context owns the array
-   * and frees it at uvc_exit() so the harness stays leak-clean. */
-  if (ctx->list_count < MOCK_MAX_LISTS)
-    ctx->lists[ctx->list_count++] = list;
+  /* The element owns this array and must release it via uvc_free_device_list();
+   * track only an outstanding count so a test can prove every list is freed
+   * exactly once (ref-before-free, no leak, no double free). */
+  pthread_mutex_lock(&g_lock);
+  g_device_lists_outstanding++;
+  pthread_mutex_unlock(&g_lock);
 
   *devs = list;
   return UVC_SUCCESS;
@@ -351,9 +361,32 @@ void uvc_unref_device(uvc_device_t *dev) {
   /* Storage is owned by the context and reclaimed in uvc_exit(). */
 }
 
+void uvc_ref_device(uvc_device_t *dev) {
+  if (dev)
+    dev->refcount++;
+}
+
+void uvc_free_device_list(uvc_device_t **list, uint8_t unref_devices) {
+  if (!list)
+    return;
+  if (unref_devices) {
+    for (int i = 0; list[i] != NULL; i++)
+      uvc_unref_device(list[i]);
+  }
+  free(list);
+  pthread_mutex_lock(&g_lock);
+  if (g_device_lists_outstanding > 0)
+    g_device_lists_outstanding--;
+  pthread_mutex_unlock(&g_lock);
+}
+
 uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   if (!dev || !devh)
     return UVC_ERROR_INVALID_PARAM;
+  /* A device unref'd to zero is freed by real libuvc; opening it then is a
+   * use-after-free. Reject it so a missing ref-before-free fails loudly here. */
+  if (dev->refcount <= 0)
+    return UVC_ERROR_NO_DEVICE;
 
   uvc_device_handle_t *h = calloc(1, sizeof(*h));
   if (!h)

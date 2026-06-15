@@ -68,6 +68,11 @@ void mock_uvc_set_ptz_range(int32_t pan_min, int32_t pan_max,
  * (observability for assertions). */
 int mock_uvc_frames_delivered(void);
 
+/* Device-list arrays handed out by uvc_find_devices() that have not yet been
+ * released with uvc_free_device_list(). A correct caller leaves this at its
+ * starting value; a leak makes it grow. */
+int mock_uvc_device_lists_outstanding(void);
+
 #ifdef __cplusplus
 }
 #endif

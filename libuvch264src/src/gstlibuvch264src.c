@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
 #include "gstlibuvch264src.h"
 #include "gstlibuvch264src_internal.h"
 #include "uvc_device.h"
@@ -305,6 +307,22 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     usleep(1000000); // Wait 1 second for USB to settle
   }
 
+  // Resolve the device index up-front, before touching libuvc. The `index`
+  // property stays a string so it can grow richer selectors later (vid:pid /
+  // serial), but today a bare, non-negative integer is an ordinal into the
+  // enumerated device list. Reject anything else loudly instead of silently
+  // selecting device 0 the way atoi() would have.
+  errno = 0;
+  char *index_end = NULL;
+  long device_ordinal = strtol(self->index ? self->index : "", &index_end, 10);
+  if (self->index == NULL || index_end == self->index || *index_end != '\0' ||
+      errno != 0 || device_ordinal < 0 || device_ordinal > INT_MAX) {
+    GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
+        ("Invalid device index \"%s\"", self->index ? self->index : "(null)"),
+        ("index must be a non-negative integer ordinal"));
+    return FALSE;
+  }
+
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
   if (res < 0) {
@@ -315,31 +333,41 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   uvc_device_t **dev_list;
   res = uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL);
   if (res < 0) {
-    GST_ERROR_OBJECT(self, "Unable to find any UVC devices");
+    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+        ("No UVC devices found"),
+        ("uvc_find_devices failed: %s", uvc_strerror(res)));
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
     return FALSE;
   }
 
   for (int i = 0; dev_list[i] != NULL; ++i) {
-    uvc_device_t *dev = dev_list[i];
-	if (i == atoi(self->index)) {
-		self->uvc_dev = dev;
-		break;
-	}
+    if ((long)i == device_ordinal) {
+      self->uvc_dev = dev_list[i];
+      break;
+    }
   }
-  
+
   if (!self->uvc_dev) {
-    GST_ERROR_OBJECT(self, "Unable to find UVC device: %s", self->index);
+    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+        ("No UVC device at index %ld", device_ordinal),
+        ("ordinal %ld matched none of the enumerated UVC devices", device_ordinal));
+    uvc_free_device_list(dev_list, 1);
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
     return FALSE;
   }
 
-  // Open the UVC device
+  // The selected device aliases an entry in dev_list, and uvc_free_device_list()
+  // unrefs every entry; take our own reference first so it survives the free.
+  uvc_ref_device(self->uvc_dev);
+  uvc_free_device_list(dev_list, 1);
+
   res = uvc_open(self->uvc_dev, &self->uvc_devh);
   if (res < 0) {
-    GST_ERROR_OBJECT(self, "Unable to open UVC device: %s", uvc_strerror(res));
+    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ_WRITE,
+        ("Unable to open UVC device at index %ld", device_ordinal),
+        ("uvc_open failed: %s", uvc_strerror(res)));
     uvc_unref_device(self->uvc_dev);
     self->uvc_dev = NULL;
     uvc_exit(self->uvc_ctx);

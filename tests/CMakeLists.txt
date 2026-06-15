@@ -220,6 +220,79 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # -----------------------------------------------------------------------------
+# Device-selection unit tests (Task 6).
+#
+# The element TUs, the libuvc mock, and the driver are linked into ONE
+# executable with the element type registered statically (no plugin .so). That
+# keeps the mock's state in the test process, so the device-list leak counter
+# (mock_uvc_device_lists_outstanding) is directly observable and device counts
+# can be set programmatically. Each gst-check test is surfaced as its own ctest
+# entry via GST_CHECKS so the suite can be filtered test-by-test.
+# -----------------------------------------------------------------------------
+add_executable(test_device_select
+  test_device_select.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_device_select PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_device_select PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_device_select PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_device_select PRIVATE -fsanitize=address)
+endif()
+
+# "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
+set(_device_select_cases
+  "device_zero:test_device_zero"
+  "index_validate:test_index_validate"
+  "device_restart_leak:test_device_restart_leak"
+)
+foreach(_case ${_device_select_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_ds_home "${CMAKE_BINARY_DIR}/device-select-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_ds_home})
+
+  set(_ds_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/device-select-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_ds_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _ds_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_device_select)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_ds_env}"
+    # start() spawns the control thread which binds the fixed /tmp/libuvc_control
+    # socket, so these must not run concurrently with each other or the mock
+    # streaming variants.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()
+
+# -----------------------------------------------------------------------------
 # Error-mapping unit test (gst-check). Compiles the standalone error TU directly
 # and asserts each uvc_error_t -> GST_ELEMENT_ERROR domain/code on the bus.
 # No plugin and no UVC device are involved; only the helper + libuvc's error
