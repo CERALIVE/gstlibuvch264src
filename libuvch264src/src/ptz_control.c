@@ -5,8 +5,10 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include "gstlibuvch264src_internal.h"
 #include "ptz_control.h"
+#include "gstlibuvch264src_error.h"
 
 static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
 
@@ -185,4 +187,132 @@ static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self,
     
     g_mutex_unlock(&self->control_mutex);
     return g_strdup("ERROR: Unknown command");
+}
+
+static gint ptz_clamp(gint value, gint lo, gint hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+void gst_libuvc_h264_src_ptz_probe_capabilities(GstLibuvcH264Src *self) {
+    /* M6: start every axis gated off with zeroed ranges; only a fully-checked
+     * probe re-enables one, so an unchecked GET_* value is never stored. */
+    self->pan_supported = FALSE;
+    self->tilt_supported = FALSE;
+    self->zoom_supported = FALSE;
+    self->ptz_supported = FALSE;
+    self->pan_min = self->pan_max = self->pan_cur = 0;
+    self->tilt_min = self->tilt_max = self->tilt_cur = 0;
+    self->zoom_min = self->zoom_max = self->zoom_cur = 0;
+
+    if (!self->uvc_devh) return;
+
+    g_mutex_lock(&self->control_mutex);
+
+    /* PanTilt is one UVC control carrying both axes. Trust the range only when
+     * MIN, MAX and RES all succeed; an axis counts as supported only if its own
+     * range is non-degenerate, so a device with a fixed axis stays gated off. */
+    int32_t pan_min = 0, pan_max = 0, pan_res = 0;
+    int32_t tilt_min = 0, tilt_max = 0, tilt_res = 0;
+    uvc_error_t pt_min = uvc_get_pantilt_abs(self->uvc_devh, &pan_min, &tilt_min, UVC_GET_MIN);
+    uvc_error_t pt_max = uvc_get_pantilt_abs(self->uvc_devh, &pan_max, &tilt_max, UVC_GET_MAX);
+    uvc_error_t pt_res = uvc_get_pantilt_abs(self->uvc_devh, &pan_res, &tilt_res, UVC_GET_RES);
+
+    if (pt_min == UVC_SUCCESS && pt_max == UVC_SUCCESS && pt_res == UVC_SUCCESS) {
+        if (pan_min < pan_max) {
+            self->pan_supported = TRUE;
+            self->pan_min = pan_min;
+            self->pan_max = pan_max;
+        }
+        if (tilt_min < tilt_max) {
+            self->tilt_supported = TRUE;
+            self->tilt_min = tilt_min;
+            self->tilt_max = tilt_max;
+        }
+        int32_t pan_cur = 0, tilt_cur = 0;
+        if (uvc_get_pantilt_abs(self->uvc_devh, &pan_cur, &tilt_cur, UVC_GET_CUR) == UVC_SUCCESS) {
+            self->pan_cur = pan_cur;
+            self->tilt_cur = tilt_cur;
+        }
+    }
+
+    uint16_t zoom_min = 0, zoom_max = 0, zoom_res = 0;
+    uvc_error_t z_min = uvc_get_zoom_abs(self->uvc_devh, &zoom_min, UVC_GET_MIN);
+    uvc_error_t z_max = uvc_get_zoom_abs(self->uvc_devh, &zoom_max, UVC_GET_MAX);
+    uvc_error_t z_res = uvc_get_zoom_abs(self->uvc_devh, &zoom_res, UVC_GET_RES);
+
+    if (z_min == UVC_SUCCESS && z_max == UVC_SUCCESS && z_res == UVC_SUCCESS &&
+        zoom_min < zoom_max) {
+        self->zoom_supported = TRUE;
+        self->zoom_min = zoom_min;
+        self->zoom_max = zoom_max;
+        uint16_t zoom_cur = 0;
+        if (uvc_get_zoom_abs(self->uvc_devh, &zoom_cur, UVC_GET_CUR) == UVC_SUCCESS) {
+            self->zoom_cur = zoom_cur;
+        }
+    }
+
+    self->ptz_supported =
+        self->pan_supported || self->tilt_supported || self->zoom_supported;
+
+    g_mutex_unlock(&self->control_mutex);
+
+    /* Only stored (checked) fields are logged; unsupported axes read back 0. */
+    GST_INFO_OBJECT(self, "PTZ probe: pan=%s[%d,%d] tilt=%s[%d,%d] zoom=%s[%d,%d]",
+                    self->pan_supported ? "on" : "off", self->pan_min, self->pan_max,
+                    self->tilt_supported ? "on" : "off", self->tilt_min, self->tilt_max,
+                    self->zoom_supported ? "on" : "off", self->zoom_min, self->zoom_max);
+}
+
+gboolean gst_libuvc_h264_src_ptz_set_pan(GstLibuvcH264Src *self, gint value) {
+    if (!self->uvc_devh || !self->pan_supported) return FALSE;
+
+    g_mutex_lock(&self->control_mutex);
+    gint pan = ptz_clamp(value, self->pan_min, self->pan_max);
+    /* Re-send the current tilt: pan and tilt are one control transfer. */
+    uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, pan, self->tilt_cur);
+    if (res == UVC_SUCCESS) self->pan_cur = pan;
+    g_mutex_unlock(&self->control_mutex);
+
+    if (res != UVC_SUCCESS) {
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), res, "setting pan");
+        return FALSE;
+    }
+    GST_DEBUG_OBJECT(self, "Pan set to %d", pan);
+    return TRUE;
+}
+
+gboolean gst_libuvc_h264_src_ptz_set_tilt(GstLibuvcH264Src *self, gint value) {
+    if (!self->uvc_devh || !self->tilt_supported) return FALSE;
+
+    g_mutex_lock(&self->control_mutex);
+    gint tilt = ptz_clamp(value, self->tilt_min, self->tilt_max);
+    uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, self->pan_cur, tilt);
+    if (res == UVC_SUCCESS) self->tilt_cur = tilt;
+    g_mutex_unlock(&self->control_mutex);
+
+    if (res != UVC_SUCCESS) {
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), res, "setting tilt");
+        return FALSE;
+    }
+    GST_DEBUG_OBJECT(self, "Tilt set to %d", tilt);
+    return TRUE;
+}
+
+gboolean gst_libuvc_h264_src_ptz_set_zoom(GstLibuvcH264Src *self, gint value) {
+    if (!self->uvc_devh || !self->zoom_supported) return FALSE;
+
+    g_mutex_lock(&self->control_mutex);
+    gint zoom = ptz_clamp(value, self->zoom_min, self->zoom_max);
+    uvc_error_t res = uvc_set_zoom_abs(self->uvc_devh, (uint16_t)zoom);
+    if (res == UVC_SUCCESS) self->zoom_cur = zoom;
+    g_mutex_unlock(&self->control_mutex);
+
+    if (res != UVC_SUCCESS) {
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), res, "setting zoom");
+        return FALSE;
+    }
+    GST_DEBUG_OBJECT(self, "Zoom set to %d", zoom);
+    return TRUE;
 }

@@ -74,12 +74,15 @@ option(ENABLE_SANITIZERS
   OFF)
 
 # The element sources, compiled verbatim into the mock-backed module.
+# gstlibuvch264src_error.c is included because ptz_control.c posts bus errors via
+# gst_libuvc_h264_src_post_error(); every mock-linked executable needs the symbol.
 set(_element_srcs
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/uvc_device.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/frame_pipeline.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/ptz_control.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/spspps_cache.c
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
 )
 
 # add_mock_harness_variant(<variant> <sanitizer>)
@@ -287,6 +290,75 @@ foreach(_case ${_device_select_cases})
     # start() spawns the control thread which binds the fixed /tmp/libuvc_control
     # socket, so these must not run concurrently with each other or the mock
     # streaming variants.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()
+
+# -----------------------------------------------------------------------------
+# Native PTZ property/signal tests (Task 12).
+#
+# Same single-executable, statically-registered shape as test_device_select so
+# the mock's last-written PTZ values are observable in-process
+# (mock_uvc_get_last_pantilt/zoom). Each gst-check test is its own ctest entry
+# selected via GST_CHECKS.
+# -----------------------------------------------------------------------------
+add_executable(test_ptz
+  test_ptz.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_ptz PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_ptz PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_ptz PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_ptz PRIVATE -fsanitize=address)
+endif()
+
+set(_ptz_cases
+  "ptz_properties:test_ptz_properties"
+  "ptz_capability_gate:test_ptz_capability_gate"
+)
+foreach(_case ${_ptz_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_ptz_home "${CMAKE_BINARY_DIR}/ptz-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_ptz_home})
+
+  set(_ptz_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/ptz-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_ptz_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _ptz_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_ptz)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_ptz_env}"
+    # start() binds the fixed /tmp/libuvc_control socket via the control thread,
+    # so the PTZ cases must not run concurrently with each other or the other
+    # start()-driven suites under `ctest -j`.
     RESOURCE_LOCK uvc_control_socket
     TIMEOUT 120
   )

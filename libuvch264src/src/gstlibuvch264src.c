@@ -20,6 +20,9 @@ GST_DEBUG_CATEGORY(gst_libuvc_h264_src_debug);
 enum {
   PROP_0,
   PROP_INDEX,
+  PROP_PAN,
+  PROP_TILT,
+  PROP_ZOOM,
   PROP_LAST
 };
 
@@ -52,6 +55,8 @@ static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
 static void gst_libuvc_h264_src_finalize(GObject *object);
+static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
+                                            gint pan, gint tilt, gint zoom);
 
 /* GAsyncQueue forbids NULL payloads, so create() can never receive a NULL
  * "no more frames" marker. unlock() instead pushes this dedicated address to
@@ -72,6 +77,28 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   g_object_class_install_property(gobject_class, PROP_INDEX,
     g_param_spec_string("index", "Index", "Device location, e.g., '0'",
                         DEFAULT_DEVICE_INDEX, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Native PTZ properties. Param-spec bounds cover the UVC arcsecond / focal
+   * domain; the real per-device range is enforced at set time, and a set on an
+   * axis the device does not report is silently ignored (capability-gated). */
+  g_object_class_install_property(gobject_class, PROP_PAN,
+    g_param_spec_int("pan", "Pan", "Absolute pan position in UVC arcseconds",
+                     -648000, 648000, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_TILT,
+    g_param_spec_int("tilt", "Tilt", "Absolute tilt position in UVC arcseconds",
+                     -648000, 648000, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_ZOOM,
+    g_param_spec_int("zoom", "Zoom", "Absolute zoom as a UVC focal length",
+                     0, 65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Action signal driving all three axes in one emission; each axis is applied
+   * only when the device supports it (gated in ptz_control.c). */
+  g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
+    G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+    G_CALLBACK(gst_libuvc_h264_src_set_ptz), NULL, NULL, NULL,
+    G_TYPE_BOOLEAN, 3, G_TYPE_INT, G_TYPE_INT, G_TYPE_INT);
 
   gst_element_class_set_static_metadata(element_class,
     "UVC H.264 / H.265 Video Source", "Source/Video",
@@ -251,6 +278,15 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       g_free(self->index);
       self->index = g_value_dup_string(value);
       break;
+    case PROP_PAN:
+      gst_libuvc_h264_src_ptz_set_pan(self, g_value_get_int(value));
+      break;
+    case PROP_TILT:
+      gst_libuvc_h264_src_ptz_set_tilt(self, g_value_get_int(value));
+      break;
+    case PROP_ZOOM:
+      gst_libuvc_h264_src_ptz_set_zoom(self, g_value_get_int(value));
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -265,10 +301,43 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
     case PROP_INDEX:
       g_value_set_string(value, self->index);
       break;
+    case PROP_PAN:
+      g_value_set_int(value, self->pan_cur);
+      break;
+    case PROP_TILT:
+      g_value_set_int(value, self->tilt_cur);
+      break;
+    case PROP_ZOOM:
+      g_value_set_int(value, self->zoom_cur);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
   }
+}
+
+/* "set-ptz" action handler: apply pan, tilt and zoom in one call. Each axis is
+ * driven only when the device reports it; returns TRUE only if at least one
+ * supported axis was driven and every attempted set succeeded. */
+static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
+                                            gint pan, gint tilt, gint zoom) {
+  gboolean any = FALSE;
+  gboolean ok = TRUE;
+
+  if (self->pan_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_pan(self, pan) && ok;
+  }
+  if (self->tilt_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_tilt(self, tilt) && ok;
+  }
+  if (self->zoom_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_zoom(self, zoom) && ok;
+  }
+
+  return any && ok;
 }
 
 static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) {
@@ -374,6 +443,9 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     self->uvc_ctx = NULL;
     return FALSE;
   }
+
+  // Probe PTZ ranges so only axes the device actually exposes are driven (M6).
+  gst_libuvc_h264_src_ptz_probe_capabilities(self);
 
   // Start control socket thread
   self->control_running = TRUE;

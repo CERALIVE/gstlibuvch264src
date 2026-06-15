@@ -21,6 +21,7 @@
 #ifndef MOCK_LIBUVC_H
 #define MOCK_LIBUVC_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <libuvc/libuvc.h>
 
@@ -63,6 +64,16 @@ void mock_uvc_set_max_frames(int max_frames);
 void mock_uvc_set_ptz_range(int32_t pan_min, int32_t pan_max,
                             int32_t tilt_min, int32_t tilt_max,
                             uint16_t zoom_min, uint16_t zoom_max);
+
+/* Whether the device exposes PTZ controls (default true). When false every
+ * uvc_*_abs() get and set returns UVC_ERROR_NOT_SUPPORTED, emulating a camera
+ * with no PanTilt/Zoom unit so the element's probe gates every axis off. */
+void mock_uvc_set_ptz_supported(bool supported);
+
+/* Last pan/tilt and zoom written via uvc_set_pantilt_abs()/uvc_set_zoom_abs()
+ * (observability for assertions that a property actually drove the device). */
+void mock_uvc_get_last_pantilt(int32_t *pan, int32_t *tilt);
+uint16_t mock_uvc_get_last_zoom(void);
 
 /* Frames the feeder has delivered since the last uvc_start_streaming()
  * (observability for assertions). */

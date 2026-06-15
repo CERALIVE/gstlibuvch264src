@@ -88,6 +88,7 @@ static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed *
 static int32_t g_pan_min = -180000, g_pan_max = 180000, g_pan_cur = 0;
 static int32_t g_tilt_min = -90000, g_tilt_max = 90000, g_tilt_cur = 0;
 static uint16_t g_zoom_min = 0, g_zoom_max = 100, g_zoom_cur = 0;
+static bool g_ptz_supported = true; /* false -> uvc_*_abs() return NOT_SUPPORTED */
 
 /* Apply MOCK_UVC_* environment overrides. Idempotent: only touches a field when
  * its variable is set, so it never clobbers a programmatic setter. Call with
@@ -126,6 +127,7 @@ void mock_uvc_reset(void) {
   g_pan_min = -180000; g_pan_max = 180000; g_pan_cur = 0;
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
+  g_ptz_supported = true;
   apply_env_overrides_locked();
   pthread_mutex_unlock(&g_lock);
 }
@@ -162,6 +164,26 @@ void mock_uvc_set_ptz_range(int32_t pan_min, int32_t pan_max,
   g_tilt_min = tilt_min; g_tilt_max = tilt_max;
   g_zoom_min = zoom_min; g_zoom_max = zoom_max;
   pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_ptz_supported(bool supported) {
+  pthread_mutex_lock(&g_lock);
+  g_ptz_supported = supported;
+  pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_get_last_pantilt(int32_t *pan, int32_t *tilt) {
+  pthread_mutex_lock(&g_lock);
+  if (pan) *pan = g_pan_cur;
+  if (tilt) *tilt = g_tilt_cur;
+  pthread_mutex_unlock(&g_lock);
+}
+
+uint16_t mock_uvc_get_last_zoom(void) {
+  pthread_mutex_lock(&g_lock);
+  uint16_t z = g_zoom_cur;
+  pthread_mutex_unlock(&g_lock);
+  return z;
 }
 
 int mock_uvc_frames_delivered(void) {
@@ -554,6 +576,10 @@ uvc_error_t uvc_set_pantilt_abs(uvc_device_handle_t *devh, int32_t pan,
   if (!devh)
     return UVC_ERROR_NO_DEVICE;
   pthread_mutex_lock(&g_lock);
+  if (!g_ptz_supported) {
+    pthread_mutex_unlock(&g_lock);
+    return UVC_ERROR_NOT_SUPPORTED;
+  }
   g_pan_cur = pan;
   g_tilt_cur = tilt;
   pthread_mutex_unlock(&g_lock);
@@ -565,6 +591,10 @@ uvc_error_t uvc_get_pantilt_abs(uvc_device_handle_t *devh, int32_t *pan,
   if (!devh || !pan || !tilt)
     return UVC_ERROR_NO_DEVICE;
   pthread_mutex_lock(&g_lock);
+  if (!g_ptz_supported) {
+    pthread_mutex_unlock(&g_lock);
+    return UVC_ERROR_NOT_SUPPORTED;
+  }
   *pan = ptz_pick_i32(req_code, g_pan_cur, g_pan_min, g_pan_max);
   *tilt = ptz_pick_i32(req_code, g_tilt_cur, g_tilt_min, g_tilt_max);
   pthread_mutex_unlock(&g_lock);
@@ -575,6 +605,10 @@ uvc_error_t uvc_set_zoom_abs(uvc_device_handle_t *devh, uint16_t focal_length) {
   if (!devh)
     return UVC_ERROR_NO_DEVICE;
   pthread_mutex_lock(&g_lock);
+  if (!g_ptz_supported) {
+    pthread_mutex_unlock(&g_lock);
+    return UVC_ERROR_NOT_SUPPORTED;
+  }
   g_zoom_cur = focal_length;
   pthread_mutex_unlock(&g_lock);
   return UVC_SUCCESS;
@@ -585,6 +619,10 @@ uvc_error_t uvc_get_zoom_abs(uvc_device_handle_t *devh, uint16_t *focal_length,
   if (!devh || !focal_length)
     return UVC_ERROR_NO_DEVICE;
   pthread_mutex_lock(&g_lock);
+  if (!g_ptz_supported) {
+    pthread_mutex_unlock(&g_lock);
+    return UVC_ERROR_NOT_SUPPORTED;
+  }
   *focal_length = ptz_pick_u16(req_code, g_zoom_cur, g_zoom_min, g_zoom_max);
   pthread_mutex_unlock(&g_lock);
   return UVC_SUCCESS;

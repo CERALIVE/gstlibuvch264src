@@ -50,6 +50,15 @@ struct _GstLibuvcH264Src {
   gpointer control_thread;
   gboolean control_running;
   GMutex control_mutex;
+
+  // PTZ state, filled by ptz_probe_capabilities() at open and guarded by
+  // control_mutex. pan and tilt share one UVC control, so a single-axis set must
+  // re-send the other axis from *_cur (the last value written).
+  gint pan_min, pan_max, pan_cur;
+  gint tilt_min, tilt_max, tilt_cur;
+  gint zoom_min, zoom_max, zoom_cur;
+  gboolean pan_supported, tilt_supported, zoom_supported;
+  gboolean ptz_supported;
 };
 
 G_END_DECLS
