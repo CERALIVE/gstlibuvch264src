@@ -718,6 +718,7 @@ function(add_negotiate_variant variant sanitizer)
     "negotiate_extreme_fps_high${suffix}:test_negotiate_extreme_fps_high"
     "negotiate_extreme_res_low${suffix}:test_negotiate_extreme_res_low"
     "negotiate_extreme_res_high${suffix}:test_negotiate_extreme_res_high"
+    "negotiate_smaller_max_payload${suffix}:test_negotiate_smaller_max_payload"
   )
   if(NOT sanitizer STREQUAL "")
     list(APPEND _neg_cases "negotiate_leak:test_negotiate_leak")
