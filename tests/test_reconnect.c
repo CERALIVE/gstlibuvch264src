@@ -43,6 +43,13 @@
 #include "mock_libusb.h"
 #endif
 
+/* H.264 NAL unit types (the mock streams H.264 by default). The re-gate test
+ * reads the leading NAL type of each emitted buffer to prove the IDR gate
+ * dropped the resumed stream's leading non-IDR slices. */
+#define NAL_NON_IDR 1
+#define NAL_IDR     5
+#define NAL_SPS     7
+
 /* The harness blanks GST_PLUGIN_SYSTEM_PATH; load just core-elements so fakesink
  * is available without scanning unrelated plugins. */
 static void
@@ -247,6 +254,201 @@ GST_START_TEST (test_reconnect_resume)
   fail_unless (resumed && final_buffers >= baseline + 5,
       "stream did not resume after reconnect: %d buffers (baseline %d), "
       "open count %d", final_buffers, baseline, open_count);
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
+/* test_reconnect_idr_regate (Task 15)                                       */
+/*                                                                           */
+/* A successful reconnect must re-arm the stream state (gstlibuvch264src.c    */
+/* :1028-1031): had_idr reset re-engages the IDR gate so the resumed stream's */
+/* leading non-IDR slices are dropped until a fresh IDR, and base_time/       */
+/* prev_pts reset re-baseline PTS to running-time so the first resumed PTS    */
+/* reflects the new running-time across the disconnect gap rather than        */
+/* continuing from the pre-disconnect value.                                 */
+/*                                                                           */
+/* The pre-disconnect feeder delivers exactly one VALID SPS-prefixed IDR      */
+/* (latching had_idr=TRUE and a low PTS), then goes silent. The replug feeds  */
+/* a stream joined mid-GOP (MOCK_UVC_FRAME_NONIDR_LEAD: bare non-IDR slices   */
+/* then a fresh IDR). A probe records each emitted buffer's leading NAL type  */
+/* and PTS so the test can assert the leading non-IDRs were dropped and the   */
+/* PTS jumped to running-time, monotonic thereafter.                         */
+/* ------------------------------------------------------------------------- */
+
+#define REGATE_CAP 64
+
+static gint regate_count;               /* atomic: emitted buffers recorded */
+static gint regate_nal[REGATE_CAP];     /* leading NAL type per buffer */
+static GstClockTime regate_pts[REGATE_CAP];
+
+static gint
+regate_leading_nal_type (GstBuffer * buf)
+{
+  GstMapInfo map;
+  gint type = -1;
+  if (gst_buffer_map (buf, &map, GST_MAP_READ)) {
+    /* Annex-B: 00 00 00 01 then the NAL header (H.264 type = byte & 0x1F). */
+    if (map.size >= 5 && map.data[0] == 0 && map.data[1] == 0 &&
+        map.data[2] == 0 && map.data[3] == 1) {
+      type = map.data[4] & 0x1F;
+    }
+    gst_buffer_unmap (buf, &map);
+  }
+  return type;
+}
+
+static GstPadProbeReturn
+regate_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  (void) pad;
+  (void) user_data;
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+    gint idx = g_atomic_int_get (&regate_count);
+    if (idx < REGATE_CAP) {
+      regate_nal[idx] = regate_leading_nal_type (buf);
+      regate_pts[idx] = GST_BUFFER_PTS (buf);
+      g_atomic_int_inc (&regate_count);
+    }
+    g_atomic_int_inc (&buffers_seen);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+GST_START_TEST (test_reconnect_idr_regate)
+{
+  load_core_elements ();
+  register_element ();
+  mock_uvc_reset ();
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+  mock_uvc_set_max_frames (1);
+
+  g_atomic_int_set (&buffers_seen, 0);
+  g_atomic_int_set (&regate_count, 0);
+
+  GstElement *pipeline = gst_pipeline_new ("regate-pipeline");
+  GstElement *src = gst_element_factory_make ("libuvch264src", "src");
+  GstElement *sink = gst_element_factory_make ("fakesink", "sink");
+  fail_unless (pipeline != NULL && src != NULL && sink != NULL,
+      "failed to create test elements");
+  g_object_set (sink, "sync", FALSE, NULL);
+  gst_bin_add_many (GST_BIN (pipeline), src, sink, NULL);
+  fail_unless (gst_element_link (src, sink), "failed to link src ! sink");
+
+  GstPad *pad = gst_element_get_static_pad (sink, "sink");
+  fail_unless (pad != NULL, "fakesink has no sink pad");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, regate_probe, NULL, NULL);
+  gst_object_unref (pad);
+
+  g_object_set (src, "reconnect", TRUE, NULL);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
+      != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  /* Wait for the single pre-disconnect frame so the first feeder has run and
+   * gone quiet; switching the mode below then only affects the reopened stream. */
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&buffers_seen) < 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+  fail_unless (g_atomic_int_get (&buffers_seen) >= 1,
+      "the initial stream never delivered a frame");
+
+  /* The replug feeds a mid-GOP join: leading bare non-IDR slices, then a fresh
+   * IDR. A re-armed IDR gate must drop every leading non-IDR so the first
+   * resumed buffer is the SPS-prefixed IDR. */
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_NONIDR_LEAD);
+  mock_uvc_set_max_frames (0);
+
+  /* Wait for the reopen (open count >= 2) plus a few resumed buffers, or fail
+   * fast on a bus error (reconnect must suppress the disconnect error). */
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gboolean resumed = FALSE;
+  gboolean errored = FALSE;
+  deadline = g_get_monotonic_time () + 40 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    GstMessage *msg =
+        gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg != NULL) {
+      errored = (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR);
+      gst_message_unref (msg);
+      break;
+    }
+    if (g_atomic_int_get (&regate_count) >= 4 && mock_uvc_open_count () >= 2) {
+      resumed = TRUE;
+      break;
+    }
+    g_usleep (20 * G_TIME_SPAN_MILLISECOND);
+  }
+  gst_object_unref (bus);
+
+  /* Teardown joins the feeder/streaming thread, so the probe arrays and the
+   * mock counters are stable to read afterwards (a failed fail_unless longjmps
+   * past the unref, so snapshot and tear down before asserting). */
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  gint count = g_atomic_int_get (&regate_count);
+  gint open_count = mock_uvc_open_count ();
+  gint close_count = mock_uvc_close_count ();
+  gint nal0 = count > 0 ? regate_nal[0] : -1;
+  gint nal1 = count > 1 ? regate_nal[1] : -1;
+  GstClockTime pts0 = count > 0 ? regate_pts[0] : GST_CLOCK_TIME_NONE;
+  GstClockTime pts1 = count > 1 ? regate_pts[1] : GST_CLOCK_TIME_NONE;
+  gboolean monotonic = TRUE;
+  for (gint i = 1; i < count && i < REGATE_CAP; i++) {
+    if (!(regate_pts[i] > regate_pts[i - 1]))
+      monotonic = FALSE;
+  }
+
+  gst_object_unref (pipeline);
+
+  fail_unless (!errored,
+      "reconnect=TRUE should suppress the disconnect error, but the pipeline "
+      "errored out");
+  fail_unless (resumed && open_count >= 2,
+      "stream did not reopen+resume after reconnect (open count %d, %d buffers)",
+      open_count, count);
+  fail_unless (count >= 2,
+      "need the pre-disconnect frame plus at least one resumed buffer, got %d",
+      count);
+
+  fail_unless (nal0 == NAL_SPS || nal0 == NAL_IDR,
+      "pre-disconnect buffer should be an IDR/SPS, got NAL type %d", nal0);
+
+  /* IDR RE-GATE: the resumed stream led with bare non-IDR slices; a re-armed
+   * gate must have dropped them all, so the first resumed buffer is the fresh
+   * SPS-prefixed IDR, never a forwarded non-IDR. */
+  fail_unless (nal1 != NAL_NON_IDR,
+      "IDR gate not re-armed on reconnect: a non-IDR slice was forwarded as the "
+      "first resumed buffer (had_idr stale across reconnect)");
+  fail_unless (nal1 == NAL_SPS || nal1 == NAL_IDR,
+      "first resumed buffer should be an IDR/SPS, got NAL type %d", nal1);
+
+  /* PTS RE-BASELINE: the pre-disconnect frame arrived right after PLAYING, so
+   * its PTS is small; the resumed stream's first PTS must reflect the new
+   * running-time across the ~5 s detection + ~1 s backoff gap, proving the
+   * baseline was re-latched to running-time rather than continuing from the
+   * pre-disconnect value (prev_pts + 1). */
+  fail_unless (GST_CLOCK_TIME_IS_VALID (pts0) && GST_CLOCK_TIME_IS_VALID (pts1),
+      "expected valid PTS on both the pre- and post-reconnect buffers");
+  fail_unless (pts0 < 2 * GST_SECOND,
+      "pre-disconnect PTS unexpectedly large (%" GST_TIME_FORMAT ")",
+      GST_TIME_ARGS (pts0));
+  fail_unless (pts1 >= 4 * GST_SECOND,
+      "resumed PTS (%" GST_TIME_FORMAT ") did not jump to running-time across "
+      "the disconnect gap - PTS was not re-baselined", GST_TIME_ARGS (pts1));
+
+  fail_unless (monotonic,
+      "PTS was not strictly monotonic across the resume boundary");
+
+  /* force_usb_release() must never precede uvc_close() on the reconnect path:
+   * uvc_close() owns the single close, so opens and closes stay balanced after
+   * teardown (initial open + reconnect reopen, each closed exactly once). */
+  fail_unless (close_count == open_count,
+      "teardown imbalance: %d uvc_close vs %d uvc_open (force_usb_release may "
+      "have preceded uvc_close on reconnect)", close_count, open_count);
 }
 
 GST_END_TEST;
@@ -623,6 +825,11 @@ reconnect_suite (void)
   tcase_set_timeout (tc_recon, 60);
   tcase_add_test (tc_recon, test_reconnect_resume);
   suite_add_tcase (s, tc_recon);
+
+  TCase *tc_regate = tcase_create ("reconnect_idr_regate");
+  tcase_set_timeout (tc_regate, 90);
+  tcase_add_test (tc_regate, test_reconnect_idr_regate);
+  suite_add_tcase (s, tc_regate);
 
   TCase *tc_backoff = tcase_create ("backoff_sequence");
   tcase_set_timeout (tc_backoff, 30);

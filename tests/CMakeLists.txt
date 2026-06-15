@@ -1101,6 +1101,7 @@ apply_sanitizer_flags(test_reconnect "${STATIC_SUITE_SANITIZER}")
 set(_reconnect_cases
   "disconnect_error:test_disconnect_error"
   "reconnect_resume:test_reconnect_resume"
+  "reconnect_idr_regate:test_reconnect_idr_regate"
   "reconnect_exhaustion:test_reconnect_exhaustion"
   "reconnect_backoff_sequence:test_reconnect_backoff_sequence"
   "reconnect_backoff_interrupt:test_reconnect_backoff_interrupt"
