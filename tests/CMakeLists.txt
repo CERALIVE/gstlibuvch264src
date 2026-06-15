@@ -948,3 +948,74 @@ set_tests_properties(v4l2_probe_nonfatal PROPERTIES
   ENVIRONMENT "${_probe_env}"
   TIMEOUT 30
 )
+
+# -----------------------------------------------------------------------------
+# Live-source polish tests (Task 19).
+#
+# Same single-executable, statically-registered shape as test_pts_monotonic so
+# the test can drive a real PLAYING pipeline against the mock feeder AND reach
+# into the instance struct / call frame_callback() directly.
+#   live_source_polish      LATENCY query reports live + min == one frame
+#                           interval, and buffer OFFSETs are a strict +1 sequence.
+#   spspps_write_on_change  The SPS/PPS cache is written on a changed parameter
+#                           set, not rewritten for an identical one (L10).
+# -----------------------------------------------------------------------------
+add_executable(test_live_source
+  test_live_source.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_live_source PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_live_source PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_live_source PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_live_source PRIVATE -fsanitize=address)
+endif()
+
+set(_live_source_cases
+  "live_source_polish:test_live_source_polish"
+  "spspps_write_on_change:test_spspps_write_on_change"
+)
+foreach(_case ${_live_source_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_ls_home "${CMAKE_BINARY_DIR}/live-source-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_ls_home})
+
+  set(_ls_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/live-source-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_ls_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _ls_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_live_source)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_ls_env}"
+    # start() may spawn the control thread, so keep these off the shared socket
+    # resource like the other start()-driven suites under `ctest -j`.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endforeach()

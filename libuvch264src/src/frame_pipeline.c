@@ -134,11 +134,18 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                         "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
                     continue;
                 }
-                self->vps_length = unit->len;
-                memcpy(self->vps, unit->ptr, self->vps_length);
-                updated_sps_pps = TRUE;
+                // L10: only flag a disk write when the parameter set actually
+                // changed. SPS/PPS/VPS repeat before every IDR, so an
+                // unconditional store rewrites the cache file each GOP and wears
+                // the flash for nothing. send_sps_pps still latches every time so
+                // the sets are re-prepended in-band; only the cache write is gated.
+                if (self->vps_length != unit->len ||
+                    memcmp(self->vps, unit->ptr, unit->len) != 0) {
+                    self->vps_length = unit->len;
+                    memcpy(self->vps, unit->ptr, self->vps_length);
+                    updated_sps_pps = TRUE;
+                }
                 self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
                 continue;
             case UNIT_SPS:
                 if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
@@ -146,11 +153,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                         "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
                     continue;
                 }
-                self->sps_length = unit->len;
-                memcpy(self->sps, unit->ptr, self->sps_length);
-                updated_sps_pps = TRUE;
+                if (self->sps_length != unit->len ||
+                    memcmp(self->sps, unit->ptr, unit->len) != 0) {
+                    self->sps_length = unit->len;
+                    memcpy(self->sps, unit->ptr, self->sps_length);
+                    updated_sps_pps = TRUE;
+                }
                 self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
                 continue;
             case UNIT_PPS:
                 if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
@@ -158,11 +167,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                         "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
                     continue;
                 }
-                self->pps_length = unit->len;
-                memcpy(self->pps, unit->ptr, self->pps_length);
-                updated_sps_pps = TRUE;
+                if (self->pps_length != unit->len ||
+                    memcmp(self->pps, unit->ptr, unit->len) != 0) {
+                    self->pps_length = unit->len;
+                    memcpy(self->pps, unit->ptr, self->pps_length);
+                    updated_sps_pps = TRUE;
+                }
                 self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
                 continue;
             case UNIT_FRAME_IDR: {
                 if (!self->had_idr || self->send_sps_pps) {
@@ -321,6 +332,12 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             GST_BUFFER_DURATION(buffer) = duration;
             GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
         }
+
+        // Monotonic frame counter so downstream can detect drops. Only the
+        // feeder thread runs frame_callback, so this needs no lock.
+        GST_BUFFER_OFFSET(buffer) = self->frame_offset;
+        GST_BUFFER_OFFSET_END(buffer) = self->frame_offset + 1;
+        self->frame_offset++;
 
         g_async_queue_push(self->frame_queue, buffer);
     }

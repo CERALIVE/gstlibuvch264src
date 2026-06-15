@@ -47,6 +47,7 @@ G_DEFINE_TYPE_WITH_CODE(GstLibuvcH264Src, gst_libuvc_h264_src, GST_TYPE_PUSH_SRC
   GST_DEBUG_CATEGORY_INIT(gst_libuvc_h264_src_debug, "libuvch264src", 0, "libuvch264src element"));
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc);
+static gboolean gst_libuvc_h264_src_query(GstBaseSrc *basesrc, GstQuery *query);
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
                                              const GValue *value, GParamSpec *pspec);
 static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
@@ -74,6 +75,7 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GstPushSrcClass *push_src_class = GST_PUSH_SRC_CLASS(klass);
 
   base_src_class->negotiate = GST_DEBUG_FUNCPTR(gst_libuvc_h264_negotiate);
+  base_src_class->query = GST_DEBUG_FUNCPTR(gst_libuvc_h264_src_query);
   gobject_class->set_property = gst_libuvc_h264_src_set_property;
   gobject_class->get_property = gst_libuvc_h264_src_get_property;
 
@@ -141,6 +143,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
   self->flushing = 0;
+  self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
   
@@ -325,6 +328,31 @@ out:
     return result;
 }
 
+static gboolean gst_libuvc_h264_src_query(GstBaseSrc *basesrc, GstQuery *query) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
+
+  if (GST_QUERY_TYPE(query) == GST_QUERY_LATENCY) {
+    /* A live source delivers a frame only once it has been fully captured, so
+       the minimum latency is one frame interval; report it explicitly rather
+       than leaving downstream sinks with the GstBaseSrc default of zero. max ==
+       min: the element does not buffer ahead. frame_interval is shared with the
+       frame_callback PTS estimator, which mutates it under the object lock, so
+       read it the same way; until negotiate() sets it, defer to the base class. */
+    GstClockTime latency;
+    GST_OBJECT_LOCK(self);
+    latency = self->frame_interval > 0
+              ? (GstClockTime) self->frame_interval : GST_CLOCK_TIME_NONE;
+    GST_OBJECT_UNLOCK(self);
+
+    if (GST_CLOCK_TIME_IS_VALID(latency)) {
+      gst_query_set_latency(query, TRUE, latency, latency);
+      return TRUE;
+    }
+  }
+
+  return GST_BASE_SRC_CLASS(gst_libuvc_h264_src_parent_class)->query(basesrc, query);
+}
+
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
                                              const GValue *value, GParamSpec *pspec) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(object);
@@ -456,6 +484,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   self->had_idr = FALSE;
   self->send_sps_pps = FALSE;
   self->frame_count = 0;
+  self->frame_offset = 0;
   self->prev_int_ts = 0;
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;

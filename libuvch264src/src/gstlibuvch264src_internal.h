@@ -36,6 +36,10 @@ struct _GstLibuvcH264Src {
   gint64 frame_interval; // in ns
   guint64 prev_int_ts;
   gint frame_count;
+  /* Monotonic per-session output counter for GST_BUFFER_OFFSET. Distinct from
+   * frame_count, which is periodically reset by the PTS estimator and so is not
+   * monotonic. Reset in start(); only touched on the feeder thread. */
+  guint64 frame_offset;
   gboolean had_idr;
   gboolean send_sps_pps;
   gint vps_length;
