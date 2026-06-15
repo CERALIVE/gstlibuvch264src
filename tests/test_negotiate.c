@@ -30,6 +30,7 @@
  */
 
 #include <gst/check/gstcheck.h>
+#include <string.h>
 
 #include "gstlibuvch264src.h"
 #include "mock_libuvc.h"
@@ -385,6 +386,148 @@ GST_START_TEST (test_negotiate_smaller_max_payload)
 
 GST_END_TEST;
 
+/* ------------------------------------------------------------------------- *
+ * max-payload tuning property (Task 12, gated on bmaxpayload-analysis.md).
+ * The device-negotiated payload the mock reports is MOCK_DEVICE_DEFAULT_PAYLOAD;
+ * a test sets a DIFFERENT value via the property so applied/fallback are
+ * distinguishable, and inspects the committed value via the mock's
+ * mock_uvc_last_started_payload()/mock_uvc_probe_call_count() observability.
+ * ------------------------------------------------------------------------- */
+
+static gint g_saw_payload_warning;
+
+/* Latch when the element logs a WARNING mentioning "max-payload" - the signature
+ * of the graceful fallback. Runs on the streaming task thread, so the flag is
+ * set atomically. */
+static void
+payload_warning_log_func (GstDebugCategory * category, GstDebugLevel level,
+    const gchar * file, const gchar * function, gint line, GObject * object,
+    GstDebugMessage * message, gpointer user_data)
+{
+  (void) category; (void) file; (void) function; (void) line; (void) object;
+  (void) user_data;
+  if (level <= GST_LEVEL_WARNING) {
+    const gchar *m = gst_debug_message_get (message);
+    if (m != NULL && strstr (m, "max-payload") != NULL)
+      g_atomic_int_set (&g_saw_payload_warning, 1);
+  }
+}
+
+/* Probe the sink for buffers, drive PLAYING, and report whether at least one
+ * buffer flowed within the window. The caller drops the pipeline to NULL. */
+static gboolean
+payload_play_until_buffer (GstElement * pipeline)
+{
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  GstPad *pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, NULL,
+      NULL);
+  gst_object_unref (pad);
+  gst_object_unref (sink);
+
+  if (gst_element_set_state (pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE)
+    return FALSE;
+
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&g_buffers_seen) <= 0
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+  return g_atomic_int_get (&g_buffers_seen) > 0;
+}
+
+GST_START_TEST (test_negotiate_max_payload_default_unchanged)
+{
+  /* Property unset (default 0 sentinel): negotiation must be byte-for-byte
+   * identical to pre-change - the element issues ZERO payload probes and streams
+   * on the device-negotiated payload. */
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = payload_play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  fail_unless (got, "stream did not start with default (unset) max-payload");
+  fail_unless (mock_uvc_probe_call_count () == 0,
+      "unset max-payload must issue NO uvc_probe_stream_ctrl (byte-for-byte "
+      "unchanged negotiation); got %d probe(s)", mock_uvc_probe_call_count ());
+  fail_unless (mock_uvc_last_started_payload () == MOCK_DEVICE_DEFAULT_PAYLOAD,
+      "unset max-payload must stream on the device-negotiated payload (%u); got %u",
+      MOCK_DEVICE_DEFAULT_PAYLOAD, mock_uvc_last_started_payload ());
+
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_negotiate_max_payload_rejected_falls_back)
+{
+  /* Device refuses the requested payload (read-back mismatch): the element must
+   * fall back to the device-negotiated value, still reach PLAYING and deliver
+   * frames, and log a warning. The media path is never failed. */
+  g_atomic_int_set (&g_saw_payload_warning, 0);
+  gst_debug_set_active (TRUE);
+  gst_debug_set_threshold_for_name ("libuvch264src", GST_LEVEL_WARNING);
+  gst_debug_add_log_function (payload_warning_log_func, NULL, NULL);
+
+  mock_uvc_set_payload_mode (MOCK_UVC_PAYLOAD_REJECT);
+
+  GstElement *pipeline = build_pipeline ();
+  GstElement *src = gst_bin_get_by_name (GST_BIN (pipeline), "src");
+  g_object_set (src, "max-payload", 32768u, NULL);
+  gst_object_unref (src);
+
+  gboolean got = payload_play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_debug_remove_log_function (payload_warning_log_func);
+
+  fail_unless (got,
+      "stream must still start when the device rejects the requested payload "
+      "(graceful fallback)");
+  fail_unless (mock_uvc_probe_call_count () > 0,
+      "element must have probed the requested override before falling back");
+  fail_unless (mock_uvc_last_started_payload () == MOCK_DEVICE_DEFAULT_PAYLOAD,
+      "a rejected payload must fall back to the device-negotiated value (%u); got %u",
+      MOCK_DEVICE_DEFAULT_PAYLOAD, mock_uvc_last_started_payload ());
+  fail_unless (g_atomic_int_get (&g_saw_payload_warning),
+      "a graceful fallback must log a max-payload warning");
+
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_negotiate_max_payload_accepted_applied)
+{
+  /* Device honors the requested payload: the element commits it and streams on
+   * it, and a property read-back reports the effective committed value. */
+  mock_uvc_set_payload_mode (MOCK_UVC_PAYLOAD_ACCEPT);
+
+  GstElement *pipeline = build_pipeline ();
+  GstElement *src = gst_bin_get_by_name (GST_BIN (pipeline), "src");
+  g_object_set (src, "max-payload", 32768u, NULL);
+  gst_object_unref (src);
+
+  gboolean got = payload_play_until_buffer (pipeline);
+
+  guint effective = 0;
+  src = gst_bin_get_by_name (GST_BIN (pipeline), "src");
+  g_object_get (src, "max-payload", &effective, NULL);
+  gst_object_unref (src);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  fail_unless (got, "stream must start with an accepted payload");
+  fail_unless (mock_uvc_last_started_payload () == 32768u,
+      "an accepted payload must be applied to the stream; got %u",
+      mock_uvc_last_started_payload ());
+  fail_unless (effective == 32768u,
+      "read-back must expose the committed payload (32768); got %u", effective);
+
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
 static Suite *
 negotiate_suite (void)
 {
@@ -404,6 +547,9 @@ negotiate_suite (void)
   tcase_add_test (tc, test_negotiate_extreme_res_low);
   tcase_add_test (tc, test_negotiate_extreme_res_high);
   tcase_add_test (tc, test_negotiate_smaller_max_payload);
+  tcase_add_test (tc, test_negotiate_max_payload_default_unchanged);
+  tcase_add_test (tc, test_negotiate_max_payload_rejected_falls_back);
+  tcase_add_test (tc, test_negotiate_max_payload_accepted_applied);
 
   return s;
 }

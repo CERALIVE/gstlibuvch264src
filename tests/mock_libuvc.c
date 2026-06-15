@@ -106,6 +106,15 @@ static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed *
 static int g_uvc_open_count = 0;  /* successful uvc_open() calls */
 static int g_uvc_close_count = 0; /* uvc_close() calls on a live handle */
 
+/* Payload-tuning observability (Task 12). g_payload_mode picks how
+ * uvc_probe_stream_ctrl() answers a host-proposed dwMaxPayloadTransferSize;
+ * g_probe_call_count proves the element issued (or, when unset, did NOT issue)
+ * the extra probe; g_last_started_payload records the dwMaxPayloadTransferSize
+ * the element committed when it called uvc_start_streaming(). */
+static mock_uvc_payload_mode_t g_payload_mode = MOCK_UVC_PAYLOAD_ACCEPT;
+static int g_probe_call_count = 0;
+static uint32_t g_last_started_payload = 0;
+
 /* Open-failure injection (Task 8). g_uvc_open_attempts counts every uvc_open()
  * past the param/refcount checks (successes AND injected failures). After
  * g_uvc_open_fail_after successful opens, every further open returns
@@ -179,6 +188,9 @@ void mock_uvc_reset(void) {
   g_uvc_close_count = 0;
   g_uvc_open_attempts = 0;
   g_uvc_open_fail_after = -1;
+  g_payload_mode = MOCK_UVC_PAYLOAD_ACCEPT;
+  g_probe_call_count = 0;
+  g_last_started_payload = 0;
   g_pan_min = -180000; g_pan_max = 180000; g_pan_cur = 0;
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
@@ -324,6 +336,26 @@ int mock_uvc_open_attempt_count(void) {
 int mock_uvc_device_lists_outstanding(void) {
   pthread_mutex_lock(&g_lock);
   int n = g_device_lists_outstanding;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+void mock_uvc_set_payload_mode(mock_uvc_payload_mode_t mode) {
+  pthread_mutex_lock(&g_lock);
+  g_payload_mode = mode;
+  pthread_mutex_unlock(&g_lock);
+}
+
+uint32_t mock_uvc_last_started_payload(void) {
+  pthread_mutex_lock(&g_lock);
+  uint32_t n = g_last_started_payload;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+int mock_uvc_probe_call_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_probe_call_count;
   pthread_mutex_unlock(&g_lock);
   return n;
 }
@@ -791,6 +823,29 @@ uvc_error_t uvc_get_stream_ctrl_format_size(uvc_device_handle_t *devh,
   ctrl->bFrameIndex = 1;
   ctrl->dwFrameInterval = 333333;
   ctrl->dwMaxVideoFrameSize = MOCK_FRAME_BUF_CAP;
+  /* Device-negotiated payload (the value real libuvc writes back from the
+   * probe/commit GET_CUR). The element streams on this unless its max-payload
+   * property overrides it via uvc_probe_stream_ctrl() below. */
+  ctrl->dwMaxPayloadTransferSize = MOCK_DEVICE_DEFAULT_PAYLOAD;
+  return UVC_SUCCESS;
+}
+
+/* Model the device's probe/commit GET_CUR write-back for a host-proposed
+ * dwMaxPayloadTransferSize: ACCEPT leaves the proposed value in place (device
+ * honored the SET_CUR; GET_CUR echoes it back), REJECT overwrites it with the
+ * device-default value (device clamped/refused it) so the element observes a
+ * read-back mismatch and falls back. Every other ctrl field is left untouched. */
+uvc_error_t uvc_probe_stream_ctrl(uvc_device_handle_t *devh,
+                                  uvc_stream_ctrl_t *ctrl) {
+  if (!devh || !ctrl)
+    return UVC_ERROR_INVALID_PARAM;
+  pthread_mutex_lock(&g_lock);
+  g_probe_call_count++;
+  mock_uvc_payload_mode_t mode = g_payload_mode;
+  pthread_mutex_unlock(&g_lock);
+
+  if (mode == MOCK_UVC_PAYLOAD_REJECT)
+    ctrl->dwMaxPayloadTransferSize = MOCK_DEVICE_DEFAULT_PAYLOAD;
   return UVC_SUCCESS;
 }
 
@@ -798,12 +853,13 @@ uvc_error_t uvc_start_streaming(uvc_device_handle_t *devh,
                                 uvc_stream_ctrl_t *ctrl,
                                 uvc_frame_callback_t *cb, void *user_ptr,
                                 uint8_t flags) {
-  (void)ctrl; (void)flags;
+  (void)flags;
   if (!devh || !cb)
     return UVC_ERROR_INVALID_PARAM;
 
   pthread_mutex_lock(&g_lock);
   g_frames_delivered = 0;
+  g_last_started_payload = (ctrl != NULL) ? ctrl->dwMaxPayloadTransferSize : 0;
   pthread_mutex_unlock(&g_lock);
 
   devh->cb = cb;

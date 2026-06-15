@@ -44,6 +44,17 @@ struct _GstLibuvcH264Src {
    * Initialised in init(), cleared in finalize(). */
   GMutex reconnect_lock;
   GCond reconnect_cond;
+  /* Opt-in USB payload override (Task 12, gated on bmaxpayload-analysis.md).
+   * max_payload is the REQUESTED value (PROP_MAX_PAYLOAD); 0 is the sentinel
+   * "use the device-negotiated value" that leaves negotiation byte-for-byte
+   * unchanged. max_payload_effective is the value actually committed to the
+   * device after negotiation - the device-negotiated value on a graceful
+   * fallback - and is what a property read-back reports (mirrors how
+   * control-socket-path is read back after PAUSED). Both are guarded by
+   * GST_OBJECT_LOCK so the set/get-property app thread and the negotiate/
+   * reconnect streaming thread form a proper happens-before. */
+  guint max_payload;
+  guint max_payload_effective;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;
