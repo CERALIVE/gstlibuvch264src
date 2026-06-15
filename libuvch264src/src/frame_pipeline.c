@@ -20,7 +20,12 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
         switch (type) {
             case 1:
                 return UNIT_FRAME_NON_IDR;
-            case 20:
+            /* Both IDR NAL types are keyframes (ITU-T H.265 Table 7-1).
+               IDR_W_RADL (19) is the type x265 and most hardware encoders emit;
+               mapping only IDR_N_LP (20) left those keyframes as UNIT_INVALID, so
+               the IDR gate never armed and SPS/PPS/VPS were never prepended. */
+            case 19:  /* IDR_W_RADL */
+            case 20:  /* IDR_N_LP */
                 return UNIT_FRAME_IDR;
             case 32:
                 return UNIT_VPS;

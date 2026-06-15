@@ -1067,7 +1067,8 @@ function(add_nal_parse_variant variant sanitizer)
     set(_nal_env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
   endif()
 
-  foreach(_suite multislice startcode bounds)
+  foreach(_suite multislice startcode bounds
+                 multislice_h265 startcode_h265 bounds_h265)
     add_test(NAME nal_parse_${_suite}${suffix} COMMAND ${testexe} ${_suite})
     if(_nal_env)
       set_tests_properties(nal_parse_${_suite}${suffix} PROPERTIES ENVIRONMENT "${_nal_env}")
