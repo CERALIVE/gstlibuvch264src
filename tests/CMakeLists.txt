@@ -1489,3 +1489,39 @@ add_clock_discontinuity_variant("" "")
 if(ENABLE_SANITIZERS)
   add_clock_discontinuity_variant("tsan" "thread")
 endif()
+
+# -----------------------------------------------------------------------------
+# mpegtsmux jitter-tolerance QA (Task 14, harden-v2).
+#
+# An end-to-end shell check (tests/qa/av_mux_check.sh), NOT a gst-check exe: it
+# drives the mock-backed plugin through the real cerastream mux topology
+# (libuvch264src ! h264parse ! mpegtsmux. + audiotestsrc ! aac/mp2 ! parser !
+# mpegtsmux. ; mpegtsmux ! filesink) and runs ffprobe on the .ts, asserting no
+# "non monotonous DTS" and monotonic per-stream DTS/PTS. It validates the Metis
+# top-risk: raw post-Option-B arrival jitter into mpegtsmux. The script points
+# itself at the mock plugin built by add_mock_harness_variant via MOCK_PLUGIN_DIR
+# and synthesizes its own real H.264 reference frame with x264enc, so no camera
+# is needed. Registered only when the external ffprobe/x264enc prerequisites are
+# present so a stripped CI image skips it cleanly instead of failing.
+# -----------------------------------------------------------------------------
+find_program(FFPROBE_EXECUTABLE ffprobe)
+find_program(BASH_EXECUTABLE bash)
+if(FFPROBE_EXECUTABLE AND BASH_EXECUTABLE)
+  add_test(NAME av_mux_jitter
+    COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/qa/av_mux_check.sh av)
+  set_tests_properties(av_mux_jitter PROPERTIES
+    ENVIRONMENT "MOCK_PLUGIN_DIR=${CMAKE_BINARY_DIR}/gstreamer-1.0-mock"
+    # The mock .so is built by add_mock_harness_variant; ctest does not build, so
+    # keep this off the shared control-socket resource because it launches its
+    # own gst process that may bind the element's control thread.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 180)
+
+  add_test(NAME av_mux_jitter_audio_only
+    COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/qa/av_mux_check.sh audio)
+  set_tests_properties(av_mux_jitter_audio_only PROPERTIES
+    ENVIRONMENT "MOCK_PLUGIN_DIR=${CMAKE_BINARY_DIR}/gstreamer-1.0-mock"
+    TIMEOUT 180)
+else()
+  message(STATUS "av_mux_jitter QA disabled (ffprobe or bash not found)")
+endif()

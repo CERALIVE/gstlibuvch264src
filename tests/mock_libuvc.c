@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -405,6 +406,36 @@ static void *feeder_main(void *arg) {
   int frame_interval_us = g_frame_interval_us;
   pthread_mutex_unlock(&g_lock);
 
+  /* Real-bitstream replay (env MOCK_UVC_ES_FILE): load one Annex-B access unit
+   * from disk and feed it verbatim on every callback instead of the crafted
+   * zero-filled NALs. The crafted units are fine for tests that terminate at
+   * `... ! fakesink`, but a real downstream parser (h264parse before mpegtsmux)
+   * rejects the zero-filled SPS as a broken bit stream. Pointing this at a tiny
+   * encoder-produced IDR (SPS+PPS+IDR) lets the element drive the real
+   * cerastream mux topology end to end. Off by default: when the env is unset
+   * es_buf stays NULL and the crafted path below is unchanged. */
+  uint8_t *es_buf = NULL;
+  size_t es_len = 0;
+  const char *es_file = getenv("MOCK_UVC_ES_FILE");
+  if (es_file != NULL && *es_file != '\0') {
+    FILE *f = fopen(es_file, "rb");
+    if (f != NULL) {
+      fseek(f, 0, SEEK_END);
+      long sz = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (sz > 0) {
+        es_buf = malloc((size_t)sz);
+        if (es_buf != NULL && fread(es_buf, 1, (size_t)sz, f) == (size_t)sz) {
+          es_len = (size_t)sz;
+        } else {
+          free(es_buf);
+          es_buf = NULL;
+        }
+      }
+      fclose(f);
+    }
+  }
+
   for (;;) {
     pthread_mutex_lock(&h->lock);
     int run = h->running;
@@ -422,11 +453,19 @@ static void *feeder_main(void *arg) {
       break;
     }
 
-    size_t len = craft_access_unit(h->frame_buf, fmt, mode, delivered);
+    size_t len;
+    uint8_t *frame_data;
+    if (es_buf != NULL) {
+      frame_data = es_buf;
+      len = es_len;
+    } else {
+      len = craft_access_unit(h->frame_buf, fmt, mode, delivered);
+      frame_data = h->frame_buf;
+    }
 
     uvc_frame_t frame;
     memset(&frame, 0, sizeof(frame));
-    frame.data = h->frame_buf;
+    frame.data = frame_data;
     frame.data_bytes = len;
     frame.frame_format = fmt;
     frame.width = 1920;
@@ -449,6 +488,7 @@ static void *feeder_main(void *arg) {
 
     usleep(frame_interval_us); /* inter-frame cadence; MOCK_UVC_FRAME_INTERVAL_US */
   }
+  free(es_buf);
   return NULL;
 }
 
