@@ -75,14 +75,29 @@ void load_spspps(GstLibuvcH264Src *self) {
         for (int i = 0; i < c; i++) {
             switch (units[i].type) {
                 case UNIT_VPS:
+                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                        GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached VPS NAL "
+                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                        break;
+                    }
                     memcpy(self->vps, units[i].ptr, units[i].len);
                     self->vps_length = units[i].len;
                     break;
                 case UNIT_SPS:
+                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                        GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached SPS NAL "
+                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                        break;
+                    }
                     memcpy(self->sps, units[i].ptr, units[i].len);
                     self->sps_length = units[i].len;
                     break;
                 case UNIT_PPS:
+                    if (units[i].len <= 0 || units[i].len > SPSPPSBUFSZ) {
+                        GST_WARNING_OBJECT(self, "Dropping oversized/invalid cached PPS NAL "
+                            "(%d bytes; max %d) to prevent heap overflow", units[i].len, SPSPPSBUFSZ);
+                        break;
+                    }
                     memcpy(self->pps, units[i].ptr, units[i].len);
                     self->pps_length = units[i].len;
                     break;

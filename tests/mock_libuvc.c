@@ -208,8 +208,12 @@ static size_t append_nal_h265(uint8_t *p, uint8_t nal_type, size_t payload_len) 
 static size_t craft_access_unit(uint8_t *buf, enum uvc_frame_format fmt,
                                 mock_uvc_frame_mode_t mode) {
   size_t n = 0;
-  /* OVERSIZED_SPS deliberately exceeds the element's 1024 B SPS buffer. */
-  size_t sps_payload = (mode == MOCK_UVC_FRAME_OVERSIZED_SPS) ? 1100 : 12;
+  /* OVERSIZED_SPS overflows the element's fixed 1024 B SPS buffer. The payload
+   * must exceed the whole SPS+PPS+control tail of the instance struct so an
+   * unclamped copy runs off the END of the GObject allocation (where ASan's
+   * redzone lives), not merely into the adjacent pps[] field - an intra-object
+   * spill ASan cannot see. 4096 clears that >2 KB tail with margin. */
+  size_t sps_payload = (mode == MOCK_UVC_FRAME_OVERSIZED_SPS) ? 4096 : 12;
 
   if (fmt == UVC_FRAME_FORMAT_H265) {
     n += append_nal_h265(buf + n, 32, 8);            /* VPS */

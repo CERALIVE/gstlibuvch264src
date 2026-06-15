@@ -109,6 +109,11 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
         switch (unit->type) {
             case UNIT_VPS:
+                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid VPS NAL "
+                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                    continue;
+                }
                 self->vps_length = unit->len;
                 memcpy(self->vps, unit->ptr, self->vps_length);
                 updated_sps_pps = TRUE;
@@ -116,6 +121,11 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 // deliberately not sending VPS/SPS/PPS info in their own buffer
                 continue;
             case UNIT_SPS:
+                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid SPS NAL "
+                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                    continue;
+                }
                 self->sps_length = unit->len;
                 memcpy(self->sps, unit->ptr, self->sps_length);
                 updated_sps_pps = TRUE;
@@ -123,6 +133,11 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 // deliberately not sending VPS/SPS/PPS info in their own buffer
                 continue;
             case UNIT_PPS:
+                if (unit->len <= 0 || unit->len > SPSPPSBUFSZ) {
+                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid PPS NAL "
+                        "(%d bytes; max %d) to prevent heap overflow", unit->len, SPSPPSBUFSZ);
+                    continue;
+                }
                 self->pps_length = unit->len;
                 memcpy(self->pps, unit->ptr, self->pps_length);
                 updated_sps_pps = TRUE;

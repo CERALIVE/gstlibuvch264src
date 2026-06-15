@@ -327,3 +327,76 @@ endif()
 
 add_test(NAME error_map COMMAND test_error_map)
 set_tests_properties(error_map PROPERTIES ENVIRONMENT "${_errmap_env}")
+
+# -----------------------------------------------------------------------------
+# SPS/PPS/VPS bounds-clamp regression (C1, heap overflow). Reuses the mock-backed
+# plugin built by add_mock_harness_variant, but runs the feeder in oversized-SPS
+# mode so an unclamped NAL copy would smash the element's fixed 1024 B SPS
+# buffer. The ASAN variant is the teeth: an overflow aborts the run; the clamp
+# keeps it green.
+# -----------------------------------------------------------------------------
+function(add_sps_bounds_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(plugin "gstlibuvch264src_mock${suffix}")   # built by add_mock_harness_variant
+  set(testexe "test_sps_bounds${suffix}")
+  set(ctestname "sps_bounds${suffix}")
+  set(plugdir "${CMAKE_BINARY_DIR}/gstreamer-1.0-mock${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe} test_sps_bounds.c)
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+  )
+  add_dependencies(${testexe} ${plugin})
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  set(_home "${CMAKE_BINARY_DIR}/bounds-home${suffix}")
+  file(MAKE_DIRECTORY ${_home})
+  set(_env
+    "GST_PLUGIN_PATH=${plugdir}"
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/bounds-registry${suffix}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_home}"
+    "CK_FORK=no"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+    "MOCK_UVC_FRAME_MODE=oversized_sps"
+  )
+  if(sanitizer STREQUAL "address")
+    # always-malloc so each GObject instance is a plain malloc with an ASan
+    # redzone right after it; otherwise the SPS overflow would land inside the
+    # instance (intra-object) where ASan cannot see it. detect_leaks=0 keeps
+    # GLib's one-time global allocations from drowning the real finding.
+    list(APPEND _env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1"
+      "G_SLICE=always-malloc")
+  endif()
+
+  add_test(NAME ${ctestname} COMMAND ${testexe})
+  set_tests_properties(${ctestname} PROPERTIES
+    ENVIRONMENT "${_env}"
+    # Shares the element's fixed /tmp/libuvc_control socket with the other mock
+    # variants, so it must not run concurrently with them under `ctest -j`.
+    RESOURCE_LOCK uvc_control_socket
+    TIMEOUT 120
+  )
+endfunction()
+
+add_sps_bounds_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_sps_bounds_variant("asan" "address")
+endif()
