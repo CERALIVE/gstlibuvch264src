@@ -1079,3 +1079,97 @@ add_nal_parse_variant("" "")
 if(ENABLE_SANITIZERS)
   add_nal_parse_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# Consolidated functional suite (Task 20).
+#
+# Reuses the mock-backed plugin built by add_mock_harness_variant (loaded via an
+# isolated GST_PLUGIN_PATH, exactly like the smoke test) and fills the gaps the
+# per-task suites leave: the POSITIVE caps-negotiation matrix (H.264 -> video/
+# x-h264, H.265 -> video/x-h265, frames flow in both) and frame delivery under
+# downstream backpressure. The H.265 case selects the codec purely via the
+# MOCK_UVC_FRAME_FORMAT env var the mock reads at uvc_init() - the same .so backs
+# every case. Built in plain, ASAN, and TSAN variants so the full functional path
+# is exercised under both sanitizers in CI.
+# -----------------------------------------------------------------------------
+function(add_functional_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(plugin "gstlibuvch264src_mock${suffix}")   # built by add_mock_harness_variant
+  set(testexe "test_functional${suffix}")
+  set(plugdir "${CMAKE_BINARY_DIR}/gstreamer-1.0-mock${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe} test_functional.c)
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+  )
+  add_dependencies(${testexe} ${plugin})
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  set(_home "${CMAKE_BINARY_DIR}/functional-home${suffix}")
+  file(MAKE_DIRECTORY ${_home})
+  set(_env
+    "GST_PLUGIN_PATH=${plugdir}"
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/functional-registry${suffix}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_home}"
+    "CK_FORK=no"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(sanitizer STREQUAL "address")
+    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  elseif(sanitizer STREQUAL "thread")
+    list(APPEND _env
+      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+  endif()
+
+  # "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
+  # GST_CHECKS. The H.265 case adds MOCK_UVC_FRAME_FORMAT=H265 so the same mock
+  # plugin advertises and feeds H.265.
+  set(_functional_cases
+    "functional_caps_h264${suffix}:test_caps_h264:"
+    "functional_caps_h265${suffix}:test_caps_h265:MOCK_UVC_FRAME_FORMAT=H265"
+    "functional_backpressure${suffix}:test_backpressure:"
+  )
+  foreach(_case ${_functional_cases})
+    string(REPLACE ":" ";" _parts ${_case})
+    list(GET _parts 0 _ctestname)
+    list(GET _parts 1 _testfn)
+    list(GET _parts 2 _extraenv)
+
+    set(_case_env "${_env};GST_CHECKS=${_testfn}")
+    if(NOT _extraenv STREQUAL "")
+      set(_case_env "${_case_env};${_extraenv}")
+    endif()
+
+    add_test(NAME ${_ctestname} COMMAND ${testexe})
+    set_tests_properties(${_ctestname} PROPERTIES
+      ENVIRONMENT "${_case_env}"
+      # Shares the mock plugin with the other mock variants; keep it off the
+      # shared control-socket resource like the rest under `ctest -j`.
+      RESOURCE_LOCK uvc_control_socket
+      TIMEOUT 120
+    )
+  endforeach()
+endfunction()
+
+add_functional_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_functional_variant("asan" "address")
+  add_functional_variant("tsan" "thread")
+endif()
