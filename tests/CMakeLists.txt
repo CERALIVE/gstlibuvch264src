@@ -1393,3 +1393,99 @@ set_tests_properties(paused_playing_rebaseline PROPERTIES
   ENVIRONMENT "${_resume_env}"
   TIMEOUT 120
 )
+
+# -----------------------------------------------------------------------------
+# Clock-discontinuity recovery tests (Task 16, harden-v2).
+#
+# Deterministic unit counterpart to the Task 13 state-transition test
+# (test_pts_resume.c). Same single-executable, statically-registered shape as
+# test_pts_drift so the test constructs the element directly, installs a
+# GstTestClock, and drives frame_callback()'s PTS arithmetic in-process. It does
+# NOT use the mock feeder (whose usleep() pacing a controllable clock cannot
+# drive); the clock swap goes through the real gst_element_set_clock() vmethod so
+# the Task 5 rebaseline path is exercised, not re-implemented.
+#
+#   clock_discontinuity        Stream on one test clock, swap to a second clock
+#                              jumped far forward (1 s -> 100 s) via set_clock(),
+#                              then stream more. Asserts PTS stays strictly
+#                              monotonic across the swap (the thin guard never
+#                              emits a backward PTS), rebaselines onto the new
+#                              clock's running-time, and is back within the 5 ms
+#                              drift bound within N frames - which a reintroduced
+#                              smoothing estimator could not do.
+#   clock_discontinuity_guard  Stall the test clock (repeat the running-time) so
+#                              ts <= prev_pts and the thin guard fires; assert PTS
+#                              is strictly increasing (clamped to prev_pts + 1,
+#                              never backward or repeated). Both names carry the
+#                              clock_discontinuity stem so `ctest -R
+#                              clock_discontinuity` covers the guard case too.
+#
+# The TSan variant is single-threaded (direct frame_callback, no feeder thread),
+# so it should report nothing; it uses the dedicated tsan_pts.suppressions to
+# baseline the permanent GMutex-futex blind spot in the GST_OBJECT_LOCK that the
+# PTS critical section takes (same rationale as the PTS race suite).
+# -----------------------------------------------------------------------------
+function(add_clock_discontinuity_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_clock_discontinuity${suffix}")
+
+  add_executable(${testexe}
+    test_clock_discontinuity.c
+    ${_element_srcs}
+    mock_libuvc.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
+
+  # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS.
+  set(_clockjump_cases
+    "clock_discontinuity${suffix}:test_clock_discontinuity"
+    "clock_discontinuity_guard${suffix}:test_clock_stall_guard"
+  )
+  foreach(_case ${_clockjump_cases})
+    string(REPLACE ":" ";" _parts ${_case})
+    list(GET _parts 0 _ctestname)
+    list(GET _parts 1 _testfn)
+
+    # Like the PTS race suite, use the dedicated tsan_pts.suppressions (the
+    # permanent GMutex-futex blind spot), so pass "" to the helper and append the
+    # bespoke TSAN_OPTIONS here.
+    setup_gst_test_environment("clockjump-${_ctestname}" "")
+    set(_cj_env ${GST_TEST_ENV})
+    list(APPEND _cj_env "GST_CHECKS=${_testfn}")
+    if(sanitizer STREQUAL "thread")
+      list(APPEND _cj_env
+        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_pts.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+    endif()
+
+    # No RESOURCE_LOCK: the test never enters PLAYING and never calls start(), so
+    # it spawns no control thread and binds no socket - it can run concurrently.
+    add_test(NAME ${_ctestname} COMMAND ${testexe})
+    set_tests_properties(${_ctestname} PROPERTIES
+      ENVIRONMENT "${_cj_env}"
+      TIMEOUT 120
+    )
+  endforeach()
+endfunction()
+
+add_clock_discontinuity_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_clock_discontinuity_variant("tsan" "thread")
+endif()
