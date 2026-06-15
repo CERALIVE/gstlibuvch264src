@@ -5,6 +5,8 @@
  *   - both element factories (primary + alias) exist,
  *   - the element instantiates as a GstPushSrc,
  *   - the documented "index" property is present with its default,
+ *   - the native "pan"/"tilt"/"zoom" PTZ properties are present (int, default 0),
+ *   - the opt-in "control-socket" property is present (boolean, default off),
  *   - the ALWAYS "src" pad template advertises H.264 AND H.265 caps.
  *
  * No UVC device is opened: gst_element_factory_make() only runs class/instance
@@ -77,6 +79,56 @@ GST_START_TEST (test_element_has_index_property)
 
 GST_END_TEST;
 
+/* Native PTZ properties (Task 12): pan/tilt/zoom are class-level G_TYPE_INT
+ * spec'd with default 0. They exist in introspection on every device; the
+ * real per-device range is enforced at set time, so the default is what a
+ * freshly created (unstarted) element reports here. */
+GST_START_TEST (test_element_has_ptz_properties)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL);
+
+  GObjectClass *klass = G_OBJECT_GET_CLASS (element);
+  const gchar *axes[] = { "pan", "tilt", "zoom" };
+
+  for (guint i = 0; i < G_N_ELEMENTS (axes); i++) {
+    GParamSpec *pspec = g_object_class_find_property (klass, axes[i]);
+    fail_unless (pspec != NULL, "expected '%s' property is missing", axes[i]);
+    fail_unless (pspec->value_type == G_TYPE_INT,
+        "'%s' property should be an int", axes[i]);
+
+    gint value = -1;
+    g_object_get (element, axes[i], &value, NULL);
+    fail_unless (value == 0, "default '%s' should be 0, got %d", axes[i], value);
+  }
+
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
+/* Opt-in PTZ control socket (Task 16): boolean, default FALSE so nothing binds
+ * a Unix-domain socket unless explicitly enabled. */
+GST_START_TEST (test_element_has_control_socket_property)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL);
+
+  GParamSpec *pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (element),
+      "control-socket");
+  fail_unless (pspec != NULL, "expected 'control-socket' property is missing");
+  fail_unless (pspec->value_type == G_TYPE_BOOLEAN,
+      "'control-socket' property should be a boolean");
+
+  gboolean enabled = TRUE;
+  g_object_get (element, "control-socket", &enabled, NULL);
+  fail_unless (enabled == FALSE, "default 'control-socket' should be FALSE");
+
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_src_pad_template)
 {
   GstElementFactory *factory = gst_element_factory_find (ELEMENT_NAME);
@@ -126,6 +178,8 @@ plugin_load_suite (void)
   tcase_add_test (tc, test_element_factories_exist);
   tcase_add_test (tc, test_element_creates_and_is_pushsrc);
   tcase_add_test (tc, test_element_has_index_property);
+  tcase_add_test (tc, test_element_has_ptz_properties);
+  tcase_add_test (tc, test_element_has_control_socket_property);
   tcase_add_test (tc, test_src_pad_template);
 
   return s;
