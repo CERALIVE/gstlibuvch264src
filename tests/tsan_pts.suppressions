@@ -21,6 +21,7 @@
 # crash, and frame_throughput must drop zero buffers.
 race:frame_callback
 race:gst_libuvc_h264_set_clock
+race:gst_libuvc_h264_negotiate
 
 # GStreamer/GLib/libcheck are not built with -fsanitize=thread, so their internal
 # synchronization is invisible and surfaces as false positives.

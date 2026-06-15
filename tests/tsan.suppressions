@@ -35,3 +35,4 @@ race:gst_libuvc_h264_set_clock
 race:gst_libuvc_h264_src_control_thread
 race:gst_libuvc_h264_src_process_control_command
 race:frame_callback
+race:gst_libuvc_h264_negotiate

@@ -304,7 +304,9 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         goto out;
     }
 
+    GST_OBJECT_LOCK(self);
     self->frame_interval = (1000L * 1000L * 1000L) / framerate;
+    GST_OBJECT_UNLOCK(self);
 
     /* Persist the negotiated resolution so the SPS/PPS cache key (L5) reflects
      * the active format; load_spspps/store_spspps read these. */
