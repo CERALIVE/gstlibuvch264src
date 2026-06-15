@@ -935,11 +935,10 @@ function(add_nal_parse_variant variant sanitizer)
     PkgConfig::GST
     PkgConfig::GST_BASE
   )
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
+  # Pure-C parser test: no GStreamer runtime, registry, or device, so it needs
+  # only the bare ASAN_OPTIONS (not the full setup_gst_test_environment block).
   set(_nal_env "")
   if(sanitizer STREQUAL "address")
     set(_nal_env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
@@ -989,28 +988,12 @@ function(add_functional_variant variant sanitizer)
     PkgConfig::GST_CHECK
   )
   add_dependencies(${testexe} ${plugin})
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
-  set(_home "${CMAKE_BINARY_DIR}/functional-home${suffix}")
-  file(MAKE_DIRECTORY ${_home})
-  set(_env
-    "GST_PLUGIN_PATH=${plugdir}"
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/functional-registry${suffix}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_home}"
-    "CK_FORK=no"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(sanitizer STREQUAL "address")
-    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  elseif(sanitizer STREQUAL "thread")
-    list(APPEND _env
-      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
-  endif()
+  # GST_PLUGIN_PATH points the test at the mock-backed plugin; the standard
+  # ASAN_OPTIONS / TSAN_OPTIONS (tsan.suppressions) come from the helper.
+  setup_gst_test_environment("functional${suffix}" "${sanitizer}")
+  set(_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
 
   # "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
   # GST_CHECKS. The H.265 case adds MOCK_UVC_FRAME_FORMAT=H265 so the same mock
@@ -1078,11 +1061,7 @@ target_link_libraries(test_reconnect PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_reconnect PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_reconnect PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_reconnect "${STATIC_SUITE_SANITIZER}")
 
 set(_reconnect_cases
   "disconnect_error:test_disconnect_error"
@@ -1093,22 +1072,9 @@ foreach(_case ${_reconnect_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_rc_home "${CMAKE_BINARY_DIR}/reconnect-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_rc_home})
-
-  set(_rc_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/reconnect-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_rc_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _rc_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("reconnect-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_rc_env ${GST_TEST_ENV})
+  list(APPEND _rc_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_reconnect)
   set_tests_properties(${_ctestname} PROPERTIES

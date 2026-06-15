@@ -89,6 +89,9 @@ RUN GNUARCH=$(case "${TARGETARCH}" in \
 # installs the plugin under /usr/local/lib/<triplet>/gstreamer-1.0/ and libuvc
 # installs flat under /usr/local/lib/; relocate both under /usr/lib/<triplet>/
 # while preserving the libgstlibuvch264src.so / libuvc.so* file names.
+# TODO(Task 22): unify with scripts/build-libuvc.sh --prefix option so the
+# install prefix is set once at meson setup time and this manual relocation
+# (and the matching copy in CMakeLists.txt) can be dropped.
 COPY --from=build /usr/local/lib/*/gstreamer-1.0/libgstlibuvch264src.so /tmp/stage/
 COPY --from=build /usr/local/lib/libuvc.* /tmp/stage/
 RUN GNUARCH=$(cat /tmp/gnuarch) && \
