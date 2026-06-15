@@ -46,9 +46,29 @@ typedef enum {
   MOCK_UVC_FRAME_NONIDR_LEAD,
 } mock_uvc_frame_mode_t;
 
+/* Shape of the single format/frame descriptor uvc_get_format_descs() advertises,
+ * used to exercise the element's negotiate() edge cases. */
+typedef enum {
+  /* H264/H265 format, 1080p, one 30 fps interval (the default). */
+  MOCK_UVC_FORMAT_NORMAL = 0,
+  /* A non-codec format (fourcc "MJPG"): negotiate() must find no H264/H265
+   * descriptor and post a bus error instead of streaming. */
+  MOCK_UVC_FORMAT_NO_CODEC,
+  /* No interval list and dwMin/MaxFrameInterval == 0: the device-interval
+   * branch of negotiate() must not divide by zero. */
+  MOCK_UVC_FORMAT_ZERO_DEVICE_INTERVAL,
+  /* An interval so long it rounds to 0 fps: the frame_interval computation in
+   * negotiate() must not divide by zero. */
+  MOCK_UVC_FORMAT_ZERO_FRAMERATE,
+} mock_uvc_format_mode_t;
+
 /* Restore every mock knob to its default (1 device, H264, valid frames,
- * unlimited feed, nominal PTZ ranges). Also re-reads environment overrides. */
+ * unlimited feed, nominal PTZ ranges, NORMAL format descriptor). Also re-reads
+ * environment overrides. */
 void mock_uvc_reset(void);
+
+/* Shape of the advertised format/frame descriptor; see mock_uvc_format_mode_t. */
+void mock_uvc_set_format_mode(mock_uvc_format_mode_t mode);
 
 /* Number of devices the next uvc_find_devices()/uvc_open() will expose.
  * 0 makes uvc_find_devices() report UVC_ERROR_NO_DEVICE. */

@@ -8,6 +8,7 @@
 #include <limits.h>
 #include "gstlibuvch264src.h"
 #include "gstlibuvch264src_internal.h"
+#include "gstlibuvch264src_error.h"
 #include "uvc_device.h"
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
@@ -185,6 +186,8 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     gint width = -1, height = -1, framerate = -1;
     GstCaps *best_caps = NULL;
+    gboolean result = FALSE;
+    gboolean found_codec_format = FALSE;
 
     // Enumerate supported H264 / H265 resolutions and framerates
     // And select the highest compatible resolution, at the highest supported framerate
@@ -195,6 +198,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         gboolean is_h265 = (memcmp(format_desc->fourccFormat, "H265", 4) == 0);
 
         if (!is_h264 && !is_h265) continue;
+        found_codec_format = TRUE;
 
         GstCaps *tmp_caps = gst_caps_from_string(is_h264? H264_CAPS : H265_CAPS);
         GstStructure *tmp_structure = gst_caps_get_structure(tmp_caps, 0);
@@ -224,10 +228,23 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     g_value_init(&fps, GST_TYPE_FRACTION);
                     gst_value_set_fraction(&fps, (gint)_fps, 1);
                     gst_value_list_append_value(&framerates, &fps);
+                    g_value_unset(&fps);
                 }
 
+                // gst_structure_set_value() copies the list, so the local GValue
+                // owns a GST_TYPE_LIST that must be released or it leaks per call.
                 gst_structure_set_value(tmp_structure, "framerate", &framerates);
+                g_value_unset(&framerates);
             } else {
+                // A device that reports a zero frame interval would divide by
+                // zero here (SIGFPE); skip such a degenerate descriptor instead.
+                if (frame_desc->dwMinFrameInterval == 0 ||
+                    frame_desc->dwMaxFrameInterval == 0) {
+                    GST_WARNING_OBJECT(self,
+                        "Skipping %ux%u: device reported a zero frame interval",
+                        frame_desc->wWidth, frame_desc->wHeight);
+                    continue;
+                }
                 gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
                 gint fps = 1e7 / frame_desc->dwMinFrameInterval;
                 gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
@@ -258,16 +275,28 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         gst_caps_unref(tmp_caps);
     } // for format_desc
 
-    if (width < 0 || height < 0 || framerate < 0 || !best_caps) {
-        GST_ERROR_OBJECT(self, "Unable to negotiate common caps\n");
-        return FALSE;
+    if (!found_codec_format) {
+        // The device exposes no H264/H265 format descriptor at all, so there is
+        // nothing to stream. Post a bus ERROR (not just a debug log) so
+        // downstream consumers (cerastream/CeraUI) can react, instead of falling
+        // through with uninitialized width/height/framerate.
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), UVC_ERROR_NOT_SUPPORTED,
+            "negotiating caps: device exposes no H264/H265 format");
+        goto out;
+    }
+
+    // framerate <= 0 (not just < 0): a device whose fastest interval rounds down
+    // to 0 fps would otherwise divide by zero at the frame_interval computation.
+    if (width < 0 || height < 0 || framerate <= 0 || !best_caps) {
+        GST_ERROR_OBJECT(self, "Unable to negotiate common caps");
+        goto out;
     }
 
     int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
                                               self->frame_format, width, height, framerate);
     if (res < 0) {
         GST_ERROR_OBJECT(self, "Unable to get stream control: %s", uvc_strerror(res));
-        return FALSE;
+        goto out;
     }
 
     self->frame_interval = (1000L * 1000L * 1000L) / framerate;
@@ -283,7 +312,17 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     load_spspps(self);
 
-    return TRUE;
+    result = TRUE;
+
+out:
+    // Single cleanup path: the working caps and the chosen caps are owned locals.
+    // gst_base_src_set_caps() takes its own reference, so best_caps must be freed
+    // here on success too, and both must be freed on every error path.
+    if (caps)
+        gst_caps_unref(caps);
+    if (best_caps)
+        gst_caps_unref(best_caps);
+    return result;
 }
 
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,

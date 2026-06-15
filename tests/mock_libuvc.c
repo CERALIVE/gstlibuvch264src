@@ -91,6 +91,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_device_count = 1;
 static enum uvc_frame_format g_frame_format = UVC_FRAME_FORMAT_H264;
 static mock_uvc_frame_mode_t g_frame_mode = MOCK_UVC_FRAME_VALID;
+static mock_uvc_format_mode_t g_format_mode = MOCK_UVC_FORMAT_NORMAL;
 static int g_max_frames = 0; /* 0 = until uvc_stop_streaming() */
 static int g_frames_delivered = 0;
 static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed */
@@ -136,6 +137,7 @@ void mock_uvc_reset(void) {
   g_device_count = 1;
   g_frame_format = UVC_FRAME_FORMAT_H264;
   g_frame_mode = MOCK_UVC_FRAME_VALID;
+  g_format_mode = MOCK_UVC_FORMAT_NORMAL;
   g_max_frames = 0;
   g_frames_delivered = 0;
   g_uvc_open_count = 0;
@@ -163,6 +165,12 @@ void mock_uvc_set_frame_format(enum uvc_frame_format format) {
 void mock_uvc_set_frame_mode(mock_uvc_frame_mode_t mode) {
   pthread_mutex_lock(&g_lock);
   g_frame_mode = mode;
+  pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_format_mode(mock_uvc_format_mode_t mode) {
+  pthread_mutex_lock(&g_lock);
+  g_format_mode = mode;
   pthread_mutex_unlock(&g_lock);
 }
 
@@ -470,23 +478,49 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 
   pthread_mutex_lock(&g_lock);
   enum uvc_frame_format fmt = g_frame_format;
+  mock_uvc_format_mode_t format_mode = g_format_mode;
   pthread_mutex_unlock(&g_lock);
 
-  /* One format with one 1080p30 frame descriptor. */
-  h->intervals[0] = 333333; /* 100ns units -> 30 fps */
-  h->intervals[1] = 0;
+  /* One 1080p frame descriptor; its interval shape and fourcc vary by
+   * format_mode so negotiate()'s edge cases can be exercised. */
   memset(&h->frame_desc, 0, sizeof(h->frame_desc));
   h->frame_desc.bDescriptorSubtype = UVC_VS_FRAME_FRAME_BASED;
   h->frame_desc.wWidth = 1920;
   h->frame_desc.wHeight = 1080;
-  h->frame_desc.dwMinFrameInterval = 333333;
-  h->frame_desc.dwMaxFrameInterval = 333333;
-  h->frame_desc.intervals = h->intervals;
   h->frame_desc.next = NULL;
 
+  switch (format_mode) {
+    case MOCK_UVC_FORMAT_ZERO_DEVICE_INTERVAL:
+      /* No interval list; device min/max interval are zero (1e7 / 0 = SIGFPE). */
+      h->frame_desc.intervals = NULL;
+      h->frame_desc.dwMinFrameInterval = 0;
+      h->frame_desc.dwMaxFrameInterval = 0;
+      break;
+    case MOCK_UVC_FORMAT_ZERO_FRAMERATE:
+      /* One interval long enough that 1e7 / interval truncates to 0 fps. */
+      h->intervals[0] = 20000000; /* 100ns units -> 0.5 fps -> 0 after int div */
+      h->intervals[1] = 0;
+      h->frame_desc.intervals = h->intervals;
+      h->frame_desc.dwMinFrameInterval = 20000000;
+      h->frame_desc.dwMaxFrameInterval = 20000000;
+      break;
+    default:
+      h->intervals[0] = 333333; /* 100ns units -> 30 fps */
+      h->intervals[1] = 0;
+      h->frame_desc.intervals = h->intervals;
+      h->frame_desc.dwMinFrameInterval = 333333;
+      h->frame_desc.dwMaxFrameInterval = 333333;
+      break;
+  }
+
   memset(&h->fmt_desc, 0, sizeof(h->fmt_desc));
-  memcpy(h->fmt_desc.fourccFormat,
-         fmt == UVC_FRAME_FORMAT_H265 ? "H265" : "H264", 4);
+  if (format_mode == MOCK_UVC_FORMAT_NO_CODEC) {
+    /* A format the element does not handle, so negotiate() finds no codec. */
+    memcpy(h->fmt_desc.fourccFormat, "MJPG", 4);
+  } else {
+    memcpy(h->fmt_desc.fourccFormat,
+           fmt == UVC_FRAME_FORMAT_H265 ? "H265" : "H264", 4);
+  }
   h->fmt_desc.frame_descs = &h->frame_desc;
   h->fmt_desc.next = NULL;
 

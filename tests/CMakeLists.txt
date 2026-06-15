@@ -717,6 +717,116 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # -----------------------------------------------------------------------------
+# negotiate() tests (Task 13).
+#
+# Statically registers the element (like test_device_select) so the mock's
+# format descriptor can be shaped in-process via mock_uvc_set_format_mode().
+#   negotiate_edge_*   a zero-format device posts a RESOURCE bus error, and a
+#                      0 fps / zero device-interval descriptor fails gracefully
+#                      instead of taking SIGFPE on the framerate divisions (H4).
+#   negotiate_leak     -fsanitize=address build only: N renegotiations leak no
+#                      GstCaps (M3). LeakSanitizer's recoverable check is the
+#                      gate; an __lsan_disable() warm-up window plus a
+#                      suppressions file keep GStreamer's one-time init noise out
+#                      of the result while the per-renegotiation caps leak trips.
+# -----------------------------------------------------------------------------
+function(add_negotiate_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_negotiate${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe}
+    test_negotiate.c
+    ${_element_srcs}
+    mock_libuvc.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS. The
+  # leak case is only meaningful (and only registered) for the asan variant.
+  set(_neg_cases
+    "negotiate_edge_zero_format${suffix}:test_negotiate_zero_format"
+    "negotiate_edge_framerate${suffix}:test_negotiate_framerate_zero"
+    "negotiate_edge_zero_interval${suffix}:test_negotiate_zero_interval"
+  )
+  if(NOT sanitizer STREQUAL "")
+    list(APPEND _neg_cases "negotiate_leak:test_negotiate_leak")
+  endif()
+
+  foreach(_case ${_neg_cases})
+    string(REPLACE ":" ";" _parts ${_case})
+    list(GET _parts 0 _ctestname)
+    list(GET _parts 1 _testfn)
+
+    set(_neg_home "${CMAKE_BINARY_DIR}/negotiate-home-${_ctestname}")
+    file(MAKE_DIRECTORY ${_neg_home})
+
+    set(_neg_env
+      "GST_PLUGIN_SYSTEM_PATH="
+      "GST_REGISTRY=${CMAKE_BINARY_DIR}/negotiate-registry-${_ctestname}.bin"
+      "GST_REGISTRY_FORK=no"
+      "HOME=${_neg_home}"
+      "CK_FORK=no"
+      "GST_CHECKS=${_testfn}"
+      "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+    )
+    if(NOT sanitizer STREQUAL "")
+      if(_ctestname STREQUAL "negotiate_leak")
+        # detect_leaks must be ON for __lsan_do_recoverable_leak_check(), but the
+        # at-exit check is disabled so only the in-test recoverable check (scoped
+        # by __lsan_disable() and filtered by the suppressions file) is the gate.
+        list(APPEND _neg_env
+          "ASAN_OPTIONS=detect_leaks=1:leak_check_at_exit=0:abort_on_error=1:halt_on_error=1"
+          "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan_negotiate.suppressions:print_suppressions=0")
+      else()
+        list(APPEND _neg_env
+          "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+      endif()
+    endif()
+
+    add_test(NAME ${_ctestname} COMMAND ${testexe})
+    set_tests_properties(${_ctestname} PROPERTIES
+      ENVIRONMENT "${_neg_env}"
+      # start() binds the fixed /tmp/libuvc_control socket via the control thread,
+      # so these must not run concurrently with each other or the other
+      # start()-driven suites under `ctest -j`.
+      RESOURCE_LOCK uvc_control_socket
+      TIMEOUT 120
+    )
+  endforeach()
+endfunction()
+
+add_negotiate_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_negotiate_variant("asan" "address")
+endif()
+
+# -----------------------------------------------------------------------------
 # PTS clamp + restart-state tests (Task 14).
 #
 # Same single-executable, statically-registered shape as test_device_select so
