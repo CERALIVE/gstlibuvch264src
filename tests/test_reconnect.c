@@ -35,6 +35,14 @@
 #undef GST_CAT_DEFAULT
 #include "gstlibuvch264src_internal.h"
 
+/* The teardown-order variant links a dedicated libusb mock (MOCK_LIBUSB_TEARDOWN)
+ * so uvc_close() models the single libusb_close() and the close counters prove
+ * force_usb_release() never double-closed on the reconnect path. The plain
+ * variant links the real libusb and skips those assertions. */
+#ifdef MOCK_LIBUSB_TEARDOWN
+#include "mock_libusb.h"
+#endif
+
 /* The harness blanks GST_PLUGIN_SYSTEM_PATH; load just core-elements so fakesink
  * is available without scanning unrelated plugins. */
 static void
@@ -244,6 +252,201 @@ GST_START_TEST (test_reconnect_resume)
 GST_END_TEST;
 
 /* ------------------------------------------------------------------------- */
+/* Reconnect exhaustion + teardown-order (Task 8)                            */
+/* ------------------------------------------------------------------------- */
+
+/* Counters captured at the moment the disconnect error reaches the bus, before
+ * the pipeline is torn down to NULL (a failed fail_unless longjmps past the
+ * unref, and a snapshot taken first keeps the assertions order-independent). */
+typedef struct
+{
+  gint read_errors;            /* RESOURCE/READ errors posted by the element */
+  gboolean got_flow_error;     /* basesrc STREAM error: create() returned GST_FLOW_ERROR */
+  gboolean other_error;        /* an unexpected error domain (neither of the above) */
+  gboolean got_eos;            /* EOS appeared (exhaustion must error, not EOS) */
+  gint open_attempts;          /* total uvc_open() calls incl. injected failures */
+  gint open_count;             /* successful uvc_open() calls */
+  gint uvc_closes;             /* uvc_close() calls */
+  gint usb_opens;              /* libusb handles opened (-1 without the libusb mock) */
+  gint usb_closes;             /* libusb_close() calls (-1 without the libusb mock) */
+  gint cfg_queries;            /* force_usb_release() config-descriptor queries (-1) */
+} ExhaustionResult;
+
+/* Drive the reconnect-exhaustion scenario: one frame then silence, reconnect on,
+ * and every reopen fails. create() must detect the disconnect (~5 s), exhaust the
+ * bounded backoff (1+2+4+8+16 s) reopening, then post exactly one RESOURCE/READ
+ * error and return GST_FLOW_ERROR. Fills *res with bus + mock-counter snapshots
+ * taken before teardown. */
+static void
+run_exhaustion_scenario (ExhaustionResult * res)
+{
+  load_core_elements ();
+  register_element ();
+  mock_uvc_reset ();
+#ifdef MOCK_LIBUSB_TEARDOWN
+  mock_libusb_reset ();
+#endif
+  /* One frame, then the feed goes silent (the unplug stand-in). */
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+  mock_uvc_set_max_frames (1);
+  /* The initial start() open succeeds; every reconnect reopen fails, so the
+   * retry loop runs all RECONNECT_MAX_RETRIES attempts and then gives up. */
+  mock_uvc_set_open_fail_after (1);
+
+  g_atomic_int_set (&buffers_seen, 0);
+
+  GstElement *src = NULL;
+  GstElement *pipeline = build_pipeline (&src);
+  g_object_set (src, "reconnect", TRUE, NULL);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
+      != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  /* Wait for the single pre-disconnect frame so we know the first feeder ran and
+   * went quiet; the reopen attempts below are what then fail. */
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&buffers_seen) < 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+  fail_unless (g_atomic_int_get (&buffers_seen) >= 1,
+      "the initial stream never delivered a frame");
+
+  /* Detection (~5 s) + backoff (1+2+4+8+16 = 31 s) then exhaustion. Count
+   * RESOURCE/READ errors and keep draining ~2 s past the first to prove a second
+   * one never follows (the error is posted once, right before GST_FLOW_ERROR). */
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gint read_errors = 0;
+  gboolean got_flow_error = FALSE;
+  gboolean other_error = FALSE;
+  gboolean got_eos = FALSE;
+  gint64 drain_until = 0;
+  deadline = g_get_monotonic_time () + 55 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    GstMessage *msg =
+        gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg != NULL) {
+      if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_EOS) {
+        got_eos = TRUE;
+      } else {
+        GError *gerr = NULL;
+        gchar *dbg = NULL;
+        gst_message_parse_error (msg, &gerr, &dbg);
+        if (g_error_matches (gerr, GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_READ)) {
+          /* The element's own disconnect error. */
+          read_errors++;
+        } else if (gerr != NULL && gerr->domain == GST_STREAM_ERROR) {
+          /* basesrc posts STREAM/FAILED ("Internal data stream error") once
+           * create() returns GST_FLOW_ERROR - the expected propagation, not a
+           * second element error. */
+          got_flow_error = TRUE;
+        } else {
+          other_error = TRUE;
+        }
+        g_clear_error (&gerr);
+        g_free (dbg);
+        /* Keep draining ~2 s past the first error to prove the element never
+         * posts its RESOURCE/READ a second time. */
+        if (drain_until == 0)
+          drain_until = g_get_monotonic_time () + 2 * G_TIME_SPAN_SECOND;
+      }
+      gst_message_unref (msg);
+    } else {
+      if (drain_until != 0 && g_get_monotonic_time () >= drain_until)
+        break;
+      g_usleep (20 * G_TIME_SPAN_MILLISECOND);
+    }
+  }
+
+  res->read_errors = read_errors;
+  res->got_flow_error = got_flow_error;
+  res->other_error = other_error;
+  res->got_eos = got_eos;
+  res->open_attempts = mock_uvc_open_attempt_count ();
+  res->open_count = mock_uvc_open_count ();
+  res->uvc_closes = mock_uvc_close_count ();
+#ifdef MOCK_LIBUSB_TEARDOWN
+  res->usb_opens = mock_libusb_open_count ();
+  res->usb_closes = mock_libusb_close_count ();
+  res->cfg_queries = mock_libusb_config_query_count ();
+#else
+  res->usb_opens = -1;
+  res->usb_closes = -1;
+  res->cfg_queries = -1;
+#endif
+
+  gst_object_unref (bus);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+}
+
+GST_START_TEST (test_reconnect_exhaustion)
+{
+  ExhaustionResult res;
+  run_exhaustion_scenario (&res);
+
+  fail_if (res.other_error,
+      "exhaustion posted an unexpected error (not RESOURCE/READ or STREAM)");
+  fail_unless (res.read_errors == 1,
+      "expected exactly one GST_RESOURCE_ERROR_READ after exhaustion, got %d",
+      res.read_errors);
+  /* basesrc posts STREAM/FAILED and pushes EOS downstream only AFTER create()
+   * returns GST_FLOW_ERROR, so the STREAM error proves the error path was taken;
+   * the drain loop only ends once an error is seen, so a clean EOS-without-error
+   * would still trip read_errors == 0 above. */
+  fail_unless (res.got_flow_error,
+      "create() must return GST_FLOW_ERROR after exhaustion (basesrc STREAM "
+      "error never reached the bus)");
+  fail_unless (res.open_count == 1,
+      "only the initial open should succeed, got %d successful opens",
+      res.open_count);
+  fail_unless (res.open_attempts == 6,
+      "expected 1 initial + 5 failed reopen attempts (6 total), got %d",
+      res.open_attempts);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reconnect_teardown_order)
+{
+  ExhaustionResult res;
+  run_exhaustion_scenario (&res);
+
+  /* Same exhaustion contract as test_reconnect_exhaustion. */
+  fail_if (res.other_error,
+      "exhaustion posted an unexpected error (not RESOURCE/READ or STREAM)");
+  fail_unless (res.read_errors == 1,
+      "expected exactly one GST_RESOURCE_ERROR_READ after exhaustion, got %d",
+      res.read_errors);
+  fail_unless (res.got_flow_error,
+      "create() must return GST_FLOW_ERROR after exhaustion");
+
+#ifdef MOCK_LIBUSB_TEARDOWN
+  /* The reconnect teardown is native: uvc_stop_streaming() -> uvc_close() ->
+   * uvc_unref_device(), with uvc_close() owning the single libusb_close(). The
+   * dead handle from the initial open is closed exactly once. */
+  fail_unless (res.usb_opens == 1,
+      "expected one libusb handle opened (the initial open), got %d",
+      res.usb_opens);
+  fail_unless (res.usb_closes == res.usb_opens,
+      "libusb close/open unbalanced: %d opens, %d closes (double-close vector)",
+      res.usb_opens, res.usb_closes);
+  fail_unless (res.usb_closes == res.uvc_closes,
+      "uvc_close() must own the single libusb_close(): %d uvc_close vs %d "
+      "libusb_close", res.uvc_closes, res.usb_closes);
+  /* force_usb_release() is the only caller of libusb_get_active_config_descriptor()
+   * in this element. It is NEVER invoked on the reconnect path (which would put a
+   * release before uvc_close()), and post-exhaustion stop() skips it because the
+   * handle is already NULL - so the query count must stay at zero. */
+  fail_unless (res.cfg_queries == 0,
+      "force_usb_release() must not precede uvc_close() on any retry, but it ran "
+      "%d time(s)", res.cfg_queries);
+#endif
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
 /* test_reconnect_backoff_sequence (Task 7)                                  */
 /*                                                                           */
 /* White-box assertion of the backoff schedule. Unlike the exhaustion test   */
@@ -430,6 +633,18 @@ reconnect_suite (void)
   tcase_set_timeout (tc_interrupt, 30);
   tcase_add_test (tc_interrupt, test_reconnect_backoff_interrupt);
   suite_add_tcase (s, tc_interrupt);
+
+  /* Exhaustion + teardown-order both run the full ~36 s detect+backoff cycle, so
+   * they get a generous per-case timeout. GST_CHECKS selects one per run. */
+  TCase *tc_exhaust = tcase_create ("reconnect_exhaustion");
+  tcase_set_timeout (tc_exhaust, 90);
+  tcase_add_test (tc_exhaust, test_reconnect_exhaustion);
+  suite_add_tcase (s, tc_exhaust);
+
+  TCase *tc_order = tcase_create ("reconnect_teardown_order");
+  tcase_set_timeout (tc_order, 90);
+  tcase_add_test (tc_order, test_reconnect_teardown_order);
+  suite_add_tcase (s, tc_order);
 
   return s;
 }
