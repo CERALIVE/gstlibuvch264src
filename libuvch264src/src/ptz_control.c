@@ -1,8 +1,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -12,46 +14,98 @@
 
 static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
 
-// Control socket thread function
-gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
-    GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
+/* Per-process counter so two elements in one process derive distinct default
+ * socket paths - the pid is shared, only this disambiguates them (M9). */
+static gint control_socket_seq = 0;
+
+gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self) {
     struct sockaddr_un addr;
-    int client_fd;
-    char buffer[256];
-    fd_set read_fds;
-    struct timeval timeout;
-    
+
+    if (self->control_socket_path == NULL) {
+        const gchar *runtime = g_getenv("XDG_RUNTIME_DIR");
+        if (runtime == NULL || *runtime == '\0') {
+            GST_ERROR_OBJECT(self, "XDG_RUNTIME_DIR is unset; refusing to bind the "
+                             "control socket in a world-accessible location");
+            return FALSE;
+        }
+        guint id = (guint) g_atomic_int_add(&control_socket_seq, 1);
+        self->control_socket_path = g_strdup_printf("%s/libuvch264src-%d-%u.sock",
+                                                    runtime, (int) getpid(), id);
+    }
+
+    if (strlen(self->control_socket_path) >= sizeof(addr.sun_path)) {
+        GST_ERROR_OBJECT(self, "Control socket path too long: %s",
+                         self->control_socket_path);
+        return FALSE;
+    }
+
     self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
     if (self->control_socket < 0) {
         GST_ERROR_OBJECT(self, "Failed to create control socket");
-        return NULL;
+        return FALSE;
     }
-    
+
     int flags = fcntl(self->control_socket, F_GETFL, 0);
     fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
-    
+
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, "/tmp/libuvc_control");
-    
-    unlink(addr.sun_path);
-    
+    g_strlcpy(addr.sun_path, self->control_socket_path, sizeof(addr.sun_path));
+
+    /* Drop a socket left by an unclean prior exit; bind to a live path fails. */
+    unlink(self->control_socket_path);
+
     if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        GST_ERROR_OBJECT(self, "Failed to bind control socket");
+        GST_ERROR_OBJECT(self, "Failed to bind control socket at %s",
+                         self->control_socket_path);
         close(self->control_socket);
         self->control_socket = -1;
-        return NULL;
+        return FALSE;
     }
-    
+
+    /* Owner-only: the socket carries unauthenticated PTZ control, so restrict it
+     * to this user on top of the already-0700 $XDG_RUNTIME_DIR (M9). */
+    if (chmod(self->control_socket_path, S_IRUSR | S_IWUSR) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to chmod control socket %s to 0600",
+                         self->control_socket_path);
+        close(self->control_socket);
+        self->control_socket = -1;
+        unlink(self->control_socket_path);
+        return FALSE;
+    }
+
     if (listen(self->control_socket, 5) < 0) {
         GST_ERROR_OBJECT(self, "Failed to listen on control socket");
         close(self->control_socket);
         self->control_socket = -1;
-        return NULL;
+        unlink(self->control_socket_path);
+        return FALSE;
     }
-    
-    GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
-    
+
+    GST_INFO_OBJECT(self, "Control socket listening on %s", self->control_socket_path);
+    return TRUE;
+}
+
+void gst_libuvc_h264_src_control_socket_unbind(GstLibuvcH264Src *self) {
+    if (self->control_socket >= 0) {
+        close(self->control_socket);
+        self->control_socket = -1;
+    }
+    if (self->control_socket_path != NULL) {
+        unlink(self->control_socket_path);
+    }
+}
+
+// Control socket accept loop. The socket is already created, bound and listening
+// (gst_libuvc_h264_src_control_socket_bind, run in start()), which closes the old
+// race where the listening fd was assigned from inside this thread.
+gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
+    GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
+    int client_fd;
+    char buffer[256];
+    fd_set read_fds;
+    struct timeval timeout;
+
     while (self->control_running) {
         FD_ZERO(&read_fds);
         FD_SET(self->control_socket, &read_fds);
@@ -63,7 +117,7 @@ gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
         
         if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
             client_fd = accept(self->control_socket, NULL, NULL);
-            if (client_fd > 0) {
+            if (client_fd >= 0) {
                 ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
                 if (len > 0) {
                     buffer[len] = 0;
@@ -97,95 +151,61 @@ gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     return NULL;
 }
 
+/* Routes through the shared Task-12 PTZ helpers (one clamp/gate/lock path for
+ * both properties and socket). The setters lock control_mutex internally, so
+ * they MUST be called without it held; GET_* snapshots cached state separately. */
 static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command) {
     int pan, tilt, zoom;
-    uint16_t zoom_abs;
-    
-    g_mutex_lock(&self->control_mutex);
-    
+
     if (sscanf(command, "PAN_TILT %d %d", &pan, &tilt) == 2) {
-        if (self->uvc_devh) {
-            uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, pan, tilt);
-            if (res == UVC_SUCCESS) {
-                GST_INFO_OBJECT(self, "Set pan/tilt to: %d/%d", pan, tilt);
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("OK pan=%d tilt=%d", pan, tilt);
-            } else {
-                GST_WARNING_OBJECT(self, "Failed to set pan/tilt: %s", uvc_strerror(res));
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
-            }
+        gboolean any = FALSE, ok = TRUE;
+        if (self->pan_supported) {
+            any = TRUE;
+            ok = gst_libuvc_h264_src_ptz_set_pan(self, pan) && ok;
         }
-    } 
+        if (self->tilt_supported) {
+            any = TRUE;
+            ok = gst_libuvc_h264_src_ptz_set_tilt(self, tilt) && ok;
+        }
+        if (!any) return g_strdup("ERROR: pan/tilt not supported");
+        if (!ok) return g_strdup("ERROR: pan/tilt transfer failed");
+
+        g_mutex_lock(&self->control_mutex);
+        gint p = self->pan_cur, t = self->tilt_cur;
+        g_mutex_unlock(&self->control_mutex);
+        return g_strdup_printf("OK pan=%d tilt=%d", p, t);
+    }
     else if (sscanf(command, "ZOOM %d", &zoom) == 1) {
-        if (self->uvc_devh) {
-            zoom_abs = (uint16_t)zoom;
-            uvc_error_t res = uvc_set_zoom_abs(self->uvc_devh, zoom_abs);
-            if (res == UVC_SUCCESS) {
-                GST_INFO_OBJECT(self, "Set zoom to: %d", zoom_abs);
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("OK zoom=%d", zoom_abs);
-            } else {
-                GST_WARNING_OBJECT(self, "Failed to set zoom: %s", uvc_strerror(res));
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
-            }
-        }
+        if (!self->zoom_supported) return g_strdup("ERROR: zoom not supported");
+        if (!gst_libuvc_h264_src_ptz_set_zoom(self, zoom))
+            return g_strdup("ERROR: zoom transfer failed");
+
+        g_mutex_lock(&self->control_mutex);
+        gint z = self->zoom_cur;
+        g_mutex_unlock(&self->control_mutex);
+        return g_strdup_printf("OK zoom=%d", z);
     }
     else if (strcmp(command, "GET_POSITION") == 0) {
-        if (self->uvc_devh) {
-            int32_t current_pan, current_tilt;
-            uint16_t current_zoom;
-            char *response = NULL;
-            
-            uvc_error_t res_pan = uvc_get_pantilt_abs(self->uvc_devh, &current_pan, &current_tilt, UVC_GET_CUR);
-            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &current_zoom, UVC_GET_CUR);
-            
-            if (res_pan == UVC_SUCCESS && res_zoom == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=%d tilt=%d zoom=%d", current_pan, current_tilt, current_zoom);
-            } else if (res_pan == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=%d tilt=%d zoom=unknown", current_pan, current_tilt);
-            } else if (res_zoom == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=unknown tilt=unknown zoom=%d", current_zoom);
-            } else {
-                response = g_strdup("ERROR: Cannot read position");
-            }
-            
-            GST_INFO_OBJECT(self, "Current position: pan=%d, tilt=%d, zoom=%d", 
-                           current_pan, current_tilt, current_zoom);
-            g_mutex_unlock(&self->control_mutex);
-            return response;
-        }
+        g_mutex_lock(&self->control_mutex);
+        gint p = self->pan_cur, t = self->tilt_cur, z = self->zoom_cur;
+        g_mutex_unlock(&self->control_mutex);
+        return g_strdup_printf("OK pan=%d tilt=%d zoom=%d", p, t, z);
     }
     else if (strcmp(command, "GET_CAPABILITIES") == 0) {
-        if (self->uvc_devh) {
-            GString *caps = g_string_new("CAPABILITIES:");
-            
-            int32_t pan_min, pan_max, pan_step;
-            int32_t tilt_min, tilt_max, tilt_step;
-            uvc_error_t res_pt = uvc_get_pantilt_abs(self->uvc_devh, &pan_min, &tilt_min, UVC_GET_MIN);
-            if (res_pt == UVC_SUCCESS) {
-                uvc_get_pantilt_abs(self->uvc_devh, &pan_max, &tilt_max, UVC_GET_MAX);
-                uvc_get_pantilt_abs(self->uvc_devh, &pan_step, &tilt_step, UVC_GET_RES);
-                g_string_append_printf(caps, " pan=[%d,%d,step=%d] tilt=[%d,%d,step=%d]", 
-                                      pan_min, pan_max, pan_step, tilt_min, tilt_max, tilt_step);
-            }
-            
-            uint16_t zoom_min, zoom_max, zoom_step;
-            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &zoom_min, UVC_GET_MIN);
-            if (res_zoom == UVC_SUCCESS) {
-                uvc_get_zoom_abs(self->uvc_devh, &zoom_max, UVC_GET_MAX);
-                uvc_get_zoom_abs(self->uvc_devh, &zoom_step, UVC_GET_RES);
-                g_string_append_printf(caps, " zoom=[%d,%d,step=%d]", zoom_min, zoom_max, zoom_step);
-            }
-            
-            GST_INFO_OBJECT(self, "Capabilities: %s", caps->str);
-            g_mutex_unlock(&self->control_mutex);
-            return g_string_free(caps, FALSE);
-        }
+        g_mutex_lock(&self->control_mutex);
+        gboolean ps = self->pan_supported, ts = self->tilt_supported, zs = self->zoom_supported;
+        gint pmin = self->pan_min, pmax = self->pan_max;
+        gint tmin = self->tilt_min, tmax = self->tilt_max;
+        gint zmin = self->zoom_min, zmax = self->zoom_max;
+        g_mutex_unlock(&self->control_mutex);
+
+        GString *caps = g_string_new("CAPABILITIES:");
+        if (ps) g_string_append_printf(caps, " pan=[%d,%d]", pmin, pmax);
+        if (ts) g_string_append_printf(caps, " tilt=[%d,%d]", tmin, tmax);
+        if (zs) g_string_append_printf(caps, " zoom=[%d,%d]", zmin, zmax);
+        return g_string_free(caps, FALSE);
     }
-    
-    g_mutex_unlock(&self->control_mutex);
+
     return g_strdup("ERROR: Unknown command");
 }
 

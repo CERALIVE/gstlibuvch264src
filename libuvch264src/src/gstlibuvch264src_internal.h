@@ -45,7 +45,11 @@ struct _GstLibuvcH264Src {
   unsigned char sps[SPSPPSBUFSZ];
   unsigned char pps[SPSPPSBUFSZ];
   
-  // Control socket additions
+  // Control socket additions. Opt-in (M9): enabled gates it on; path is the bound
+  // path (explicit property or per-instance $XDG_RUNTIME_DIR default), heap-owned
+  // here and freed in finalize().
+  gboolean control_socket_enabled;
+  gchar* control_socket_path;
   gint control_socket;
   gpointer control_thread;
   gboolean control_running;

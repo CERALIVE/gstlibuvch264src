@@ -6,6 +6,16 @@
 
 G_BEGIN_DECLS
 
+/* Create, bind (per-instance path under $XDG_RUNTIME_DIR, mode 0600) and listen
+ * on the opt-in control socket. Run in start() before the control thread spawns,
+ * so the listening fd exists before any accept(). Returns FALSE (and binds
+ * nothing) on failure; the media path runs on regardless. */
+gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self);
+
+/* Close the listening fd and unlink the bound path. Safe to call when the socket
+ * was never bound. The path string itself is freed in finalize(). */
+void gst_libuvc_h264_src_control_socket_unbind(GstLibuvcH264Src *self);
+
 gpointer gst_libuvc_h264_src_control_thread(gpointer data);
 
 /* Probe pan/tilt/zoom ranges via the UVC GET_MIN/MAX/RES requests and record

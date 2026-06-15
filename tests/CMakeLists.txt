@@ -365,6 +365,73 @@ foreach(_case ${_ptz_cases})
 endforeach()
 
 # -----------------------------------------------------------------------------
+# Opt-in hardened control-socket tests (Task 16).
+#
+# Same single-executable, statically-registered shape as test_ptz so start()/
+# stop() run the REAL socket bind/unbind against the filesystem (only libuvc is
+# mocked). No RESOURCE_LOCK is needed: each case binds a per-instance path under
+# its own private $XDG_RUNTIME_DIR (created in the test), so nothing collides on
+# the old fixed /tmp/libuvc_control path - which is gone now that the socket is
+# opt-in and per-instance.
+# -----------------------------------------------------------------------------
+add_executable(test_socket
+  test_socket.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_include_directories(test_socket PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_socket PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+if(ENABLE_SANITIZERS)
+  target_compile_options(test_socket PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+  target_link_options(test_socket PRIVATE -fsanitize=address)
+endif()
+
+set(_socket_cases
+  "socket_default_off:test_socket_default_off"
+  "socket_hardened:test_socket_hardened"
+)
+foreach(_case ${_socket_cases})
+  string(REPLACE ":" ";" _parts ${_case})
+  list(GET _parts 0 _ctestname)
+  list(GET _parts 1 _testfn)
+
+  set(_socket_home "${CMAKE_BINARY_DIR}/socket-home-${_ctestname}")
+  file(MAKE_DIRECTORY ${_socket_home})
+
+  set(_socket_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/socket-registry-${_ctestname}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_socket_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=${_testfn}"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(ENABLE_SANITIZERS)
+    list(APPEND _socket_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  add_test(NAME ${_ctestname} COMMAND test_socket)
+  set_tests_properties(${_ctestname} PROPERTIES
+    ENVIRONMENT "${_socket_env}"
+    TIMEOUT 120
+  )
+endforeach()
+
+# -----------------------------------------------------------------------------
 # Error-mapping unit test (gst-check). Compiles the standalone error TU directly
 # and asserts each uvc_error_t -> GST_ELEMENT_ERROR domain/code on the bus.
 # No plugin and no UVC device are involved; only the helper + libuvc's error

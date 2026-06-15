@@ -23,6 +23,8 @@ enum {
   PROP_PAN,
   PROP_TILT,
   PROP_ZOOM,
+  PROP_CONTROL_SOCKET,
+  PROP_CONTROL_SOCKET_PATH,
   PROP_LAST
 };
 
@@ -93,6 +95,19 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
     g_param_spec_int("zoom", "Zoom", "Absolute zoom as a UVC focal length",
                      0, 65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Opt-in PTZ control socket (M9). Default OFF: the legacy world-accessible
+   * /tmp/libuvc_control is gone, so nothing binds unless asked. */
+  g_object_class_install_property(gobject_class, PROP_CONTROL_SOCKET,
+    g_param_spec_boolean("control-socket", "Control socket",
+                         "Enable the Unix-domain PTZ control socket",
+                         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_CONTROL_SOCKET_PATH,
+    g_param_spec_string("control-socket-path", "Control socket path",
+                        "Explicit control socket path; empty selects a "
+                        "per-instance path under $XDG_RUNTIME_DIR",
+                        NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -129,6 +144,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->prev_pts = G_MAXUINT64;
   
   // Control socket initialization
+  self->control_socket_enabled = FALSE;
+  self->control_socket_path = NULL;
   self->control_socket = -1;
   self->control_thread = NULL;
   self->control_running = FALSE;
@@ -287,6 +304,15 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
     case PROP_ZOOM:
       gst_libuvc_h264_src_ptz_set_zoom(self, g_value_get_int(value));
       break;
+    case PROP_CONTROL_SOCKET:
+      self->control_socket_enabled = g_value_get_boolean(value);
+      break;
+    case PROP_CONTROL_SOCKET_PATH: {
+      const gchar *path = g_value_get_string(value);
+      g_free(self->control_socket_path);
+      self->control_socket_path = (path && *path) ? g_strdup(path) : NULL;
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -309,6 +335,12 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       break;
     case PROP_ZOOM:
       g_value_set_int(value, self->zoom_cur);
+      break;
+    case PROP_CONTROL_SOCKET:
+      g_value_set_boolean(value, self->control_socket_enabled);
+      break;
+    case PROP_CONTROL_SOCKET_PATH:
+      g_value_set_string(value, self->control_socket_path);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -447,11 +479,19 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   // Probe PTZ ranges so only axes the device actually exposes are driven (M6).
   gst_libuvc_h264_src_ptz_probe_capabilities(self);
 
-  // Start control socket thread
-  self->control_running = TRUE;
-  self->control_thread = g_thread_new("uvc-control",
-                                     gst_libuvc_h264_src_control_thread,
-                                     self);
+  // Opt-in control socket (M9): bind here BEFORE the thread so the listening fd
+  // exists before any accept(); a bind failure is non-fatal to the media path.
+  if (self->control_socket_enabled) {
+    if (gst_libuvc_h264_src_control_socket_bind(self)) {
+      self->control_running = TRUE;
+      self->control_thread = g_thread_new("uvc-control",
+                                          gst_libuvc_h264_src_control_thread,
+                                          self);
+    } else {
+      GST_WARNING_OBJECT(self, "Control socket enabled but bind failed; "
+                         "continuing without it");
+    }
+  }
 
   GST_DEBUG_OBJECT(self, "Libuvc source started successfully");
   return TRUE;
@@ -467,31 +507,30 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   if (self->control_running) {
     GST_DEBUG_OBJECT(self, "Stopping control thread");
     self->control_running = FALSE;
-    
-    // Wake up control thread
-    int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (wakeup_fd >= 0) {
-      struct sockaddr_un addr;
-      memset(&addr, 0, sizeof(addr));
-      addr.sun_family = AF_UNIX;
-      strcpy(addr.sun_path, "/tmp/libuvc_control");
-      fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
-      connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
-      close(wakeup_fd);
+
+    // Nudge the thread out of its select() at once by self-connecting to the
+    // bound path; the 1s select timeout is the fallback if this misses.
+    if (self->control_socket_path != NULL) {
+      int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+      if (wakeup_fd >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        g_strlcpy(addr.sun_path, self->control_socket_path, sizeof(addr.sun_path));
+        fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
+        connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
+        close(wakeup_fd);
+      }
     }
-    
+
     if (self->control_thread) {
       g_thread_join(self->control_thread);
       self->control_thread = NULL;
     }
   }
 
-  // Close control socket
-  if (self->control_socket >= 0) {
-    close(self->control_socket);
-    self->control_socket = -1;
-    unlink("/tmp/libuvc_control");
-  }
+  // Close the listening fd and unlink the per-instance socket path.
+  gst_libuvc_h264_src_control_socket_unbind(self);
 
   // CRITICAL FIX: Stop streaming and force USB release
   if (self->streaming && self->uvc_devh) {
@@ -626,6 +665,12 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
     if (self->index) {
         g_free(self->index);
         self->index = NULL;
+    }
+
+    // stop() above already unlinked the socket; free the owned path string.
+    if (self->control_socket_path) {
+        g_free(self->control_socket_path);
+        self->control_socket_path = NULL;
     }
 
     if (self->frame_queue) {
