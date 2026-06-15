@@ -341,6 +341,50 @@ GST_START_TEST (test_negotiate_extreme_res_high)
 
 GST_END_TEST;
 
+/* End-to-end consumer guard for the libuvc 047920b backport ("accept smaller
+ * Max payloads than required", #273). The decisive check is a one-liner in
+ * libuvc's static _uvc_stream_params_negotiated() (called only by
+ * uvc_probe_stream_ctrl()): pre-backport it required the device-reported
+ * dwMaxPayloadTransferSize to EQUAL the requested one; post-backport it accepts
+ * any value <= requested, so HighSpeed cameras that report a smaller max payload
+ * negotiate instead of failing with UVC_ERROR_INVALID_MODE.
+ *
+ * That check lives entirely inside libuvc, which this suite replaces with
+ * mock_libuvc.c, so the libuvc-layer RED->GREEN proof for the backport is the
+ * fork-level harness recorded in .omo/evidence/task-10-tdd-redgreen.txt (probe
+ * RED -51 pre-backport, GREEN 0 post-backport for a 512<3072 payload). This
+ * element-level case guards the consumer side: the negotiate() path must reach
+ * PLAYING and deliver frames against a device that negotiated successfully, the
+ * very outcome the backport now unlocks for smaller-payload cameras. */
+GST_START_TEST (test_negotiate_smaller_max_payload)
+{
+  GstElement *pipeline = build_pipeline ();
+
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  GstPad *pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, NULL,
+      NULL);
+  gst_object_unref (pad);
+  gst_object_unref (sink);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING) !=
+      GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&g_buffers_seen) <= 0
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (g_atomic_int_get (&g_buffers_seen) > 0,
+      "element failed to stream when the device negotiated a smaller max payload");
+}
+
+GST_END_TEST;
+
 static Suite *
 negotiate_suite (void)
 {
@@ -359,6 +403,7 @@ negotiate_suite (void)
   tcase_add_test (tc, test_negotiate_extreme_fps_high);
   tcase_add_test (tc, test_negotiate_extreme_res_low);
   tcase_add_test (tc, test_negotiate_extreme_res_high);
+  tcase_add_test (tc, test_negotiate_smaller_max_payload);
 
   return s;
 }
