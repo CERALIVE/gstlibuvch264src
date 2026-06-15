@@ -472,3 +472,96 @@ add_sps_bounds_variant("" "")
 if(ENABLE_SANITIZERS)
   add_sps_bounds_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# Clock + PTS critical-section tests (Task 10).
+#
+# Statically links the element TUs, the libuvc mock, and the driver into one
+# executable (like test_device_select) so the racing set_clock() vmethod and the
+# mock feeder's frame_callback() run in the SAME instrumented binary - what TSan
+# needs to observe both sides of the clock/PTS race. The error helper TU is
+# included because ptz_control.c references it. The -fsanitize=thread variant is
+# the gate; it uses a dedicated suppressions file that does NOT mask
+# frame_callback()/set_clock(), so a lock regression reappears as a reported
+# race instead of being silently baselined.
+# -----------------------------------------------------------------------------
+function(add_pts_safety_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_pts_thread_safety${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe}
+    test_pts_thread_safety.c
+    ${_element_srcs}
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
+    mock_libuvc.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS.
+  set(_pts_cases
+    "pts_thread_safety${suffix}:test_pts_clock_race"
+    "frame_throughput${suffix}:test_frame_throughput"
+  )
+  foreach(_case ${_pts_cases})
+    string(REPLACE ":" ";" _parts ${_case})
+    list(GET _parts 0 _ctestname)
+    list(GET _parts 1 _testfn)
+
+    set(_pts_home "${CMAKE_BINARY_DIR}/pts-home-${_ctestname}")
+    file(MAKE_DIRECTORY ${_pts_home})
+
+    set(_pts_env
+      "GST_PLUGIN_SYSTEM_PATH="
+      "GST_REGISTRY=${CMAKE_BINARY_DIR}/pts-registry-${_ctestname}.bin"
+      "GST_REGISTRY_FORK=no"
+      "HOME=${_pts_home}"
+      "CK_FORK=no"
+      "GST_CHECKS=${_testfn}"
+      "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+    )
+    if(sanitizer STREQUAL "thread")
+      list(APPEND _pts_env
+        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_pts.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+    endif()
+
+    add_test(NAME ${_ctestname} COMMAND ${testexe})
+    set_tests_properties(${_ctestname} PROPERTIES
+      ENVIRONMENT "${_pts_env}"
+      # start() binds the fixed /tmp/libuvc_control socket, so these must not run
+      # concurrently with each other or the other mock-backed variants.
+      RESOURCE_LOCK uvc_control_socket
+      TIMEOUT 120
+    )
+  endforeach()
+endfunction()
+
+add_pts_safety_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_pts_safety_variant("tsan" "thread")
+endif()

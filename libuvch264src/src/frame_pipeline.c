@@ -93,14 +93,34 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     nal_unit_t units[MAX_UNITS_MAIN];
     int c = parse_nal_units(self->frame_format, units, MAX_UNITS_MAIN, data, frame->data_bytes);
 
-    if (!self->clock) return;
-    GstClockTime now = gst_clock_get_time(self->clock);
-
-    if (self->base_time == G_MAXUINT64) {
-        GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(self));
-        self->base_time = base_time;
+    /* The clock and the PTS baseline are shared with set_clock(), which can swap
+       the clock or reset the baseline from another thread. Snapshot the clock
+       under the object lock and take our own ref, so reading the time (the
+       expensive part) and dropping the ref happen outside the lock and can never
+       race a concurrent unref/free. */
+    GstClock *clock = NULL;
+    GstClockTime base_time = 0;
+    GST_OBJECT_LOCK(self);
+    if (self->clock) {
+        clock = gst_object_ref(self->clock);
+        base_time = self->base_time;
     }
-    GstClockTime ts = now - self->base_time;
+    GST_OBJECT_UNLOCK(self);
+
+    if (!clock) return;
+    GstClockTime now = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+
+    /* Latch the running base time on the first frame after a (re)start or clock
+       change. gst_element_get_base_time() takes the object lock itself, so read
+       it before re-entering our critical section, then commit under the lock. */
+    if (base_time == G_MAXUINT64) {
+        base_time = gst_element_get_base_time(GST_ELEMENT(self));
+        GST_OBJECT_LOCK(self);
+        self->base_time = base_time;
+        GST_OBJECT_UNLOCK(self);
+    }
+    GstClockTime ts = now - base_time;
 
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
@@ -188,6 +208,16 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                  and can drift over time
             */
 
+            GstClockTime timestamp;
+            GstClockTime duration;
+            int64_t offset;
+
+            /* prev_pts / pts_offset_sum / pts_stretch (and base_time, above) are
+               shared with set_clock(); keep this read-modify-write under the
+               object lock. The buffer fields are written afterwards from locals
+               so the buffer alloc/fill and the queue push stay outside it. */
+            GST_OBJECT_LOCK(self);
+
             // We'll set the first PTS to the current timestamp ts
             if (self->prev_pts == G_MAXUINT64) {
                 self->prev_pts = ts - self->frame_interval;
@@ -254,16 +284,18 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->prev_int_ts = ts;
             }
 
-            GstClockTime timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
-            int64_t offset = ts - timestamp;
+            timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
+            offset = ts - timestamp;
             self->pts_offset_sum += offset;
+            duration = timestamp - self->prev_pts;
+            self->prev_pts = timestamp;
+
+            GST_OBJECT_UNLOCK(self);
 
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
-            GST_BUFFER_DURATION(buffer) = timestamp - self->prev_pts;
+            GST_BUFFER_DURATION(buffer) = duration;
             GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
-
-            self->prev_pts = timestamp;
         }
 
         g_async_queue_push(self->frame_queue, buffer);
