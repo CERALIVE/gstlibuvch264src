@@ -14,6 +14,63 @@ find_package(Threads REQUIRED)
 pkg_get_variable(GST_PLUGINS_DIR gstreamer-1.0 pluginsdir)
 
 # -----------------------------------------------------------------------------
+# Shared test helpers.
+# -----------------------------------------------------------------------------
+
+# apply_sanitizer_flags(<target> <sanitizer>)
+#   <sanitizer>  "" (no-op), "address", or "thread".
+#   Adds the matching -fsanitize compile + link flags to <target>. The compile
+#   side also enables frame pointers and debug info for readable sanitizer
+#   traces; passing the same set at link is a harmless no-op for the extra
+#   compile-only flags and keeps every call site to a single line. Collapses the
+#   ~20 hand-rolled san_opts / ENABLE_SANITIZERS blocks that used to be inlined.
+function(apply_sanitizer_flags target sanitizer)
+  if(sanitizer STREQUAL "")
+    return()
+  endif()
+  set(_san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  target_compile_options(${target} PRIVATE ${_san_opts})
+  target_link_options(${target} PRIVATE ${_san_opts})
+endfunction()
+
+# setup_gst_test_environment(<prefix> <sanitizer>)
+#   Assembles the common GStreamer test-isolation environment shared by the
+#   statically-registered single-executable suites and the mock-plugin suites,
+#   and returns it as a CMake list in the parent-scope variable GST_TEST_ENV.
+#
+#   <prefix>     unique stem for this test instance; also names the per-instance
+#                GST_REGISTRY file and $HOME dir (created here) so suites never
+#                clobber each other under `ctest -j`.
+#   <sanitizer>  "", "address", or "thread". Appends the STANDARD
+#                ASAN_OPTIONS / TSAN_OPTIONS (the latter using tsan.suppressions).
+#                Suites with bespoke sanitizer env - the PTS race suite's
+#                tsan_pts.suppressions, the negotiate LSAN leak case, and the
+#                sps-bounds G_SLICE knob - pass "" here and append their own.
+#
+#   Callers append GST_PLUGIN_PATH (mock-plugin suites), GST_CHECKS, and any
+#   test-specific vars to GST_TEST_ENV after the call. Collapses the ~15
+#   hand-rolled six-line env blocks that used to be inlined.
+function(setup_gst_test_environment prefix sanitizer)
+  set(_home "${CMAKE_BINARY_DIR}/${prefix}-home")
+  file(MAKE_DIRECTORY "${_home}")
+  set(_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/${prefix}-registry.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_home}"
+    "CK_FORK=no"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(sanitizer STREQUAL "address")
+    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  elseif(sanitizer STREQUAL "thread")
+    list(APPEND _env
+      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+  endif()
+  set(GST_TEST_ENV "${_env}" PARENT_SCOPE)
+endfunction()
+
+# -----------------------------------------------------------------------------
 # Plugin-load smoke test (gst-check). Hardware-independent: it only exercises
 # registration/introspection, never opening a UVC device.
 # -----------------------------------------------------------------------------
@@ -73,6 +130,16 @@ option(ENABLE_SANITIZERS
   "Also build -fsanitize=thread / -fsanitize=address variants of the mock harness"
   OFF)
 
+# The statically-registered single-executable suites build exactly one
+# instrumented binary; under ENABLE_SANITIZERS that binary is always the
+# AddressSanitizer build. The mock-plugin and PTS/TSan suites pass their own
+# per-variant sanitizer instead. Centralised here so the per-suite call sites
+# reduce to apply_sanitizer_flags(... "${STATIC_SUITE_SANITIZER}").
+set(STATIC_SUITE_SANITIZER "")
+if(ENABLE_SANITIZERS)
+  set(STATIC_SUITE_SANITIZER "address")
+endif()
+
 # The element sources, compiled verbatim into the mock-backed module.
 # gstlibuvch264src_error.c is included because ptz_control.c posts bus errors via
 # gst_libuvc_h264_src_post_error(); every mock-linked executable needs the symbol.
@@ -100,11 +167,6 @@ function(add_mock_harness_variant variant sanitizer)
   set(ctestname "mock_smoke${suffix}")
   set(plugdir "${CMAKE_BINARY_DIR}/gstreamer-1.0-mock${suffix}")
 
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
-
   # --- mock-backed plugin module ---
   add_library(${plugin} MODULE ${_element_srcs} mock_libuvc.c)
   set_target_properties(${plugin} PROPERTIES
@@ -124,10 +186,7 @@ function(add_mock_harness_variant variant sanitizer)
     PkgConfig::LIBUSB
     Threads::Threads
   )
-  if(san_opts)
-    target_compile_options(${plugin} PRIVATE ${san_opts})
-    target_link_options(${plugin} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${plugin} "${sanitizer}")
 
   # --- smoke test executable (loads the mock-backed plugin) ---
   add_executable(${testexe} test_mock_smoke.c)
@@ -137,10 +196,7 @@ function(add_mock_harness_variant variant sanitizer)
     PkgConfig::GST_CHECK
   )
   add_dependencies(${testexe} ${plugin})
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
   # Each variant gets its own plugin dir, registry, and HOME so they never
   # clobber each other (the smoke test writes the element's SPS/PPS cache under
@@ -148,31 +204,11 @@ function(add_mock_harness_variant variant sanitizer)
   # Full isolation: the system plugin path is blanked so the registry never
   # scans unrelated third-party plugins (which trip the sanitizers). Only the
   # mock-backed plugin (GST_PLUGIN_PATH) plus an explicitly loaded coreelements
-  # plugin (GST_COREELEMENTS_PLUGIN, for fakesink) are visible to the test.
-  set(_home "${CMAKE_BINARY_DIR}/mock-home${suffix}")
-  file(MAKE_DIRECTORY ${_home})
-  set(_env
-    "GST_PLUGIN_PATH=${plugdir}"
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/mock-registry${suffix}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_home}"
-    "CK_FORK=no"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(sanitizer STREQUAL "address")
-    # Leak detection is intentionally deferred: GStreamer/GLib's one-time global
-    # allocations are noisy. ASan still catches buffer overflow, use-after-free,
-    # and double-free - the high-value coverage the oversized-SPS path targets.
-    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  elseif(sanitizer STREQUAL "thread")
-    # ignore_noninstrumented_modules makes TSan treat calls into uninstrumented
-    # libraries (all of GStreamer/GLib here) atomically, so their internal mutex
-    # bookkeeping is not misreported; the suppressions file is a documented
-    # backstop. Races inside the instrumented plugin + mock are still reported.
-    list(APPEND _env
-      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
-  endif()
+  # plugin (GST_COREELEMENTS_PLUGIN, for fakesink) are visible to the test. The
+  # standard ASAN_OPTIONS (detect_leaks=0) / TSAN_OPTIONS (tsan.suppressions,
+  # ignore_noninstrumented_modules) come from setup_gst_test_environment.
+  setup_gst_test_environment("mock${suffix}" "${sanitizer}")
+  set(_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
 
   add_test(NAME ${ctestname} COMMAND ${testexe})
   set_tests_properties(${ctestname} PROPERTIES
@@ -194,10 +230,7 @@ function(add_mock_harness_variant variant sanitizer)
     PkgConfig::GST_CHECK
   )
   add_dependencies(${lifecycleexe} ${plugin})
-  if(san_opts)
-    target_compile_options(${lifecycleexe} PRIVATE ${san_opts})
-    target_link_options(${lifecycleexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${lifecycleexe} "${sanitizer}")
 
   # DISCONNECT mode (one frame, then silence) makes create() block, so the test
   # exercises unlock() interrupting it on teardown.
@@ -250,11 +283,7 @@ target_link_libraries(test_device_select PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_device_select PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_device_select PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_device_select "${STATIC_SUITE_SANITIZER}")
 
 # "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
 set(_device_select_cases
@@ -268,22 +297,9 @@ foreach(_case ${_device_select_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_ds_home "${CMAKE_BINARY_DIR}/device-select-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_ds_home})
-
-  set(_ds_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/device-select-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_ds_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _ds_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("device-select-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_ds_env ${GST_TEST_ENV})
+  list(APPEND _ds_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_device_select)
   set_tests_properties(${_ctestname} PROPERTIES
@@ -322,11 +338,7 @@ target_link_libraries(test_ptz PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_ptz PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_ptz PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_ptz "${STATIC_SUITE_SANITIZER}")
 
 set(_ptz_cases
   "ptz_properties:test_ptz_properties"
@@ -337,22 +349,9 @@ foreach(_case ${_ptz_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_ptz_home "${CMAKE_BINARY_DIR}/ptz-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_ptz_home})
-
-  set(_ptz_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/ptz-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_ptz_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _ptz_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("ptz-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_ptz_env ${GST_TEST_ENV})
+  list(APPEND _ptz_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_ptz)
   set_tests_properties(${_ctestname} PROPERTIES
@@ -393,11 +392,7 @@ target_link_libraries(test_socket PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_socket PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_socket PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_socket "${STATIC_SUITE_SANITIZER}")
 
 set(_socket_cases
   "socket_default_off:test_socket_default_off"
@@ -408,22 +403,9 @@ foreach(_case ${_socket_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_socket_home "${CMAKE_BINARY_DIR}/socket-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_socket_home})
-
-  set(_socket_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/socket-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_socket_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _socket_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("socket-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_socket_env ${GST_TEST_ENV})
+  list(APPEND _socket_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_socket)
   set_tests_properties(${_ctestname} PROPERTIES
@@ -487,11 +469,6 @@ function(add_sps_bounds_variant variant sanitizer)
   set(ctestname "sps_bounds${suffix}")
   set(plugdir "${CMAKE_BINARY_DIR}/gstreamer-1.0-mock${suffix}")
 
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
-
   add_executable(${testexe} test_sps_bounds.c)
   target_link_libraries(${testexe} PRIVATE
     PkgConfig::GST
@@ -499,31 +476,17 @@ function(add_sps_bounds_variant variant sanitizer)
     PkgConfig::GST_CHECK
   )
   add_dependencies(${testexe} ${plugin})
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
-  set(_home "${CMAKE_BINARY_DIR}/bounds-home${suffix}")
-  file(MAKE_DIRECTORY ${_home})
-  set(_env
-    "GST_PLUGIN_PATH=${plugdir}"
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/bounds-registry${suffix}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_home}"
-    "CK_FORK=no"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-    "MOCK_UVC_FRAME_MODE=oversized_sps"
-  )
+  # Standard ASAN_OPTIONS (detect_leaks=0) comes from the helper; this suite adds
+  # G_SLICE=always-malloc so each GObject instance is a plain malloc with an ASan
+  # redzone right after it - otherwise the SPS overflow would land inside the
+  # instance (intra-object) where ASan cannot see it.
+  setup_gst_test_environment("bounds${suffix}" "${sanitizer}")
+  set(_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
+  list(APPEND _env "MOCK_UVC_FRAME_MODE=oversized_sps")
   if(sanitizer STREQUAL "address")
-    # always-malloc so each GObject instance is a plain malloc with an ASan
-    # redzone right after it; otherwise the SPS overflow would land inside the
-    # instance (intra-object) where ASan cannot see it. detect_leaks=0 keeps
-    # GLib's one-time global allocations from drowning the real finding.
-    list(APPEND _env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1"
-      "G_SLICE=always-malloc")
+    list(APPEND _env "G_SLICE=always-malloc")
   endif()
 
   add_test(NAME ${ctestname} COMMAND ${testexe})
@@ -562,11 +525,6 @@ function(add_pts_safety_variant variant sanitizer)
 
   set(testexe "test_pts_thread_safety${suffix}")
 
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
-
   add_executable(${testexe}
     test_pts_thread_safety.c
     ${_element_srcs}
@@ -586,10 +544,7 @@ function(add_pts_safety_variant variant sanitizer)
     PkgConfig::LIBUSB
     Threads::Threads
   )
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
   # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS.
   set(_pts_cases
@@ -601,18 +556,13 @@ function(add_pts_safety_variant variant sanitizer)
     list(GET _parts 0 _ctestname)
     list(GET _parts 1 _testfn)
 
-    set(_pts_home "${CMAKE_BINARY_DIR}/pts-home-${_ctestname}")
-    file(MAKE_DIRECTORY ${_pts_home})
-
-    set(_pts_env
-      "GST_PLUGIN_SYSTEM_PATH="
-      "GST_REGISTRY=${CMAKE_BINARY_DIR}/pts-registry-${_ctestname}.bin"
-      "GST_REGISTRY_FORK=no"
-      "HOME=${_pts_home}"
-      "CK_FORK=no"
-      "GST_CHECKS=${_testfn}"
-      "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-    )
+    # This suite uses a DEDICATED TSan suppressions file (tsan_pts.suppressions)
+    # that does NOT mask frame_callback()/set_clock(), so the helper's standard
+    # thread branch is bypassed (sanitizer "") and the bespoke TSAN_OPTIONS is
+    # appended here instead.
+    setup_gst_test_environment("pts-${_ctestname}" "")
+    set(_pts_env ${GST_TEST_ENV})
+    list(APPEND _pts_env "GST_CHECKS=${_testfn}")
     if(sanitizer STREQUAL "thread")
       list(APPEND _pts_env
         "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_pts.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
@@ -656,11 +606,6 @@ function(add_usb_teardown_variant variant sanitizer)
 
   set(testexe "test_usb_teardown${suffix}")
 
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
-
   add_executable(${testexe}
     test_usb_teardown.c
     ${_element_srcs}
@@ -683,24 +628,10 @@ function(add_usb_teardown_variant variant sanitizer)
     PkgConfig::GST_CHECK
     Threads::Threads
   )
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
-  set(_home "${CMAKE_BINARY_DIR}/usb-teardown-home${suffix}")
-  file(MAKE_DIRECTORY ${_home})
-  set(_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/usb-teardown-registry${suffix}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_home}"
-    "CK_FORK=no"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(sanitizer STREQUAL "address")
-    list(APPEND _env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("usb-teardown${suffix}" "${sanitizer}")
+  set(_env ${GST_TEST_ENV})
 
   add_test(NAME usb_teardown${suffix} COMMAND ${testexe})
   set_tests_properties(usb_teardown${suffix} PROPERTIES
@@ -740,11 +671,6 @@ function(add_negotiate_variant variant sanitizer)
 
   set(testexe "test_negotiate${suffix}")
 
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
-
   add_executable(${testexe}
     test_negotiate.c
     ${_element_srcs}
@@ -763,10 +689,7 @@ function(add_negotiate_variant variant sanitizer)
     PkgConfig::LIBUSB
     Threads::Threads
   )
-  if(san_opts)
-    target_compile_options(${testexe} PRIVATE ${san_opts})
-    target_link_options(${testexe} PRIVATE ${san_opts})
-  endif()
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
 
   # "<ctest name>:<gst-check test fn>" - one ctest entry each via GST_CHECKS. The
   # leak case is only meaningful (and only registered) for the asan variant.
@@ -784,18 +707,12 @@ function(add_negotiate_variant variant sanitizer)
     list(GET _parts 0 _ctestname)
     list(GET _parts 1 _testfn)
 
-    set(_neg_home "${CMAKE_BINARY_DIR}/negotiate-home-${_ctestname}")
-    file(MAKE_DIRECTORY ${_neg_home})
-
-    set(_neg_env
-      "GST_PLUGIN_SYSTEM_PATH="
-      "GST_REGISTRY=${CMAKE_BINARY_DIR}/negotiate-registry-${_ctestname}.bin"
-      "GST_REGISTRY_FORK=no"
-      "HOME=${_neg_home}"
-      "CK_FORK=no"
-      "GST_CHECKS=${_testfn}"
-      "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-    )
+    # Helper called with "" so the standard ASAN branch is bypassed: the leak
+    # case needs detect_leaks=1 + LSAN suppressions, the edge cases need the
+    # standard detect_leaks=0 - both are applied case-by-case below.
+    setup_gst_test_environment("negotiate-${_ctestname}" "")
+    set(_neg_env ${GST_TEST_ENV})
+    list(APPEND _neg_env "GST_CHECKS=${_testfn}")
     if(NOT sanitizer STREQUAL "")
       if(_ctestname STREQUAL "negotiate_leak")
         # detect_leaks must be ON for __lsan_do_recoverable_leak_check(), but the
@@ -860,11 +777,7 @@ target_link_libraries(test_pts_monotonic PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_pts_monotonic PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_pts_monotonic PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_pts_monotonic "${STATIC_SUITE_SANITIZER}")
 
 # "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
 set(_pts_monotonic_cases
@@ -876,22 +789,9 @@ foreach(_case ${_pts_monotonic_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_pm_home "${CMAKE_BINARY_DIR}/pts-monotonic-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_pm_home})
-
-  set(_pm_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/pts-monotonic-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_pm_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _pm_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("pts-monotonic-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_pm_env ${GST_TEST_ENV})
+  list(APPEND _pm_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_pts_monotonic)
   set_tests_properties(${_ctestname} PROPERTIES
@@ -979,11 +879,7 @@ target_link_libraries(test_live_source PRIVATE
   PkgConfig::LIBUSB
   Threads::Threads
 )
-if(ENABLE_SANITIZERS)
-  target_compile_options(test_live_source PRIVATE
-    -fsanitize=address -fno-omit-frame-pointer -g)
-  target_link_options(test_live_source PRIVATE -fsanitize=address)
-endif()
+apply_sanitizer_flags(test_live_source "${STATIC_SUITE_SANITIZER}")
 
 set(_live_source_cases
   "live_source_polish:test_live_source_polish"
@@ -994,22 +890,9 @@ foreach(_case ${_live_source_cases})
   list(GET _parts 0 _ctestname)
   list(GET _parts 1 _testfn)
 
-  set(_ls_home "${CMAKE_BINARY_DIR}/live-source-home-${_ctestname}")
-  file(MAKE_DIRECTORY ${_ls_home})
-
-  set(_ls_env
-    "GST_PLUGIN_SYSTEM_PATH="
-    "GST_REGISTRY=${CMAKE_BINARY_DIR}/live-source-registry-${_ctestname}.bin"
-    "GST_REGISTRY_FORK=no"
-    "HOME=${_ls_home}"
-    "CK_FORK=no"
-    "GST_CHECKS=${_testfn}"
-    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
-  )
-  if(ENABLE_SANITIZERS)
-    list(APPEND _ls_env
-      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
-  endif()
+  setup_gst_test_environment("live-source-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
+  set(_ls_env ${GST_TEST_ENV})
+  list(APPEND _ls_env "GST_CHECKS=${_testfn}")
 
   add_test(NAME ${_ctestname} COMMAND test_live_source)
   set_tests_properties(${_ctestname} PROPERTIES
@@ -1038,11 +921,6 @@ function(add_nal_parse_variant variant sanitizer)
   endif()
 
   set(testexe "test_nal_parse${suffix}")
-
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
 
   add_executable(${testexe}
     test_nal_parse.c
@@ -1103,11 +981,6 @@ function(add_functional_variant variant sanitizer)
   set(plugin "gstlibuvch264src_mock${suffix}")   # built by add_mock_harness_variant
   set(testexe "test_functional${suffix}")
   set(plugdir "${CMAKE_BINARY_DIR}/gstreamer-1.0-mock${suffix}")
-
-  set(san_opts "")
-  if(NOT sanitizer STREQUAL "")
-    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
-  endif()
 
   add_executable(${testexe} test_functional.c)
   target_link_libraries(${testexe} PRIVATE
@@ -1246,3 +1119,87 @@ foreach(_case ${_reconnect_cases})
     TIMEOUT 120
   )
 endforeach()
+
+# -----------------------------------------------------------------------------
+# PTS drift-bound regression guard (Task 1, harden-v2). Committed RED.
+#
+# Same single-executable, statically-registered shape as test_pts_thread_safety
+# so the test can construct the element directly, install a GstTestClock, and
+# drive frame_callback()'s real PTS arithmetic in-process. It does NOT use the
+# mock feeder: the feeder paces with usleep() (wall clock) and cannot be driven
+# by a controllable clock, so a jittered/lossy synthetic arrival schedule is fed
+# by calling frame_callback() directly between gst_test_clock_set_time() steps.
+#
+# The test asserts the Option B contract - rate fidelity |(PTS_N-PTS_0) -
+# (ts_N-ts_0)| <= 2 ms and instantaneous max|PTS_i-ts_i| <= 5 ms - which the
+# current estimator cannot meet, so it is committed RED and turns green with the
+# Task 5 rearchitecture. The ASAN variant proves the harness itself is clean:
+# only the bound assertion fails, never a sanitizer error.
+# -----------------------------------------------------------------------------
+function(add_pts_drift_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_pts_drift${suffix}")
+
+  set(san_opts "")
+  if(NOT sanitizer STREQUAL "")
+    set(san_opts -fsanitize=${sanitizer} -fno-omit-frame-pointer -g)
+  endif()
+
+  add_executable(${testexe}
+    test_pts_drift.c
+    ${_element_srcs}
+    mock_libuvc.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  if(san_opts)
+    target_compile_options(${testexe} PRIVATE ${san_opts})
+    target_link_options(${testexe} PRIVATE ${san_opts})
+  endif()
+
+  set(_drift_home "${CMAKE_BINARY_DIR}/pts-drift-home${suffix}")
+  file(MAKE_DIRECTORY ${_drift_home})
+
+  set(_drift_env
+    "GST_PLUGIN_SYSTEM_PATH="
+    "GST_REGISTRY=${CMAKE_BINARY_DIR}/pts-drift-registry${suffix}.bin"
+    "GST_REGISTRY_FORK=no"
+    "HOME=${_drift_home}"
+    "CK_FORK=no"
+    "GST_CHECKS=test_pts_drift"
+    "GST_COREELEMENTS_PLUGIN=${GST_PLUGINS_DIR}/libgstcoreelements.so"
+  )
+  if(sanitizer STREQUAL "address")
+    list(APPEND _drift_env
+      "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+  endif()
+
+  # No RESOURCE_LOCK: the test never enters PLAYING and never calls start(), so
+  # it spawns no control thread and binds no socket - it can run concurrently.
+  add_test(NAME pts_drift${suffix} COMMAND ${testexe})
+  set_tests_properties(pts_drift${suffix} PROPERTIES
+    ENVIRONMENT "${_drift_env}"
+    TIMEOUT 120
+  )
+endfunction()
+
+add_pts_drift_variant("" "")
+if(ENABLE_SANITIZERS)
+  add_pts_drift_variant("asan" "address")
+endif()
