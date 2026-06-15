@@ -27,6 +27,7 @@ enum {
   PROP_CONTROL_SOCKET,
   PROP_CONTROL_SOCKET_PATH,
   PROP_RECONNECT,
+  PROP_MAX_PAYLOAD,
   PROP_LAST
 };
 
@@ -38,6 +39,18 @@ enum {
 /* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
 #define RECONNECT_MAX_RETRIES 5
 #define RECONNECT_BACKOFF_INITIAL_S 1
+
+/* Opt-in USB payload override (Task 12, gated on bmaxpayload-analysis.md §5).
+ * MAX_PAYLOAD_DEFAULT is the sentinel: 0 = "use the device-negotiated value",
+ * so the unset default leaves negotiation byte-for-byte unchanged. A nonzero
+ * request is clamped to [MAX_PAYLOAD_MIN_LEGAL, MAX_PAYLOAD_MAX]: the floor keeps
+ * it legal on a USB2 high-speed bulk endpoint (512 B packet), and the ceiling
+ * caps the bulk transfer pool (LIBUVC_NUM_TRANSFER_BUFS x payload ~= 100 x
+ * payload) well under a constrained Rockchip CMA/DMA budget and usbfs's 16 MB
+ * single-buffer limit - a few MB per buffer at most, never tens of MB. */
+#define MAX_PAYLOAD_DEFAULT 0u
+#define MAX_PAYLOAD_MIN_LEGAL 512u
+#define MAX_PAYLOAD_MAX (4u * 1024u * 1024u)
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -73,6 +86,10 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 static void gst_libuvc_h264_src_finalize(GObject *object);
 static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
                                             gint pan, gint tilt, gint zoom);
+static gboolean gst_libuvc_h264_src_negotiate_clean_payload(GstLibuvcH264Src *self,
+                                            gint width, gint height, gint fps);
+static void gst_libuvc_h264_src_apply_max_payload(GstLibuvcH264Src *self,
+                                            gint width, gint height, gint fps);
 
 /* GAsyncQueue forbids NULL payloads, so create() can never receive a NULL
  * "no more frames" marker. unlock() instead pushes this dedicated address to
@@ -134,6 +151,24 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                          "device disconnects mid-stream",
                          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Opt-in USB payload override (Task 12, gated on bmaxpayload-analysis.md).
+   * Default 0 is the "leave the device-negotiated value unchanged" sentinel, so
+   * the negotiation is byte-for-byte identical to before unless set. A nonzero
+   * value is clamped to the conservative band and applied via probe/commit with
+   * read-back; a device that refuses it falls back to the device-negotiated
+   * value. Read-back reports the effective committed value. */
+  g_object_class_install_property(gobject_class, PROP_MAX_PAYLOAD,
+    g_param_spec_uint("max-payload", "Max payload transfer size",
+                      "USB payload transfer size hint in bytes "
+                      "(dwMaxPayloadTransferSize). 0 = use the device-negotiated "
+                      "value (default; negotiation unchanged). A nonzero value is "
+                      "clamped to [512, 4194304], applied via probe/commit with "
+                      "read-back, and falls back to the device-negotiated value "
+                      "if the device refuses it. Read-back reports the effective "
+                      "committed value.",
+                      0, MAX_PAYLOAD_MAX, MAX_PAYLOAD_DEFAULT,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -169,6 +204,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->flushing = 0;
   self->consecutive_timeouts = 0;
   self->reconnect_enabled = FALSE;
+  self->max_payload = MAX_PAYLOAD_DEFAULT;
+  self->max_payload_effective = 0;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -193,6 +230,84 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
 
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
+}
+
+/* Re-run a CLEAN device negotiation (NO payload override) so self->uvc_ctrl
+ * holds the device-negotiated dwMaxPayloadTransferSize. This is the graceful
+ * fallback target whenever an override is refused or wedges stream start
+ * (bmaxpayload-analysis.md §5.4): the stream comes up on the device value rather
+ * than failing. Records the device value as the effective committed payload for
+ * property read-back. Returns FALSE only if the clean re-negotiation itself
+ * fails (a genuine device error, not a payload mismatch). */
+static gboolean gst_libuvc_h264_src_negotiate_clean_payload(GstLibuvcH264Src *self,
+                                            gint width, gint height, gint fps) {
+  int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                            self->frame_format, width, height, fps);
+  if (res < 0) {
+    GST_WARNING_OBJECT(self, "max-payload fallback: clean re-negotiation failed: %s",
+                       uvc_strerror(res));
+    return FALSE;
+  }
+  GST_OBJECT_LOCK(self);
+  self->max_payload_effective = self->uvc_ctrl.dwMaxPayloadTransferSize;
+  GST_OBJECT_UNLOCK(self);
+  return TRUE;
+}
+
+/* Apply the opt-in max-payload override to the just-negotiated stream control
+ * (bmaxpayload-analysis.md §5). Called right after uvc_get_stream_ctrl_format_size
+ * in both negotiate() and the reconnect re-arm. Unset (0) is the sentinel: it
+ * leaves the device-negotiated value byte-for-byte unchanged (ZERO extra device
+ * writes), only recording it for read-back. A nonzero request is clamped to the
+ * conservative band, written into the control block, and RE-PROBED so the device
+ * write-back (GET_CUR) is observed - never trusting the read-back-free SET_CUR
+ * inside uvc_stream_start (the silent-divergence trap). On any re-probe failure
+ * or read-back mismatch it reverts to the device-negotiated value (graceful
+ * fallback); the stream never fails because of the hint. */
+static void gst_libuvc_h264_src_apply_max_payload(GstLibuvcH264Src *self,
+                                            gint width, gint height, gint fps) {
+  GST_OBJECT_LOCK(self);
+  guint requested = self->max_payload;
+  GST_OBJECT_UNLOCK(self);
+
+  if (requested == 0) {
+    GST_OBJECT_LOCK(self);
+    self->max_payload_effective = self->uvc_ctrl.dwMaxPayloadTransferSize;
+    GST_OBJECT_UNLOCK(self);
+    return;
+  }
+
+  guint clamped = requested;
+  if (clamped < MAX_PAYLOAD_MIN_LEGAL)
+    clamped = MAX_PAYLOAD_MIN_LEGAL;
+  if (clamped > MAX_PAYLOAD_MAX)
+    clamped = MAX_PAYLOAD_MAX;
+  if (clamped != requested)
+    GST_WARNING_OBJECT(self, "max-payload %u out of range [%u, %u]; clamped to %u",
+                       requested, MAX_PAYLOAD_MIN_LEGAL, MAX_PAYLOAD_MAX, clamped);
+
+  guint32 device_default = self->uvc_ctrl.dwMaxPayloadTransferSize;
+
+  self->uvc_ctrl.dwMaxPayloadTransferSize = clamped;
+  uvc_error_t res = uvc_probe_stream_ctrl(self->uvc_devh, &self->uvc_ctrl);
+  guint32 committed = self->uvc_ctrl.dwMaxPayloadTransferSize;
+
+  if (res < 0 || committed != clamped) {
+    GST_WARNING_OBJECT(self,
+        "max-payload %u not honored by device (re-probe %s, device committed %u); "
+        "falling back to device-negotiated payload %u",
+        clamped, res < 0 ? uvc_strerror(res) : "read-back mismatch",
+        committed, device_default);
+    gst_libuvc_h264_src_negotiate_clean_payload(self, width, height, fps);
+    return;
+  }
+
+  GST_INFO_OBJECT(self,
+      "max-payload applied: requested %u, device committed %u (was %u)",
+      clamped, committed, device_default);
+  GST_OBJECT_LOCK(self);
+  self->max_payload_effective = committed;
+  GST_OBJECT_UNLOCK(self);
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -330,6 +445,10 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         goto out;
     }
 
+    // Opt-in max-payload override (Task 12). Unset leaves negotiation unchanged;
+    // a set value is probe/committed with read-back and falls back gracefully.
+    gst_libuvc_h264_src_apply_max_payload(self, width, height, framerate);
+
     GST_OBJECT_LOCK(self);
     self->frame_interval = (1000L * 1000L * 1000L) / framerate;
     GST_OBJECT_UNLOCK(self);
@@ -416,6 +535,15 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
     case PROP_RECONNECT:
       self->reconnect_enabled = g_value_get_boolean(value);
       break;
+    case PROP_MAX_PAYLOAD:
+      /* Read on the negotiate/reconnect streaming thread by the apply helper;
+       * mutate under the object lock so the write and that read form a proper
+       * happens-before. Stored verbatim (the conservative clamp is applied at
+       * negotiation time, where the device-default is known for the fallback). */
+      GST_OBJECT_LOCK(self);
+      self->max_payload = g_value_get_uint(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -447,6 +575,13 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       break;
     case PROP_RECONNECT:
       g_value_set_boolean(value, self->reconnect_enabled);
+      break;
+    case PROP_MAX_PAYLOAD:
+      GST_OBJECT_LOCK(self);
+      g_value_set_uint(value, self->max_payload_effective > 0
+                              ? self->max_payload_effective
+                              : self->max_payload);
+      GST_OBJECT_UNLOCK(self);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -1022,6 +1157,14 @@ gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
       continue;
     }
 
+    // Re-apply the opt-in max-payload override idempotently on the reconnect
+    // path (Task 12). A post-replug link that came back as USB2 or a device that
+    // now refuses the value falls back to the device-negotiated payload here
+    // rather than looping the reconnect into exhaustion.
+    gst_libuvc_h264_src_apply_max_payload(self, self->negotiated_width,
+                                          self->negotiated_height,
+                                          self->negotiated_framerate);
+
     // Re-arm the stream state BEFORE the feeder spawns so frame_callback sees the
     // reset (pthread_create in uvc_start_streaming is the happens-before edge):
     // re-latch the PTS baseline and re-engage the IDR gate after the gap.
@@ -1062,9 +1205,30 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
     // Start streaming
     res = uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback, self, 0);
     if (res < 0) {
-      self->streaming = FALSE;
-      GST_ERROR_OBJECT(self, "Unable to start streaming: %s", uvc_strerror(res));
-      return GST_FLOW_ERROR;
+      // Task 12 graceful fallback: a start failure attributable to a max-payload
+      // override (e.g. LIBUSB_ERROR_NO_MEM exhausting a constrained DMA pool, or
+      // UVC_ERROR_INVALID_MODE on a slower link) must not fail the media path.
+      // Revert to the device-negotiated payload via a clean re-negotiation and
+      // retry the start once before surfacing an error.
+      guint requested;
+      GST_OBJECT_LOCK(self);
+      requested = self->max_payload;
+      GST_OBJECT_UNLOCK(self);
+      if (requested > 0 &&
+          gst_libuvc_h264_src_negotiate_clean_payload(self,
+              self->negotiated_width, self->negotiated_height,
+              self->negotiated_framerate)) {
+        GST_WARNING_OBJECT(self,
+            "stream start failed with max-payload override (%s); retrying with "
+            "device-negotiated payload", uvc_strerror(res));
+        res = uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl,
+                                  frame_callback, self, 0);
+      }
+      if (res < 0) {
+        self->streaming = FALSE;
+        GST_ERROR_OBJECT(self, "Unable to start streaming: %s", uvc_strerror(res));
+        return GST_FLOW_ERROR;
+      }
     }
   }
 

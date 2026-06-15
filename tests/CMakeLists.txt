@@ -719,6 +719,9 @@ function(add_negotiate_variant variant sanitizer)
     "negotiate_extreme_res_low${suffix}:test_negotiate_extreme_res_low"
     "negotiate_extreme_res_high${suffix}:test_negotiate_extreme_res_high"
     "negotiate_smaller_max_payload${suffix}:test_negotiate_smaller_max_payload"
+    "negotiate_max_payload_default${suffix}:test_negotiate_max_payload_default_unchanged"
+    "negotiate_max_payload_reject${suffix}:test_negotiate_max_payload_rejected_falls_back"
+    "negotiate_max_payload_accept${suffix}:test_negotiate_max_payload_accepted_applied"
   )
   if(NOT sanitizer STREQUAL "")
     list(APPEND _neg_cases "negotiate_leak:test_negotiate_leak")

@@ -52,6 +52,24 @@ typedef enum {
   MOCK_UVC_FRAME_NONIDR_LEAD,
 } mock_uvc_frame_mode_t;
 
+/* Device-negotiated dwMaxPayloadTransferSize the mock reports from
+ * uvc_get_stream_ctrl_format_size() (the value the element streams on when the
+ * max-payload property is unset). A payload-tuning test sets a DIFFERENT value
+ * via the property so the accepted/applied vs. rejected/fallback cases are
+ * distinguishable from this baseline. */
+#define MOCK_DEVICE_DEFAULT_PAYLOAD 16384u
+
+/* How the mock's uvc_probe_stream_ctrl() answers a host-proposed
+ * dwMaxPayloadTransferSize, modelling the device's SET_CUR+GET_CUR write-back. */
+typedef enum {
+  /* Device honors the request: GET_CUR echoes the host-proposed value back. */
+  MOCK_UVC_PAYLOAD_ACCEPT = 0,
+  /* Device refuses/clamps it: GET_CUR writes back MOCK_DEVICE_DEFAULT_PAYLOAD,
+   * diverging from the request so the element must detect the mismatch and fall
+   * back to the device-negotiated value. */
+  MOCK_UVC_PAYLOAD_REJECT,
+} mock_uvc_payload_mode_t;
+
 /* Shape of the single format/frame descriptor uvc_get_format_descs() advertises,
  * used to exercise the element's negotiate() edge cases. */
 typedef enum {
@@ -154,6 +172,19 @@ int mock_uvc_open_attempt_count(void);
  * released with uvc_free_device_list(). A correct caller leaves this at its
  * starting value; a leak makes it grow. */
 int mock_uvc_device_lists_outstanding(void);
+
+/* How uvc_probe_stream_ctrl() answers a host-proposed max payload (Task 12):
+ * ACCEPT (default) echoes the request back, REJECT clamps it to the
+ * device-default so the element sees a read-back mismatch and falls back. */
+void mock_uvc_set_payload_mode(mock_uvc_payload_mode_t mode);
+
+/* dwMaxPayloadTransferSize the element committed at the last uvc_start_streaming()
+ * (the value it actually streamed on after any max-payload probe/commit). */
+uint32_t mock_uvc_last_started_payload(void);
+
+/* uvc_probe_stream_ctrl() calls since reset. 0 proves the element issued NO
+ * extra probe (max-payload unset = byte-for-byte unchanged negotiation). */
+int mock_uvc_probe_call_count(void);
 
 #ifdef __cplusplus
 }
