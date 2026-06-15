@@ -28,20 +28,37 @@ RUN apt-get update && apt-get install -y \
 # Copy plugin sources and patches into the image
 COPY . /app
 
-# Build and install libuvc from upstream v0.0.7 with the H265 and UVC 1.5
-# patches applied. Stock libuvc lacks UVC_FRAME_FORMAT_H265 (required by the
-# plugin's H265 codepaths) and predates UVC 1.5 header parsing and the
-# libusb auto-detach call needed to claim devices bound to the uvcvideo
-# kernel driver.
+# Build and install libuvc. The plugin needs UVC_FRAME_FORMAT_H265 (absent from
+# stock libuvc), UVC 1.5 header parsing, and the libusb auto-detach call needed
+# to claim devices bound to the uvcvideo kernel driver.
+#
+# Source selected by the LIBUVC_USE_FORK build arg (keep SHAs/URLs in sync with
+# CMakeLists.txt; see libuvch264src/docs/notes/libuvc-fork-adr.md):
+#
+#   1 (default): clone the CeraLive/libuvc fork at the pinned ceralive-v0.0.7.1
+#                SHA. The three changes are commits on the fork, so NO patch(1)
+#                step is needed.
+#   0 (rollback): clone upstream v0.0.7 at its pinned SHA and apply the UVC 1.5 +
+#                H.265 patches with patch(1) (the pre-fork path). Build with
+#                `docker build --build-arg LIBUVC_USE_FORK=0 ...` to use it.
+#
+# Tags are mutable; a SHA is not. Shallow-fetch the single pinned commit, then
+# `git checkout FETCH_HEAD` (a bare SHA cannot be passed to git clone --branch).
 WORKDIR /app/libuvc-build
-# Pinned to the exact commit the v0.0.7 tag pointed to (tags are mutable; a SHA
-# is not). Shallow-fetch the single commit. Keep in sync with CMakeLists.txt.
-RUN git init -q . && \
-	git remote add origin https://github.com/libuvc/libuvc.git && \
-	git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b && \
-	git checkout -q FETCH_HEAD && \
-	patch -p1 < /app/patches/uvc15-support.patch && \
-	patch -p1 < /app/patches/libuvc-h265-support.patch && \
+ARG LIBUVC_USE_FORK=1
+RUN if [ "${LIBUVC_USE_FORK}" = "1" ]; then \
+		git init -q . && \
+		git remote add origin https://github.com/CeraLive/libuvc.git && \
+		git fetch --depth 1 origin 21bc89ab1010e2bcce90d846a19134500065965e && \
+		git checkout -q FETCH_HEAD; \
+	else \
+		git init -q . && \
+		git remote add origin https://github.com/libuvc/libuvc.git && \
+		git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b && \
+		git checkout -q FETCH_HEAD && \
+		patch -p1 < /app/patches/uvc15-support.patch && \
+		patch -p1 < /app/patches/libuvc-h265-support.patch; \
+	fi && \
 	cmake . \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DCMAKE_BUILD_TYPE=Release \
