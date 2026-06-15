@@ -2,10 +2,14 @@
  * Unit tests for the SPS/PPS cache path builder (libuvch264src/src/spspps_path.h).
  *
  * These run against the pure spspps_build_path() helper, so no GObject /
- * GStreamer instance is needed. Two ctest suites are dispatched by argv[1]:
+ * GStreamer instance is needed. Three ctest suites are dispatched by argv[1]:
  *
- *   path  (cache_path_safety)   - M7 NULL-path safety + M8 traversal blocking
- *   key   (cache_resolution_key)- L5 codec + resolution keyed file names
+ *   path     (cache_path_safety)    - M7 NULL-path safety + M8 traversal blocking
+ *   key      (cache_resolution_key) - L5 codec + resolution keyed file names
+ *   selector (cache_selector_key)   - per-selector key: distinct serial:/vid:pid/
+ *                                     bus: selectors map to DISTINCT cache files
+ *                                     (the old strtol() key collapsed them all to
+ *                                     "0", so distinct cameras shared one file)
  */
 
 #include <stdio.h>
@@ -32,35 +36,41 @@ static int run_path_safety(void) {
     char buf[4096];
     int ret;
 
-    /* M8: a "../.." index must not escape ~/.spspps. */
+    /* M8: a "../.." index must not escape ~/.spspps. The selector is no longer
+     * collapsed to "0" - it is escaped injectively (every byte outside
+     * [A-Za-z0-9-] becomes "_<HH>") - so '/' and '.' cannot survive as a path
+     * separator or a ".." traversal, yet two distinct selectors stay distinct. */
     ret = spspps_build_path(buf, sizeof(buf), HOME, "../..", 0, 1920, 1080);
     CHECK(ret > 0, "traversal index builds a path");
     CHECK(strstr(buf, "..") == NULL, "traversal index contains no '..'");
     CHECK(strncmp(buf, DIR "/", strlen(DIR "/")) == 0,
           "traversal index stays under ~/.spspps");
-    CHECK(strcmp(buf, DIR "/0_h264_1920x1080") == 0,
-          "non-numeric index collapses to safe '0'");
+    CHECK(strchr(buf + strlen(DIR "/"), '/') == NULL,
+          "traversal index introduces no extra '/'");
+    CHECK(strcmp(buf, DIR "/_2E_2E_2F_2E_2E_h264_1920x1080") == 0,
+          "traversal index is escaped, not collapsed to '0'");
 
     /* An absolute-looking index must not inject a new root. */
     ret = spspps_build_path(buf, sizeof(buf), HOME, "/etc/passwd", 0, 1280, 720);
     CHECK(ret > 0 && strstr(buf, "/etc/passwd") == NULL,
           "absolute-path index does not reach /etc/passwd");
-    CHECK(strcmp(buf, DIR "/0_h264_1280x720") == 0,
-          "absolute-path index collapses to safe '0'");
+    CHECK(strcmp(buf, DIR "/_2Fetc_2Fpasswd_h264_1280x720") == 0,
+          "absolute-path index is escaped under the cache dir");
 
-    /* A leading digit followed by traversal keeps only the parsed integer. */
+    /* A leading digit followed by traversal keeps the whole selector but escapes
+     * every separator, so the traversal can never re-form. */
     ret = spspps_build_path(buf, sizeof(buf), HOME, "5/../../etc", 0, 640, 480);
     CHECK(ret > 0 && strstr(buf, "..") == NULL,
           "digit+traversal index drops the traversal");
-    CHECK(strcmp(buf, DIR "/5_h264_640x480") == 0,
-          "digit+traversal index keeps only the parsed integer");
+    CHECK(strcmp(buf, DIR "/5_2F_2E_2E_2F_2E_2E_2Fetc_h264_640x480") == 0,
+          "digit+traversal index is fully escaped (no path separators survive)");
 
-    /* A negative index is rejected to the safe fallback. */
+    /* A negative index is a distinct, safe key (not collapsed onto "0"). */
     ret = spspps_build_path(buf, sizeof(buf), HOME, "-1", 0, 320, 240);
-    CHECK(strcmp(buf, DIR "/0_h264_320x240") == 0,
-          "negative index collapses to safe '0'");
+    CHECK(strcmp(buf, DIR "/-1_h264_320x240") == 0,
+          "negative index is a distinct safe key");
 
-    /* A normal numeric index passes through. */
+    /* A normal numeric index passes through unchanged (backward compatible). */
     ret = spspps_build_path(buf, sizeof(buf), HOME, "2", 0, 1920, 1080);
     CHECK(strcmp(buf, DIR "/2_h264_1920x1080") == 0,
           "numeric index is preserved");
@@ -119,6 +129,54 @@ static int run_resolution_key(void) {
     return g_failures;
 }
 
+static int run_selector_key(void) {
+    char a[4096];
+    char b[4096];
+
+    spspps_build_path(a, sizeof(a), HOME, "serial:CAM-A", 0, 1920, 1080);
+    spspps_build_path(b, sizeof(b), HOME, "serial:CAM-B", 0, 1920, 1080);
+    CHECK(strcmp(a, b) != 0, "two serial selectors yield different cache files");
+    CHECK(strstr(a, "CAM-A") != NULL, "serial key carries the serial string");
+    CHECK(strstr(b, "CAM-B") != NULL, "serial key carries the serial string");
+    CHECK(strcmp(a, DIR "/serial_3ACAM-A_h264_1920x1080") == 0,
+          "serial selector key is the escaped full selector");
+
+    spspps_build_path(b, sizeof(b), HOME, "0", 0, 1920, 1080);
+    CHECK(strcmp(a, b) != 0, "serial selector never collides with ordinal 0");
+
+    spspps_build_path(a, sizeof(a), HOME, "1234:5678", 0, 1920, 1080);
+    spspps_build_path(b, sizeof(b), HOME, "8765:4321", 0, 1920, 1080);
+    CHECK(strcmp(a, b) != 0, "two vid:pid selectors yield different cache files");
+    CHECK(strcmp(a, DIR "/1234_3A5678_h264_1920x1080") == 0,
+          "vid:pid selector key escapes the ':' separator");
+
+    spspps_build_path(a, sizeof(a), HOME, "bus:1:5", 0, 1920, 1080);
+    spspps_build_path(b, sizeof(b), HOME, "bus:1:6", 0, 1920, 1080);
+    CHECK(strcmp(a, b) != 0, "bus selectors differing only in address differ");
+    CHECK(strcmp(a, DIR "/bus_3A1_3A5_h264_1920x1080") == 0,
+          "bus selector key escapes both ':' separators");
+
+    spspps_build_path(a, sizeof(a), HOME, "serial:CAM-A", 0, 1920, 1080);
+    spspps_build_path(b, sizeof(b), HOME, "serial:CAM-A", 1, 1920, 1080);
+    CHECK(strcmp(a, b) != 0, "same serial, different codec yields different file");
+    spspps_build_path(b, sizeof(b), HOME, "serial:CAM-A", 0, 1280, 720);
+    CHECK(strcmp(a, b) != 0, "same serial, different resolution yields different file");
+
+    /* M8 for selectors: a hostile serial must escape, never traverse. */
+    spspps_build_path(a, sizeof(a), HOME, "serial:../../etc", 0, 1920, 1080);
+    CHECK(strstr(a, "..") == NULL, "hostile serial contains no '..'");
+    CHECK(strncmp(a, DIR "/", strlen(DIR "/")) == 0,
+          "hostile serial stays under ~/.spspps");
+    CHECK(strchr(a + strlen(DIR "/"), '/') == NULL,
+          "hostile serial introduces no extra '/'");
+
+    spspps_build_path(a, sizeof(a), HOME, "serial:CAM-A", 0, 1920, 1080);
+    spspps_build_path(b, sizeof(b), HOME, "serial:CAM-A", 0, 1920, 1080);
+    CHECK(strcmp(a, b) == 0, "identical selectors produce identical key");
+
+    return g_failures;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <path|key>\n", argv[0]);
@@ -132,6 +190,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "key") == 0) {
         printf("cache_resolution_key:\n");
         failures = run_resolution_key();
+    } else if (strcmp(argv[1], "selector") == 0) {
+        printf("cache_selector_key:\n");
+        failures = run_selector_key();
     } else {
         fprintf(stderr, "unknown suite: %s\n", argv[1]);
         return 2;

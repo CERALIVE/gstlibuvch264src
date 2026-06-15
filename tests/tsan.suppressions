@@ -28,11 +28,16 @@ called_from_lib:libgstcheck-1.0
 # green; remove each one as the wave locks the corresponding path. Races in the
 # mock (tests/mock_libuvc.c) or any other code are still reported, so the harness
 # stays useful for catching NEW races.
+#
+# Task 4 (control-socket hardening) locked the control-socket path: control_running
+# is now atomic and the listening fd's lifecycle is serialised under control_mutex
+# (publish in bind(), snapshot in the thread, close+invalidate in unbind(), with
+# stop() joining the thread before unbind). The control_thread /
+# process_control_command baselines are therefore REMOVED - a regression there now
+# reappears as a reported race instead of being silently masked.
 race:gst_libuvc_h264_src_create
 race:gst_libuvc_h264_src_start
 race:gst_libuvc_h264_src_stop
 race:gst_libuvc_h264_set_clock
-race:gst_libuvc_h264_src_control_thread
-race:gst_libuvc_h264_src_process_control_command
 race:frame_callback
 race:gst_libuvc_h264_negotiate

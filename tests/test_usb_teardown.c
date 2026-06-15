@@ -1,15 +1,21 @@
-/* USB teardown (H1) + interface-count (L8) regression for the libuvch264src
- * element. The element TUs, the libuvc mock, and a dedicated libusb mock (no
- * real libusb) are linked into one executable with MOCK_LIBUSB_TEARDOWN defined,
- * so force_usb_release() actually drives a mock libusb handle and uvc_close()
- * models libuvc closing that same handle.
+/* USB teardown (H1) regression for the libuvch264src element. The element TUs,
+ * the libuvc mock, and a dedicated libusb mock (no real libusb) are linked into
+ * one executable with MOCK_LIBUSB_TEARDOWN defined, so uvc_open() models
+ * acquiring a libusb handle and uvc_close() models libuvc closing that same
+ * handle - making any double-close observable.
  *
- * The old force_usb_release() closed the handle and stop() then called
- * uvc_close() on it again - a double-close. Driven 10 times, the ASAN variant
- * aborts on that double-free; both variants also fail the balance assertions
- * below. The fixed teardown leaves closing to uvc_close(), so each open is
- * matched by exactly one close, and the interface count is read once per
- * teardown from the active config descriptor (L8) instead of a fixed 0..7 range.
+ * History: the original stop() teardown called force_usb_release() before
+ * uvc_close(); that helper used to libusb_close() the handle, which uvc_close()
+ * then closed a second time - a double-close (Task 4 spike, scenario B). The fix
+ * lets uvc_close() OWN the single libusb_close(): stop() no longer performs any
+ * direct libusb interface or config management, so force_usb_release() was
+ * deleted as redundant (uvc_close() releases the interfaces natively). Driven
+ * TEARDOWN_CYCLES times, the ASAN variant aborts on a double-free if the order
+ * ever regresses; both variants also assert each open is matched by exactly one
+ * close, that uvc_close() is the sole closer, and that NO libusb config
+ * descriptor is queried during teardown (cfg_queries == 0) - the witness that no
+ * force_usb_release()-style direct release runs before uvc_close(). This is the
+ * stop()-path twin of test_reconnect_teardown_order's cfg_queries == 0 check.
  */
 
 #include <gst/check/gstcheck.h>
@@ -85,8 +91,8 @@ GST_START_TEST (test_usb_teardown_cycles)
     }
 
     /* Wait until streaming has delivered a frame this cycle, so stop() tears
-     * down a live handle (uvc_stop_streaming + force_usb_release + uvc_close).
-     * Bounded: a missing frame still exercises the open/close teardown. */
+     * down a live handle (uvc_stop_streaming + uvc_close). Bounded: a missing
+     * frame still exercises the open/close teardown. */
     int before = g_atomic_int_get (&g_buffers_seen);
     gint64 deadline = g_get_monotonic_time () + 2 * G_TIME_SPAN_SECOND;
     while (g_atomic_int_get (&g_buffers_seen) <= before
@@ -121,20 +127,31 @@ GST_START_TEST (test_usb_teardown_cycles)
   fail_unless (uvc_closes == uvc_opens,
       "uvc teardown unbalanced: %d opens, %d closes", uvc_opens, uvc_closes);
 
-  /* H1: each open's libusb handle is closed exactly once. The old code closed it
-   * in force_usb_release() too, which would double this (and ASAN would already
-   * have aborted on the double-free before we ever got here). */
+  /* H1: each open's libusb handle is closed exactly once. The old code also
+   * closed it in force_usb_release() before uvc_close(), which would double this
+   * (and ASAN would already have aborted on the double-free before we got here). */
   fail_unless (usb_opens == TEARDOWN_CYCLES,
       "expected %d libusb handles opened, got %d", TEARDOWN_CYCLES, usb_opens);
   fail_unless (usb_closes == usb_opens,
       "libusb close/open unbalanced: %d opens, %d closes (double-close is H1)",
       usb_opens, usb_closes);
 
-  /* L8: the release loop sized itself from the active config descriptor (queried
-   * once per teardown), not a hardcoded 0..7 range. */
-  fail_unless (cfg_queries == TEARDOWN_CYCLES,
-      "expected %d active-config queries (L8), got %d", TEARDOWN_CYCLES,
-      cfg_queries);
+  /* uvc_close() owns the single libusb_close(): the mock closes the handle only
+   * inside uvc_close(), so a libusb-close count equal to the uvc_close() count
+   * proves nothing else (a resurrected force_usb_release()) closed it. */
+  fail_unless (usb_closes == uvc_closes,
+      "uvc_close() must own the single libusb_close(): %d uvc_close vs %d "
+      "libusb_close", uvc_closes, usb_closes);
+
+  /* No direct libusb interface/config management in teardown: force_usb_release()
+   * was the ONLY caller of libusb_get_active_config_descriptor(), and stop() now
+   * lets uvc_close() own the whole teardown, so the active-config query count
+   * must be zero. RED while stop() still calls force_usb_release() before
+   * uvc_close() (one query per cycle); GREEN once that call is removed and the
+   * helper deleted - the stop()-path twin of test_reconnect_teardown_order. */
+  fail_unless (cfg_queries == 0,
+      "teardown must not query the libusb config descriptor (force_usb_release "
+      "must not precede uvc_close); got %d quer(ies)", cfg_queries);
 }
 
 GST_END_TEST;

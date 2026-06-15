@@ -23,12 +23,14 @@
 #include <libuvc/libuvc.h>
 
 #include "frame_pipeline.h"
+#include "spspps_cache.h"
 
 /* frame_pipeline.c pulls these in through frame_callback(), which this test
    never calls; trivial definitions satisfy the linker without dragging in the
    element or the SPS/PPS cache TU. */
 GST_DEBUG_CATEGORY(gst_libuvc_h264_src_debug);
-void store_spspps(GstLibuvcH264Src *self) { (void)self; }
+void spspps_key_snapshot(GstLibuvcH264Src *self, spspps_key_t *key) { (void)self; (void)key; }
+void store_spspps(GstLibuvcH264Src *self, const spspps_key_t *key) { (void)self; (void)key; }
 
 static int g_failures;
 
@@ -562,10 +564,135 @@ static int run_bounds_h265(void) {
     return g_failures;
 }
 
+/* spspps_clamp_len() is the store-side bound that keeps store_spspps()'s fwrite
+   from running off the fixed SPSPPSBUFSZ self->{vps,sps,pps} arrays when a corrupt
+   or unclamped *_length reaches it. It is pure, so it is asserted directly; the
+   ASAN teeth are the exact-size source buffer below - a broken clamp returning the
+   raw oversized length would over-read it and abort the run. */
+static int run_store_bounds(void) {
+    CHECK(spspps_clamp_len(-1) == 0, "negative length floors to 0");
+    CHECK(spspps_clamp_len(-100000) == 0, "large negative length floors to 0");
+    CHECK(spspps_clamp_len(0) == 0, "zero length stays 0");
+    CHECK(spspps_clamp_len(1) == 1, "minimal length passes through");
+    CHECK(spspps_clamp_len(512) == 512, "in-range length passes through");
+    CHECK(spspps_clamp_len(SPSPPSBUFSZ) == (gsize)SPSPPSBUFSZ,
+          "exact-size length passes through");
+    CHECK(spspps_clamp_len(SPSPPSBUFSZ + 1) == (gsize)SPSPPSBUFSZ,
+          "one past the bound caps at SPSPPSBUFSZ");
+    CHECK(spspps_clamp_len(SPSPPSBUFSZ + 4096) == (gsize)SPSPPSBUFSZ,
+          "far-oversized length caps at SPSPPSBUFSZ");
+
+    unsigned char *src = g_malloc(SPSPPSBUFSZ);
+    memset(src, 0xAB, SPSPPSBUFSZ);
+    gsize safe = spspps_clamp_len(SPSPPSBUFSZ + 4096);
+    CHECK(safe == (gsize)SPSPPSBUFSZ, "clamped copy length stays within the buffer");
+    /* Model store_spspps()'s fwrite(self->vps, 1, len): read `safe` bytes out of
+       the exact-size source. A broken clamp returning the raw oversized length
+       reads past src and trips ASAN (heap-buffer-overflow). */
+    volatile unsigned long sink = 0;
+    for (gsize i = 0; i < safe; i++) {
+        sink += src[i];
+    }
+    (void) sink;
+    g_free(src);
+    return g_failures;
+}
+
+/* Drive the full parser (count -> parse) over `buf` for one codec and prove every
+   emitted unit stays inside [buf, buf+size). Touching the first/last byte of each
+   span gives ASAN teeth: an out-of-bounds unit hits the redzone right after the
+   exact-size allocation and aborts, not merely the arithmetic check. */
+static void drive_parser_bounds(enum uvc_frame_format fmt, unsigned char *buf,
+                                gsize size, const char *label) {
+    gsize n = count_nal_units(fmt, buf, size);
+    nal_unit_t *units = g_new(nal_unit_t, n ? n : 1);
+    gsize c = parse_nal_units(fmt, units, n, buf, size);
+
+    int ok = (c <= n);
+    for (gsize i = 0; i < c; i++) {
+        if (units[i].ptr < buf) ok = 0;
+        if (units[i].len > size) ok = 0;
+        if (units[i].ptr + units[i].len > buf + size) ok = 0;
+        if (units[i].len > 0) {
+            volatile unsigned char first = units[i].ptr[0];
+            volatile unsigned char last = units[i].ptr[units[i].len - 1];
+            (void)first;
+            (void)last;
+        }
+    }
+    CHECK(ok, label);
+    g_free(units);
+}
+
+/* Deterministic in-test mirror of tests/corpus/nal/: the same five adversarial
+   byte patterns the libFuzzer harness (fuzz_nal.c) seeds with, each driven through
+   the parser for BOTH codecs. Buffers are the exact used length (g_malloc) so the
+   ASAN redzone sits right after the last byte and any over-read aborts. */
+static int run_fuzz_seed(void) {
+    /* (1) valid H.264 SPS+PPS+IDR */
+    {
+        gsize size = (4 + 1 + 8) + (4 + 1 + 4) + (4 + 1 + 16);
+        unsigned char *buf = g_malloc(size);
+        gsize pos = 0;
+        pos = append_nal(buf, pos, 4, NH_SPS, 8);
+        pos = append_nal(buf, pos, 4, NH_PPS, 4);
+        pos = append_nal(buf, pos, 4, NH_IDR, 16);
+        CHECK(pos == size, "seed(1) valid H.264 buffer filled exactly");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H264, buf, size, "seed(1) valid H.264 in bounds (H264)");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H265, buf, size, "seed(1) valid H.264 in bounds (H265 view)");
+        g_free(buf);
+    }
+    /* (2) valid H.265 VPS+SPS+PPS+IDR */
+    {
+        gsize size = (4 + 2 + 8) + (4 + 2 + 8) + (4 + 2 + 4) + (4 + 2 + 16);
+        unsigned char *buf = g_malloc(size);
+        gsize pos = 0;
+        pos = append_nal_h265(buf, pos, 4, H265_VPS, 8);
+        pos = append_nal_h265(buf, pos, 4, H265_SPS, 8);
+        pos = append_nal_h265(buf, pos, 4, H265_PPS, 4);
+        pos = append_nal_h265(buf, pos, 4, H265_IDR_W_RADL, 16);
+        CHECK(pos == size, "seed(2) valid H.265 buffer filled exactly");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H265, buf, size, "seed(2) valid H.265 in bounds (H265)");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H264, buf, size, "seed(2) valid H.265 in bounds (H264 view)");
+        g_free(buf);
+    }
+    /* (3) truncated start code: 00 00 01 with no header byte */
+    {
+        gsize size = 3;
+        unsigned char *buf = g_malloc(size);
+        buf[0] = 0x00;
+        buf[1] = 0x00;
+        buf[2] = 0x01;
+        drive_parser_bounds(UVC_FRAME_FORMAT_H264, buf, size, "seed(3) truncated start code in bounds (H264)");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H265, buf, size, "seed(3) truncated start code in bounds (H265)");
+        g_free(buf);
+    }
+    /* (4) oversized single NAL: payload far larger than the SPS/PPS clamp limit */
+    {
+        gsize pay = 5000;
+        gsize size = 4 + 1 + pay;
+        unsigned char *buf = g_malloc(size);
+        gsize pos = append_nal(buf, 0, 4, NH_SPS, pay);
+        CHECK(pos == size, "seed(4) oversized buffer filled exactly");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H264, buf, size, "seed(4) oversized NAL in bounds (H264)");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H265, buf, size, "seed(4) oversized NAL in bounds (H265)");
+        g_free(buf);
+    }
+    /* (5) empty input: a 0-length view must index into nothing */
+    {
+        unsigned char *buf = g_malloc(1);
+        drive_parser_bounds(UVC_FRAME_FORMAT_H264, buf, 0, "seed(5) empty input in bounds (H264)");
+        drive_parser_bounds(UVC_FRAME_FORMAT_H265, buf, 0, "seed(5) empty input in bounds (H265)");
+        g_free(buf);
+    }
+    return g_failures;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <multislice|startcode|bounds|"
-                        "multislice_h265|startcode_h265|bounds_h265>\n", argv[0]);
+                        "multislice_h265|startcode_h265|bounds_h265|"
+                        "store_bounds|fuzz_seed>\n", argv[0]);
         return 2;
     }
 
@@ -588,6 +715,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "bounds_h265") == 0) {
         printf("nal_parse bounds_h265:\n");
         failures = run_bounds_h265();
+    } else if (strcmp(argv[1], "store_bounds") == 0) {
+        printf("nal_parse store_bounds:\n");
+        failures = run_store_bounds();
+    } else if (strcmp(argv[1], "fuzz_seed") == 0) {
+        printf("nal_parse fuzz_seed:\n");
+        failures = run_fuzz_seed();
     } else {
         fprintf(stderr, "unknown suite: %s\n", argv[1]);
         return 2;

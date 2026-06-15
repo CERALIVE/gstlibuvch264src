@@ -8,12 +8,21 @@
  * (tests/test_cache.c) without constructing a GObject. spspps_cache.c wraps
  * this with the element's logging and instance state.
  *
- * Two hardening properties live here:
+ * Three hardening properties live here:
  *
- *   M8 (path traversal): the device `index` is never interpolated verbatim. It
- *   is parsed with strtol and only the resulting non-negative integer reaches
- *   the path, so a hostile index such as "../.." or "/etc/passwd" collapses to
- *   a safe numeric component and can never escape ~/.spspps.
+ *   M8 (path traversal): the device `index` is never interpolated verbatim.
+ *   Every byte outside [A-Za-z0-9-] - in particular '/' and '.' - is escaped as
+ *   "_<HH>" (two hex digits), so a hostile index such as "../.." or "/etc/passwd"
+ *   carries no path separator and no ".." traversal and can never escape
+ *   ~/.spspps.
+ *
+ *   Per-selector key (collision fix): the escape is injective - "_" itself is
+ *   escaped - so distinct selectors (serial:CAM-A vs serial:CAM-B, two different
+ *   vid:pid, two bus: addresses) always map to DISTINCT keys. The old strtol()
+ *   key collapsed every non-ordinal selector onto "0", so distinct cameras shared
+ *   one cache file. A plain ordinal is pure digits, which pass through verbatim,
+ *   so "0" stays "0" and the existing on-disk layout is preserved (backward
+ *   compatible).
  *
  *   L5 (resolution key): the negotiated codec and WxH are folded into the file
  *   name, so a cache entry written for one resolution can never be loaded for a
@@ -48,18 +57,34 @@ static inline int spspps_build_path(char *out, size_t outlen,
     if (index == NULL) {
         ret = snprintf(out, outlen, "%s/.spspps", home_dir);
     } else {
-        /* M8: parse, do not interpolate. A non-numeric or negative index can
-         * not introduce path separators or ".." once collapsed to a long. */
-        char *end = NULL;
-        long idx = strtol(index, &end, 10);
-        if (end == index || idx < 0) {
-            idx = 0;
+        /* M8 + per-selector key: escape, do not interpolate. Every byte outside
+         * [A-Za-z0-9-] becomes "_<HH>", which (a) strips any '/' or "." so no
+         * path separator or ".." traversal survives, and (b) is injective ("_"
+         * is itself escaped to "_5F"), so distinct selectors never collide. Pure
+         * digits pass through verbatim, keeping the ordinal layout ("0" -> "0"). */
+        static const char hexd[] = "0123456789ABCDEF";
+        char key[768];
+        size_t k = 0;
+        for (const unsigned char *p = (const unsigned char *)index; *p; p++) {
+            unsigned char c = *p;
+            int safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') || c == '-';
+            if (safe) {
+                if (k + 1 >= sizeof(key)) return -1;
+                key[k++] = (char)c;
+            } else {
+                if (k + 3 >= sizeof(key)) return -1;
+                key[k++] = '_';
+                key[k++] = hexd[(c >> 4) & 0xF];
+                key[k++] = hexd[c & 0xF];
+            }
         }
+        key[k] = '\0';
 
         /* L5: codec + resolution are part of the key. */
         const char *codec = is_h265 ? "h265" : "h264";
-        ret = snprintf(out, outlen, "%s/.spspps/%ld_%s_%dx%d",
-                       home_dir, idx, codec, width, height);
+        ret = snprintf(out, outlen, "%s/.spspps/%s_%s_%dx%d",
+                       home_dir, key, codec, width, height);
     }
 
     if (ret < 0 || (size_t)ret >= outlen) {
