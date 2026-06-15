@@ -70,6 +70,109 @@ function(setup_gst_test_environment prefix sanitizer)
   set(GST_TEST_ENV "${_env}" PARENT_SCOPE)
 endfunction()
 
+# add_gstcheck_multicase_test(<exe> <prefix> <sanitizer> <cases> [options])
+#   Registers one ctest entry per case for a gst-check suite that fans a single
+#   test executable out across several gst-check test functions via GST_CHECKS.
+#   Collapses the eight near-identical multi-case `foreach` registration blocks
+#   (device_select, ptz, socket, pts_safety, pts_monotonic, live_source,
+#   functional, reconnect - plus framerate_mismatch) that all shared this shape:
+#     setup_gst_test_environment(<prefix>-<name> <sanitizer>) -> GST_TEST_ENV
+#     env = [<prepend>] GST_TEST_ENV "GST_CHECKS=<fn>" [<per-case extra>] [<append>]
+#     add_test(<name> <exe>); RESOURCE_LOCK uvc_control_socket; TIMEOUT 120
+#
+#   <exe>        the test executable every case runs.
+#   <prefix>     stem for the per-case isolation prefix ("<prefix>-<ctestname>"),
+#                fed to setup_gst_test_environment for a unique registry/HOME.
+#   <sanitizer>  "", "address", or "thread"; forwarded to
+#                setup_gst_test_environment for the STANDARD ASAN/TSAN env. Pass
+#                "" and use APPEND_ENV for suites with bespoke sanitizer options
+#                (e.g. the PTS race's tsan_pts.suppressions).
+#   <cases>      a CMake list of "<ctest name>:<gst-check fn>" or
+#                "<ctest name>:<gst-check fn>:<per-case extra env>" entries. The
+#                optional third field (which may be empty) is appended verbatim.
+#
+#   Options:
+#     NO_RESOURCE_LOCK   omit the uvc_control_socket RESOURCE_LOCK (suites whose
+#                        cases bind a per-instance path and can run concurrently).
+#     PREPEND_ENV <e>... env entries placed BEFORE GST_TEST_ENV (e.g. a mock
+#                        plugin's GST_PLUGIN_PATH).
+#     APPEND_ENV  <e>... env entries placed AFTER the per-case vars (e.g. a
+#                        bespoke TSAN_OPTIONS for the PTS race suite).
+function(add_gstcheck_multicase_test exe prefix sanitizer cases)
+  cmake_parse_arguments(_mc "NO_RESOURCE_LOCK" "" "PREPEND_ENV;APPEND_ENV" ${ARGN})
+  foreach(_case ${cases})
+    string(REPLACE ":" ";" _parts "${_case}")
+    list(GET _parts 0 _ctestname)
+    list(GET _parts 1 _testfn)
+    list(LENGTH _parts _nparts)
+    set(_extra "")
+    if(_nparts GREATER 2)
+      list(GET _parts 2 _extra)
+    endif()
+
+    setup_gst_test_environment("${prefix}-${_ctestname}" "${sanitizer}")
+    set(_env ${_mc_PREPEND_ENV} ${GST_TEST_ENV})
+    list(APPEND _env "GST_CHECKS=${_testfn}")
+    if(NOT _extra STREQUAL "")
+      list(APPEND _env "${_extra}")
+    endif()
+    if(_mc_APPEND_ENV)
+      list(APPEND _env ${_mc_APPEND_ENV})
+    endif()
+
+    add_test(NAME ${_ctestname} COMMAND ${exe})
+    # ENVIRONMENT must be passed as a single quoted argument: the env value is a
+    # CMake list whose internal ";" would otherwise flatten into stray
+    # set_tests_properties key/value args. Branch instead of building a props
+    # variable so "${_env}" stays one argument.
+    if(_mc_NO_RESOURCE_LOCK)
+      set_tests_properties(${_ctestname} PROPERTIES
+        ENVIRONMENT "${_env}"
+        TIMEOUT 120)
+    else()
+      # start()-driven suites share the fixed /tmp/libuvc_control socket, so they
+      # must not run concurrently under `ctest -j`.
+      set_tests_properties(${_ctestname} PROPERTIES
+        ENVIRONMENT "${_env}"
+        RESOURCE_LOCK uvc_control_socket
+        TIMEOUT 120)
+    endif()
+  endforeach()
+endfunction()
+
+# add_static_gstcheck_exe(<name> [EXTRA_SRCS <src>...])
+#   Builds a statically-registered single-executable gst-check suite: the named
+#   test (<name>.c) plus the element TUs and the libuvc mock compiled into ONE
+#   binary (no plugin .so), so the mock's in-process state is directly
+#   observable. Wires the standard element include dirs, the GST/libusb/Threads
+#   links, and STATIC_SUITE_SANITIZER instrumentation. Collapses the seven
+#   identical add_executable/target_include_directories/target_link_libraries/
+#   apply_sanitizer_flags blocks (device_select, ptz, socket, pts_monotonic,
+#   live_source, reconnect, framerate_mismatch). Suites with a different shape
+#   (extra error TU, libusb mock, or a per-variant sanitizer) keep their own
+#   bespoke definition.
+#
+#   EXTRA_SRCS  additional sources to compile into the binary beyond the
+#               <name>.c + element TUs + mock_libuvc.c default set.
+function(add_static_gstcheck_exe name)
+  cmake_parse_arguments(_se "" "" "EXTRA_SRCS" ${ARGN})
+  add_executable(${name} ${name}.c ${_element_srcs} mock_libuvc.c ${_se_EXTRA_SRCS})
+  target_include_directories(${name} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${name} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  apply_sanitizer_flags(${name} "${STATIC_SUITE_SANITIZER}")
+endfunction()
+
 # -----------------------------------------------------------------------------
 # Plugin-load smoke test (gst-check). Hardware-independent: it only exercises
 # registration/introspection, never opening a UVC device.
@@ -143,6 +246,7 @@ endif()
 # The element sources, compiled verbatim into the mock-backed module.
 # gstlibuvch264src_error.c is included because ptz_control.c posts bus errors via
 # gst_libuvc_h264_src_post_error(); every mock-linked executable needs the symbol.
+#
 # Single source of truth: read the .c list from libuvch264src/src/sources.txt,
 # shared verbatim with the top-level CMakeLists.txt and the Meson production build
 # (libuvch264src/src/meson.build). sources.txt holds bare filenames; prefix each
@@ -266,25 +370,7 @@ endif()
 # can be set programmatically. Each gst-check test is surfaced as its own ctest
 # entry via GST_CHECKS so the suite can be filtered test-by-test.
 # -----------------------------------------------------------------------------
-add_executable(test_device_select
-  test_device_select.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_device_select PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_device_select PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_device_select "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_device_select)
 
 # "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
 set(_device_select_cases
@@ -293,25 +379,10 @@ set(_device_select_cases
   "device_restart_leak:test_device_restart_leak"
   "device_selector:test_device_selector"
 )
-foreach(_case ${_device_select_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-
-  setup_gst_test_environment("device-select-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_ds_env ${GST_TEST_ENV})
-  list(APPEND _ds_env "GST_CHECKS=${_testfn}")
-
-  add_test(NAME ${_ctestname} COMMAND test_device_select)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_ds_env}"
-    # start() spawns the control thread which binds the fixed /tmp/libuvc_control
-    # socket, so these must not run concurrently with each other or the mock
-    # streaming variants.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# start() spawns the control thread which binds the fixed /tmp/libuvc_control
+# socket, so these must not run concurrently (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_device_select "device-select"
+  "${STATIC_SUITE_SANITIZER}" "${_device_select_cases}")
 
 # -----------------------------------------------------------------------------
 # Native PTZ property/signal tests (Task 12).
@@ -321,49 +392,16 @@ endforeach()
 # (mock_uvc_get_last_pantilt/zoom). Each gst-check test is its own ctest entry
 # selected via GST_CHECKS.
 # -----------------------------------------------------------------------------
-add_executable(test_ptz
-  test_ptz.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_ptz PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_ptz PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_ptz "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_ptz)
 
 set(_ptz_cases
   "ptz_properties:test_ptz_properties"
   "ptz_capability_gate:test_ptz_capability_gate"
 )
-foreach(_case ${_ptz_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-
-  setup_gst_test_environment("ptz-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_ptz_env ${GST_TEST_ENV})
-  list(APPEND _ptz_env "GST_CHECKS=${_testfn}")
-
-  add_test(NAME ${_ctestname} COMMAND test_ptz)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_ptz_env}"
-    # start() binds the fixed /tmp/libuvc_control socket via the control thread,
-    # so the PTZ cases must not run concurrently with each other or the other
-    # start()-driven suites under `ctest -j`.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# start() binds the fixed /tmp/libuvc_control socket via the control thread, so
+# the PTZ cases must not run concurrently (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_ptz "ptz"
+  "${STATIC_SUITE_SANITIZER}" "${_ptz_cases}")
 
 # -----------------------------------------------------------------------------
 # Opt-in hardened control-socket tests (Task 16).
@@ -375,45 +413,16 @@ endforeach()
 # the old fixed /tmp/libuvc_control path - which is gone now that the socket is
 # opt-in and per-instance.
 # -----------------------------------------------------------------------------
-add_executable(test_socket
-  test_socket.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_socket PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_socket PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_socket "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_socket)
 
 set(_socket_cases
   "socket_default_off:test_socket_default_off"
   "socket_hardened:test_socket_hardened"
 )
-foreach(_case ${_socket_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-
-  setup_gst_test_environment("socket-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_socket_env ${GST_TEST_ENV})
-  list(APPEND _socket_env "GST_CHECKS=${_testfn}")
-
-  add_test(NAME ${_ctestname} COMMAND test_socket)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_socket_env}"
-    TIMEOUT 120
-  )
-endforeach()
+# No RESOURCE_LOCK: each case binds a per-instance path under its own private
+# $XDG_RUNTIME_DIR, so nothing collides and they can run concurrently.
+add_gstcheck_multicase_test(test_socket "socket"
+  "${STATIC_SUITE_SANITIZER}" "${_socket_cases}" NO_RESOURCE_LOCK)
 
 # -----------------------------------------------------------------------------
 # Error-mapping unit test (gst-check). Compiles the standalone error TU directly
@@ -572,32 +581,18 @@ function(add_pts_safety_variant variant sanitizer)
     "pts_thread_safety${suffix}:test_pts_clock_race"
     "frame_throughput${suffix}:test_frame_throughput"
   )
-  foreach(_case ${_pts_cases})
-    string(REPLACE ":" ";" _parts ${_case})
-    list(GET _parts 0 _ctestname)
-    list(GET _parts 1 _testfn)
-
-    # This suite uses a DEDICATED TSan suppressions file (tsan_pts.suppressions)
-    # that does NOT mask frame_callback()/set_clock(), so the helper's standard
-    # thread branch is bypassed (sanitizer "") and the bespoke TSAN_OPTIONS is
-    # appended here instead.
-    setup_gst_test_environment("pts-${_ctestname}" "")
-    set(_pts_env ${GST_TEST_ENV})
-    list(APPEND _pts_env "GST_CHECKS=${_testfn}")
-    if(sanitizer STREQUAL "thread")
-      list(APPEND _pts_env
-        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_pts.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
-    endif()
-
-    add_test(NAME ${_ctestname} COMMAND ${testexe})
-    set_tests_properties(${_ctestname} PROPERTIES
-      ENVIRONMENT "${_pts_env}"
-      # start() binds the fixed /tmp/libuvc_control socket, so these must not run
-      # concurrently with each other or the other mock-backed variants.
-      RESOURCE_LOCK uvc_control_socket
-      TIMEOUT 120
-    )
-  endforeach()
+  # This suite uses a DEDICATED TSan suppressions file (tsan_pts.suppressions)
+  # that does NOT mask frame_callback()/set_clock(), so the helper's standard
+  # thread branch is bypassed (sanitizer "") and the bespoke TSAN_OPTIONS is
+  # passed via APPEND_ENV instead.
+  set(_pts_extra "")
+  if(sanitizer STREQUAL "thread")
+    set(_pts_extra APPEND_ENV
+      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_pts.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+  endif()
+  # start() binds the fixed /tmp/libuvc_control socket, so these must not run
+  # concurrently (RESOURCE_LOCK, applied by helper).
+  add_gstcheck_multicase_test(${testexe} "pts" "" "${_pts_cases}" ${_pts_extra})
 endfunction()
 
 add_pts_safety_variant("" "")
@@ -784,50 +779,17 @@ endif()
 #                  stream once to latch had_idr, restart, and assert the first
 #                  buffer after the restart is never a forwarded non-IDR (M5).
 # -----------------------------------------------------------------------------
-add_executable(test_pts_monotonic
-  test_pts_monotonic.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_pts_monotonic PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_pts_monotonic PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_pts_monotonic "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_pts_monotonic)
 
 # "<ctest name>:<gst-check test fn>" - one ctest entry each, selected by GST_CHECKS.
 set(_pts_monotonic_cases
   "pts_monotonic:test_pts_monotonic"
   "restart_idr:test_restart_idr"
 )
-foreach(_case ${_pts_monotonic_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-
-  setup_gst_test_environment("pts-monotonic-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_pm_env ${GST_TEST_ENV})
-  list(APPEND _pm_env "GST_CHECKS=${_testfn}")
-
-  add_test(NAME ${_ctestname} COMMAND test_pts_monotonic)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_pm_env}"
-    # start() binds the fixed /tmp/libuvc_control socket via the control thread,
-    # so these must not run concurrently with each other or the other
-    # start()-driven suites under `ctest -j`.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# start() binds the fixed /tmp/libuvc_control socket via the control thread, so
+# these must not run concurrently (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_pts_monotonic "pts-monotonic"
+  "${STATIC_SUITE_SANITIZER}" "${_pts_monotonic_cases}")
 
 # -----------------------------------------------------------------------------
 # V4L2 capability probe tests (Task 23).
@@ -886,25 +848,7 @@ set_tests_properties(v4l2_probe_nonfatal PROPERTIES
 #   spspps_write_on_change  The SPS/PPS cache is written on a changed parameter
 #                           set, not rewritten for an identical one (L10).
 # -----------------------------------------------------------------------------
-add_executable(test_live_source
-  test_live_source.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_live_source PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_live_source PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_live_source "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_live_source)
 
 # "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
 # GST_CHECKS. cache_h265_vps_write_on_change is named with the "cache" stem so
@@ -916,28 +860,10 @@ set(_live_source_cases
   "spspps_write_on_change:test_spspps_write_on_change:"
   "cache_h265_vps_write_on_change:test_h265_vps_write_on_change:MOCK_UVC_FRAME_FORMAT=H265"
 )
-foreach(_case ${_live_source_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-  list(GET _parts 2 _extraenv)
-
-  setup_gst_test_environment("live-source-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_ls_env ${GST_TEST_ENV})
-  list(APPEND _ls_env "GST_CHECKS=${_testfn}")
-  if(NOT _extraenv STREQUAL "")
-    list(APPEND _ls_env "${_extraenv}")
-  endif()
-
-  add_test(NAME ${_ctestname} COMMAND test_live_source)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_ls_env}"
-    # start() may spawn the control thread, so keep these off the shared socket
-    # resource like the other start()-driven suites under `ctest -j`.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# start() may spawn the control thread, so keep these off the shared socket
+# resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_live_source "live-source"
+  "${STATIC_SUITE_SANITIZER}" "${_live_source_cases}")
 
 # -----------------------------------------------------------------------------
 # NAL parser unit tests (Task 15). Pure C against the real parser in
@@ -1025,11 +951,6 @@ function(add_functional_variant variant sanitizer)
   add_dependencies(${testexe} ${plugin})
   apply_sanitizer_flags(${testexe} "${sanitizer}")
 
-  # GST_PLUGIN_PATH points the test at the mock-backed plugin; the standard
-  # ASAN_OPTIONS / TSAN_OPTIONS (tsan.suppressions) come from the helper.
-  setup_gst_test_environment("functional${suffix}" "${sanitizer}")
-  set(_env "GST_PLUGIN_PATH=${plugdir}" ${GST_TEST_ENV})
-
   # "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
   # GST_CHECKS. The H.265 case adds MOCK_UVC_FRAME_FORMAT=H265 so the same mock
   # plugin advertises and feeds H.265.
@@ -1038,26 +959,12 @@ function(add_functional_variant variant sanitizer)
     "functional_caps_h265${suffix}:test_caps_h265:MOCK_UVC_FRAME_FORMAT=H265"
     "functional_backpressure${suffix}:test_backpressure:"
   )
-  foreach(_case ${_functional_cases})
-    string(REPLACE ":" ";" _parts ${_case})
-    list(GET _parts 0 _ctestname)
-    list(GET _parts 1 _testfn)
-    list(GET _parts 2 _extraenv)
-
-    set(_case_env "${_env};GST_CHECKS=${_testfn}")
-    if(NOT _extraenv STREQUAL "")
-      set(_case_env "${_case_env};${_extraenv}")
-    endif()
-
-    add_test(NAME ${_ctestname} COMMAND ${testexe})
-    set_tests_properties(${_ctestname} PROPERTIES
-      ENVIRONMENT "${_case_env}"
-      # Shares the mock plugin with the other mock variants; keep it off the
-      # shared control-socket resource like the rest under `ctest -j`.
-      RESOURCE_LOCK uvc_control_socket
-      TIMEOUT 120
-    )
-  endforeach()
+  # GST_PLUGIN_PATH (PREPEND_ENV) points the test at the mock-backed plugin; the
+  # standard ASAN_OPTIONS / TSAN_OPTIONS (tsan.suppressions) come from the helper.
+  # Shares the mock plugin with the other mock variants; keep it off the shared
+  # control-socket resource like the rest (RESOURCE_LOCK, applied by helper).
+  add_gstcheck_multicase_test(${testexe} "functional" "${sanitizer}"
+    "${_functional_cases}" PREPEND_ENV "GST_PLUGIN_PATH=${plugdir}")
 endfunction()
 
 add_functional_variant("" "")
@@ -1078,25 +985,7 @@ endif()
 #   reconnect_resume  reconnect on: the element reopens the device and frames
 #                     resume after a simulated replug instead of erroring.
 # -----------------------------------------------------------------------------
-add_executable(test_reconnect
-  test_reconnect.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_reconnect PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_reconnect PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_reconnect "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_reconnect)
 
 set(_reconnect_cases
   "disconnect_error:test_disconnect_error"
@@ -1106,24 +995,10 @@ set(_reconnect_cases
   "reconnect_backoff_sequence:test_reconnect_backoff_sequence"
   "reconnect_backoff_interrupt:test_reconnect_backoff_interrupt"
 )
-foreach(_case ${_reconnect_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-
-  setup_gst_test_environment("reconnect-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_rc_env ${GST_TEST_ENV})
-  list(APPEND _rc_env "GST_CHECKS=${_testfn}")
-
-  add_test(NAME ${_ctestname} COMMAND test_reconnect)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_rc_env}"
-    # start() may spawn the control thread, so keep these off the shared socket
-    # resource like the other start()-driven suites under `ctest -j`.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# start() may spawn the control thread, so keep these off the shared socket
+# resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_reconnect "reconnect"
+  "${STATIC_SUITE_SANITIZER}" "${_reconnect_cases}")
 
 # -----------------------------------------------------------------------------
 # Reconnect exhaustion teardown-order test (Task 8, harden-v2).
@@ -1294,25 +1169,7 @@ endif()
 #                                      renegotiation (exactly one CAPS event) or a
 #                                      silent drop over the streaming path.
 # -----------------------------------------------------------------------------
-add_executable(test_framerate_mismatch
-  test_framerate_mismatch.c
-  ${_element_srcs}
-  mock_libuvc.c
-)
-target_include_directories(test_framerate_mismatch PRIVATE
-  ${CMAKE_SOURCE_DIR}/libuvch264src/src
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${LIBUVC_EXTRA_INCLUDES}
-  ${LIBUVC_INCLUDE_DIRS}
-)
-target_link_libraries(test_framerate_mismatch PRIVATE
-  PkgConfig::GST
-  PkgConfig::GST_BASE
-  PkgConfig::GST_CHECK
-  PkgConfig::LIBUSB
-  Threads::Threads
-)
-apply_sanitizer_flags(test_framerate_mismatch "${STATIC_SUITE_SANITIZER}")
+add_static_gstcheck_exe(test_framerate_mismatch)
 
 # "<ctest name>:<gst-check test fn>:<extra env>" - one ctest entry each via
 # GST_CHECKS. The no-renegotiate case paces the mock feeder at ~24 fps
@@ -1322,28 +1179,10 @@ set(_framerate_mismatch_cases
   "framerate_mismatch_pts:test_framerate_mismatch_pts:"
   "framerate_mismatch_no_renegotiate:test_framerate_mismatch_no_renegotiate:MOCK_UVC_FRAME_INTERVAL_US=41667"
 )
-foreach(_case ${_framerate_mismatch_cases})
-  string(REPLACE ":" ";" _parts ${_case})
-  list(GET _parts 0 _ctestname)
-  list(GET _parts 1 _testfn)
-  list(GET _parts 2 _extraenv)
-
-  setup_gst_test_environment("framerate-mismatch-${_ctestname}" "${STATIC_SUITE_SANITIZER}")
-  set(_fm_env ${GST_TEST_ENV})
-  list(APPEND _fm_env "GST_CHECKS=${_testfn}")
-  if(NOT _extraenv STREQUAL "")
-    list(APPEND _fm_env "${_extraenv}")
-  endif()
-
-  add_test(NAME ${_ctestname} COMMAND test_framerate_mismatch)
-  set_tests_properties(${_ctestname} PROPERTIES
-    ENVIRONMENT "${_fm_env}"
-    # framerate_mismatch_no_renegotiate enters PLAYING -> start(); keep both off
-    # the shared control-socket resource like the other start()-driven suites.
-    RESOURCE_LOCK uvc_control_socket
-    TIMEOUT 120
-  )
-endforeach()
+# framerate_mismatch_no_renegotiate enters PLAYING -> start(); keep both off the
+# shared control-socket resource like the rest (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_framerate_mismatch "framerate-mismatch"
+  "${STATIC_SUITE_SANITIZER}" "${_framerate_mismatch_cases}")
 
 # -----------------------------------------------------------------------------
 # PAUSED->PLAYING PTS rebaseline continuity test (Task 13, harden-v2).
