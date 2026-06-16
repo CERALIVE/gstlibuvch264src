@@ -504,6 +504,50 @@ add_test(NAME error_map COMMAND test_error_map)
 set_tests_properties(error_map PROPERTIES ENVIRONMENT "${_errmap_env}")
 
 # -----------------------------------------------------------------------------
+# CVE-2026-1991 reproduction harness (Task 9).
+#
+# A standalone C program (NOT a gst-check suite) that links the REAL libuvc and
+# calls the exported uvc_scan_streaming() with a hand-built, malformed
+# libusb_config_descriptor. On a libuvc WITHOUT the CVE-2026-1991 guard each case
+# SIGSEGVs (out-of-range interface index / NULL altsetting dereference); on a
+# patched libuvc each case returns UVC_ERROR_INVALID_DEVICE and the program exits
+# 0. Two argv-selected cases ("oob", "null"), one ctest entry each.
+#
+# This gate exercises the *vendored libuvc*, so it only passes once the consumed
+# libuvc carries the fix (CeraLive fork harden/2026.6: uvc_scan_streaming guard +
+# e001f04 backport). Until the build pins that SHA it reproduces the crash by
+# design. Built with the static-suite sanitizer (ASan when ENABLE_SANITIZERS=ON)
+# for a clean fault backtrace; the SIGSEGV is deterministic with or without ASan.
+# -----------------------------------------------------------------------------
+add_executable(test_cve_2026_1991 test_cve_2026_1991.c)
+target_include_directories(test_cve_2026_1991 PRIVATE
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+  ${LIBUSB_INCLUDE_DIRS}
+)
+target_link_libraries(test_cve_2026_1991 PRIVATE
+  PkgConfig::LIBUSB
+  ${LIBUVC_LINK_TARGET}
+)
+apply_sanitizer_flags(test_cve_2026_1991 "${STATIC_SUITE_SANITIZER}")
+
+# Make a vendored libuvc resolvable at run time (built via FetchContent/script).
+set(_cve_env "")
+if(LIBUVC_RUNTIME_DIR)
+  list(APPEND _cve_env "LD_LIBRARY_PATH=${LIBUVC_RUNTIME_DIR}")
+endif()
+if(STATIC_SUITE_SANITIZER STREQUAL "address")
+  list(APPEND _cve_env "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1")
+endif()
+
+add_test(NAME cve_2026_1991_oob COMMAND test_cve_2026_1991 oob)
+add_test(NAME cve_2026_1991_null COMMAND test_cve_2026_1991 null)
+set_tests_properties(cve_2026_1991_oob cve_2026_1991_null PROPERTIES
+  ENVIRONMENT "${_cve_env}"
+  TIMEOUT 30
+)
+
+# -----------------------------------------------------------------------------
 # SPS/PPS/VPS bounds-clamp regression (C1, heap overflow). Reuses the mock-backed
 # plugin built by add_mock_harness_variant, but runs the feeder in oversized-SPS
 # mode so an unclamped NAL copy would smash the element's fixed 1024 B SPS
