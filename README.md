@@ -4,7 +4,7 @@ GStreamer source element for UVC H.264 (and H.265) capture devices — DJI actio
 
 Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths bypass this element entirely.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `90cc679` and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (tag `ceralive-v0.0.7.2`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 ---
 

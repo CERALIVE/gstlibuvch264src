@@ -33,7 +33,7 @@ codepaths ported from upstream BELABOX.
 
 ## cve-2026-1991-scan-streaming-nullguard.patch
 
-Mirrors the CeraLive fork's CVE-2026-1991 fix (fork commit `90cc679`) into the
+Mirrors the CeraLive fork's CVE-2026-1991 fix (fork commit `eae7f49`) into the
 upstream rollback path, so a `LIBUVC_USE_FORK=OFF` build is **not** a
 regress-to-vulnerable escape hatch. Two changes in `src/device.c`:
 
