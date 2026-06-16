@@ -1,0 +1,28 @@
+# ThreadSanitizer suppressions for test_cache_race.c.
+#
+# What this test exercises: store_spspps() runs on the libuvc callback thread
+# and reads self->index (a gchar*); set_property(PROP_INDEX) g_free()s and
+# replaces it on the application thread. The fix snapshots the cache key under
+# GST_OBJECT_LOCK (spspps_key_snapshot) and takes the same object lock in
+# set_property/get_property.
+#
+# Why the index/snapshot races below are suppressed: GST_OBJECT_LOCK is a
+# GMutex, and on Linux GLib implements GMutex with a raw futex inside
+# uninstrumented libglib. Under ignore_noninstrumented_modules=1 TSan cannot
+# observe that happens-before, so it reports the *correctly locked* index
+# accesses as races anyway. The lock's correctness is verified by the ASan
+# variant (which aborts on the use-after-free if the lock is absent) and by
+# the behavioural teeth: the run must complete with no crash and the cache
+# writer must have actually run.
+race:spspps_key_snapshot
+race:gst_libuvc_h264_src_set_property
+race:gst_libuvc_h264_src_get_property
+
+# GStreamer/GLib/libcheck are not built with -fsanitize=thread, so their
+# internal synchronization is invisible and surfaces as false positives.
+called_from_lib:libglib-2.0
+called_from_lib:libgobject-2.0
+called_from_lib:libgthread-2.0
+called_from_lib:libgstreamer-1.0
+called_from_lib:libgstbase-1.0
+called_from_lib:libgstcheck-1.0
