@@ -2,7 +2,7 @@
 
 GStreamer source element that pulls H.264 frames directly from DJI action cameras and UVC devices via libuvc. Developed by UnlimitedIRL; forked/maintained under CeraLive.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `90cc679` and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (tag `ceralive-v0.0.7.2`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 Parent manifest: [`../AGENTS.md`](../AGENTS.md)
 
@@ -78,7 +78,7 @@ gstlibuvch264src/
 
 > `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
 > `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
-> (`90cc679`, branch `harden/2026.6`) — no patch step needed. With
+> (`eae7f49` on `main`, tag `ceralive-v0.0.7.2`) — no patch step needed. With
 > `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
 > (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
 > `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
@@ -238,7 +238,7 @@ The `Dockerfile` pins both the base image and the libuvc source:
 FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 ```
 
-libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `90cc679`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
+libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `eae7f49`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
 ---
 
