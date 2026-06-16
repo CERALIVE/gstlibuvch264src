@@ -222,6 +222,61 @@ add_test(NAME cache_resolution_key COMMAND test_cache key)
 add_test(NAME cache_selector_key COMMAND test_cache selector)
 
 # -----------------------------------------------------------------------------
+# SPS/PPS cache index race test (Task 3).
+#
+# Statically links element TUs + mock (same shape as test_pts_thread_safety) so
+# both the cache-writer thread and the main-thread g_object_set(index) run
+# instrumented. ASan variant proves the snapshot-under-lock prevents the
+# use-after-free; TSan variant uses tsan_cache.suppressions (scoped to the
+# GST_OBJECT_LOCK blind spot on the index functions only).
+# -----------------------------------------------------------------------------
+function(add_cache_race_variant variant sanitizer)
+  if(variant STREQUAL "")
+    set(suffix "")
+  else()
+    set(suffix "_${variant}")
+  endif()
+
+  set(testexe "test_cache_race${suffix}")
+
+  add_executable(${testexe}
+    test_cache_race.c
+    ${_element_srcs}
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
+    mock_libuvc.c
+  )
+  target_include_directories(${testexe} PRIVATE
+    ${CMAKE_SOURCE_DIR}/libuvch264src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBUVC_EXTRA_INCLUDES}
+    ${LIBUVC_INCLUDE_DIRS}
+  )
+  target_link_libraries(${testexe} PRIVATE
+    PkgConfig::GST
+    PkgConfig::GST_BASE
+    PkgConfig::GST_CHECK
+    PkgConfig::LIBUSB
+    Threads::Threads
+  )
+  apply_sanitizer_flags(${testexe} "${sanitizer}")
+
+  set(_cache_race_cases
+    "cache_index_race${suffix}:test_index_cache_race"
+  )
+  set(_cache_race_extra "")
+  if(sanitizer STREQUAL "thread")
+    set(_cache_race_extra APPEND_ENV
+      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_cache.suppressions:halt_on_error=1:ignore_noninstrumented_modules=1")
+  endif()
+  add_gstcheck_multicase_test(${testexe} "cache_race" "" "${_cache_race_cases}" ${_cache_race_extra})
+endfunction()
+
+add_cache_race_variant("" "address")
+if(ENABLE_SANITIZERS)
+  add_cache_race_variant("tsan" "thread")
+endif()
+
+# -----------------------------------------------------------------------------
 # Mock streaming harness.
 #
 # A second, mock-backed copy of the plugin links the element's own translation
