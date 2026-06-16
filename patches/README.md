@@ -31,6 +31,27 @@ H265 fourcc GUID in the format table, includes H265 in the
 H265 frames flow through libuvc's pipeline. Required by the H265
 codepaths ported from upstream BELABOX.
 
+## cve-2026-1991-scan-streaming-nullguard.patch
+
+Mirrors the CeraLive fork's CVE-2026-1991 fix (fork commit `90cc679`) into the
+upstream rollback path, so a `LIBUVC_USE_FORK=OFF` build is **not** a
+regress-to-vulnerable escape hatch. Two changes in `src/device.c`:
+
+1. `uvc_scan_streaming()` gains two early-return guards before the
+   `info->config->interface[interface_idx].altsetting[0]` dereference. The
+   `interface_idx` argument comes straight from an attacker-controlled
+   VideoControl HEADER byte (`baInterfaceNr`) with no validation, so a malformed
+   descriptor can index `interface[]` out of bounds (`interface_idx >=
+   bNumInterfaces`) or reach an interface with no altsetting (`num_altsetting <
+   1` / `altsetting == NULL`). Both are rejected with `UVC_ERROR_INVALID_DEVICE`.
+2. `uvc_scan_control()` wraps `get_device_descriptor()` in a `== UVC_SUCCESS`
+   check (upstream backport `e001f04`) so a failed descriptor fetch no longer
+   dereferences/frees an uninitialised `dev_desc`.
+
+Apply this patch **last**, after `uvc15-support.patch` (which shifts the
+surrounding line numbers in `device.c`). The reproduction harness
+`tests/test_cve_2026_1991.c` exercises both guarded paths.
+
 ## Apply (host build)
 
 ```sh
@@ -39,6 +60,7 @@ cd libuvc
 git checkout v0.0.7
 patch -p1 < /path/to/gstlibuvch264src/patches/uvc15-support.patch
 patch -p1 < /path/to/gstlibuvch264src/patches/libuvc-h265-support.patch
+patch -p1 < /path/to/gstlibuvch264src/patches/cve-2026-1991-scan-streaming-nullguard.patch
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
          -DBUILD_EXAMPLE=OFF -DBUILD_TEST=OFF

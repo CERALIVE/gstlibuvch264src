@@ -126,7 +126,7 @@ git checkout -q -f FETCH_HEAD
 
 # --- Patches (upstream / fallback only) -------------------------------------
 if [ "$APPLY_PATCHES" -eq 1 ]; then
-	for p in uvc15-support.patch libuvc-h265-support.patch; do
+	for p in uvc15-support.patch libuvc-h265-support.patch cve-2026-1991-scan-streaming-nullguard.patch; do
 		patch_file="${PATCH_DIR}/${p}"
 		[ -f "$patch_file" ] || die "patch file missing: ${patch_file}"
 		if patch -p1 --dry-run -R <"$patch_file" >/dev/null 2>&1; then
