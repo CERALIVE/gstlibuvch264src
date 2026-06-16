@@ -57,15 +57,16 @@ Do not use upstream `main` or re-tag from a later upstream commit. The fork base
 - **Clone (HTTPS):** `https://github.com/CeraLive/libuvc.git`
 - **Visibility:** PUBLIC (no auth required to clone)
 - **Default branch:** `main`
-- **Release tag:** `ceralive-v0.0.7.1`
-- **Tag/HEAD commit SHA:** `21bc89ab1010e2bcce90d846a19134500065965e`
+- **Release tag:** `ceralive-v0.0.7.1` (base of the hardening branch; no new tag cut yet)
+- **Hardening branch:** `harden/2026.6`
+- **Tag/HEAD commit SHA:** `90cc67993047cd61d0b0a6c5bb62c4d61125cf80`
 - **Base SHA (provenance only):** `68d07a00e11d1944e27b7295ee69673239c00b4b` — confirmed ancestor of HEAD.
 
 **Pin downstream builds by SHA**, not by branch or tag name (tags/branches are mutable):
 
 ```
 GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
-GIT_TAG        21bc89ab1010e2bcce90d846a19134500065965e   # ceralive-v0.0.7.1
+GIT_TAG        90cc67993047cd61d0b0a6c5bb62c4d61125cf80   # harden/2026.6 (was ceralive-v0.0.7.1 @ 21bc89ab)
 ```
 
 Commit history on the fork (base → HEAD):
@@ -75,7 +76,9 @@ Commit history on the fork (base → HEAD):
 | `68d07a00` | `version 0.0.7` (upstream base, provenance only) |
 | `2f32812`  | `feat(uvc): add UVC 1.5 support and configurable auto-detach kernel driver` |
 | `d460f97`  | `feat(uvc): add H.265/HEVC format support` |
-| `21bc89a`  | `docs(ceralive): record fork provenance and document auto-detach option` |
+| `21bc89a`  | `docs(ceralive): record fork provenance and document auto-detach option` (tag `ceralive-v0.0.7.1`) |
+| `26ec74a`  | `fix(stream): accept smaller max payloads than requested (backport upstream 047920b)` |
+| `90cc679`  | `fix(security): guard uvc_scan_streaming NULL-deref (CVE-2026-1991) + backport e001f04` (current pin, branch `harden/2026.6`) |
 
 The `LIBUVC_AUTO_DETACH_KERNEL_DRIVER` CMake option (Hunk A caveat) is implemented
 in commit `2f32812` (default `ON`); the UVC 1.5 header (Hunk B) and H.265 support
