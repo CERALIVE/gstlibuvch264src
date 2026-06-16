@@ -4,6 +4,8 @@ GStreamer source element for UVC H.264 (and H.265) capture devices — DJI actio
 
 Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths bypass this element entirely.
 
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `90cc679` and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+
 ---
 
 ## Example Pipelines
@@ -288,6 +290,7 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `control-socket` | bool | `false` | Enable opt-in Unix-domain PTZ control socket (default off) |
 | `control-socket-path` | string | `null` | Explicit socket path; auto-selects `$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock` when null |
 | `reconnect` | bool | `false` | Auto-reconnect on mid-stream disconnect with exponential backoff (default off) |
+| `max-payload` | uint | `0` | USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`); `0` = device default; nonzero clamped to `[512, 4194304]` with read-back |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 
@@ -300,21 +303,17 @@ sudo apt install build-essential cmake git meson pkg-config
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 sudo apt install libusb-1.0-0 libusb-1.0-0-dev
 
-# 1. Clone libuvc at the pinned SHA
-git init libuvc && cd libuvc
-git remote add origin https://github.com/libuvc/libuvc.git
-git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b
-git checkout FETCH_HEAD
-cd ..
+# 1. Build libuvc (CeraLive fork, default) — no patch step needed
+scripts/build-libuvc.sh
 
-# 2. Build and install libuvc
-cd libuvc && cmake . && make && sudo make install && cd ..
+# To use upstream v0.0.7 + patches fallback instead:
+# LIBUVC_USE_FORK=OFF scripts/build-libuvc.sh
 
-# 3. Build the plugin
+# 2. Build the plugin
 meson setup build libuvch264src/
 cd build && meson compile && meson install
 
-# 4. Move .so to the system GStreamer path (multiarch-aware)
+# 3. Move .so to the system GStreamer path (multiarch-aware)
 MULTIARCH=$(gcc -print-multiarch)
 sudo mv /usr/local/lib/${MULTIARCH}/gstreamer-1.0/libgstlibuvch264src.so \
         /lib/${MULTIARCH}/gstreamer-1.0/
