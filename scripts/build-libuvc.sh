@@ -36,7 +36,7 @@ set -euo pipefail
 
 # --- Pinned coordinates — the ONLY place these SHAs/URLs live ----------------
 FORK_URL="https://github.com/CeraLive/libuvc.git"
-FORK_SHA="90cc67993047cd61d0b0a6c5bb62c4d61125cf80"      # branch harden/2026.6 (hardened: CVE-2026-1991 guard + 047920b + e001f04; was tag ceralive-v0.0.7.1 @ 21bc89ab)
+FORK_SHA="eae7f49c2978b6cdb21edc61fde006195588fec7"      # main (hardened: CVE-2026-1991 guard + 047920b + e001f04; rebased onto main from harden/2026.6, tag ceralive-v0.0.7.2)
 UPSTREAM_URL="https://github.com/libuvc/libuvc.git"
 UPSTREAM_SHA="68d07a00e11d1944e27b7295ee69673239c00b4b"  # v0.0.7 base
 
