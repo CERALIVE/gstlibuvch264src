@@ -2,6 +2,8 @@
 
 GStreamer source element that pulls H.264 frames directly from DJI action cameras and UVC devices via libuvc. Developed by UnlimitedIRL; forked/maintained under CeraLive.
 
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `90cc679` and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+
 Parent manifest: [`../AGENTS.md`](../AGENTS.md)
 
 ---
@@ -33,7 +35,12 @@ gstlibuvch264src/
 │   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
 │   │   └── uvc_device.{c,h}            # USB teardown helper + V4L2 capability probe
 │   ├── docs/notes/
-│   │   └── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
+│   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
+│   │   ├── bmaxpayload-analysis.md     # max-payload bandwidth tuning analysis
+│   │   ├── dji-xu-investigation.md     # DJI XU control investigation (report only; no code shipped)
+│   │   ├── v4l2src-spike.md            # v4l2src evaluation spike (report only; no code shipped)
+│   │   ├── scr-investigation.md        # SCR-based PTS investigation (verdict: SCR-ABSENT; no code change)
+│   │   └── libuvc-fork-adr.md          # ADR: CeraLive fork as canonical libuvc dependency
 │   └── meson.build                     # Canonical production build
 ├── tests/                   # Hardware-independent ctest suite (mock-backed)
 │   ├── mock_libuvc.{c,h}    # libuvc mock (~16 fns); env/API config; PTZ + descriptor support
@@ -53,18 +60,29 @@ gstlibuvch264src/
 │   ├── test_cache.c         # SPS/PPS cache path safety + resolution key
 │   ├── test_error_map.c     # uvc_error_t → GST_ELEMENT_ERROR mapping
 │   ├── test_v4l2_probe.c    # V4L2 VIDIOC_TRY_FMT probe (non-fatal)
+│   ├── test_compat.c        # API compatibility: property existence + type assertions
+│   ├── test_cve_2026_1991.c # CVE-2026-1991 regression: null-deref guard in scan-streaming path
+│   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
+│   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
 │   ├── tsan.suppressions    # TSan suppressions for third-party + baselined GMutex blind spots
 │   └── tsan_pts.suppressions# TSan suppressions for PTS/clock GMutex (permanent blind spot)
-├── patches/                 # libuvc v0.0.7 patches (UVC 1.5 + H.265), applied at build
+├── patches/                 # libuvc patches for the upstream fallback path (LIBUVC_USE_FORK=OFF)
+│   ├── cve-2026-1991-scan-streaming-nullguard.patch  # CVE-2026-1991 null-deref fix (upstream fallback)
+│   ├── uvc15-support.patch  # UVC 1.5 support
+│   ├── libuvc-h265-support.patch  # H.265 stream format support
+│   └── README.md
 ├── CMakeLists.txt           # TEST-ONLY build: compiles plugin + full ctest suite
 ├── Dockerfile               # Reproducible build environment (pinned ubuntu:24.04 + libuvc SHA)
 └── README.md
 ```
 
-> `libuvc/` is no longer vendored in-tree — it is cloned at the pinned SHA
-> (`68d07a00e11d1944e27b7295ee69673239c00b4b`, upstream v0.0.7) and patched at
-> build time. The Dockerfile does this for the production image; the top-level
-> `CMakeLists.txt` does the same via `FetchContent` for the test build.
+> `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
+> `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
+> (`90cc679`, branch `harden/2026.6`) — no patch step needed. With
+> `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
+> (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
+> `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
+> top-level `CMakeLists.txt` both delegate to this script.
 
 ---
 
@@ -81,6 +99,11 @@ gstlibuvch264src/
 | Meson build config | `libuvch264src/meson.build` |
 | Build environment | `Dockerfile` |
 | Reconnect feasibility verdict | `libuvch264src/docs/notes/reconnect-spike.md` |
+| max-payload tuning analysis | `libuvch264src/docs/notes/bmaxpayload-analysis.md` |
+| DJI XU investigation (report only) | `libuvch264src/docs/notes/dji-xu-investigation.md` |
+| v4l2src evaluation spike (report only) | `libuvch264src/docs/notes/v4l2src-spike.md` |
+| SCR/PTS investigation (verdict: SCR-ABSENT) | `libuvch264src/docs/notes/scr-investigation.md` |
+| libuvc fork ADR | `libuvch264src/docs/notes/libuvc-fork-adr.md` |
 | Example pipelines | `README.md` |
 
 ---
@@ -130,6 +153,10 @@ Read this property back after `PAUSED` to discover the resolved path.
 
 Opt-in in-element auto-reconnect on a mid-stream disconnect. Default is **off**: a disconnect always posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and ends the stream. When set to `true`, the element first attempts a bounded-backoff teardown/reopen (see DISCONNECT / RECONNECT BEHAVIOR) and only errors out if every retry is exhausted. Gated on the Task 4 spike verdict (`libuvch264src/docs/notes/reconnect-spike.md`).
 
+### `max-payload` (uint, range 0..4194304, default `0`)
+
+USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`). `0` (the default) leaves the device-negotiated value unchanged. A nonzero value is clamped to `[512, 4194304]`, applied via UVC probe/commit with read-back, and falls back to the device-negotiated value if the device refuses it. Read-back reports the effective committed value. See `libuvch264src/docs/notes/bmaxpayload-analysis.md` for tuning guidance.
+
 ### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
 
 Drives all three PTZ axes in one emission. Each axis is applied only when the device reports it. Returns `TRUE` if at least one supported axis was driven and every attempted set succeeded.
@@ -175,22 +202,17 @@ The probe is **non-fatal** in all cases. A mismatch between the UVC ordinal and 
 ### Production build (Meson, canonical)
 
 ```bash
-# 1. Clone and patch libuvc at the pinned SHA
-git init libuvc && cd libuvc
-git remote add origin https://github.com/libuvc/libuvc.git
-git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b
-git checkout FETCH_HEAD
-# Apply patches from ../patches/
-cd ..
+# 1. Build libuvc (CeraLive fork, default) — no patch step needed
+scripts/build-libuvc.sh
 
-# 2. Build libuvc
-cd libuvc && cmake . && make && sudo make install && cd ..
+# To use upstream v0.0.7 + patches fallback instead:
+# LIBUVC_USE_FORK=OFF scripts/build-libuvc.sh
 
-# 3. Build plugin
+# 2. Build plugin
 meson setup build libuvch264src/
 cd build && meson compile && meson install
 
-# 4. Move .so to system GStreamer path (multiarch-aware)
+# 3. Move .so to system GStreamer path (multiarch-aware)
 MULTIARCH=$(gcc -print-multiarch)
 sudo mv /usr/local/lib/${MULTIARCH}/gstreamer-1.0/libgstlibuvch264src.so \
         /lib/${MULTIARCH}/gstreamer-1.0/
@@ -216,7 +238,7 @@ The `Dockerfile` pins both the base image and the libuvc source:
 FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 ```
 
-libuvc is fetched by SHA (`68d07a00e11d1944e27b7295ee69673239c00b4b`) using the `git init` + `fetch --depth 1` pattern (a bare SHA cannot be passed to `git clone --branch`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
+libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `90cc679`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
 ---
 
@@ -274,9 +296,8 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 
 ## ANTI-PATTERNS
 
-- **DO NOT heavily modify `libuvc/`** — vendored upstream library. Patch minimally; prefer upgrading the whole vendor snapshot if fixes are needed.
-- Do NOT create `libuvc/AGENTS.md` — vendored code, not a CeraLive module.
-- Do NOT link against system libuvc if it exists; the vendored copy is intentional for version pinning.
+- Do NOT link against system libuvc if it exists; the pinned fork/upstream copy is intentional for version pinning.
+- Do NOT modify `scripts/build-libuvc.sh` SHA constants without updating both `FORK_SHA` and `UPSTREAM_SHA` together — they are the single source of truth for the dependency.
 - Do NOT hardcode `aarch64-linux-gnu` in build paths — use `$(gcc -print-multiarch)`.
 - Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
 - Do NOT enable `control-socket` by default or fall back to a world-accessible path when `XDG_RUNTIME_DIR` is unset — the socket must be opt-in and per-instance.
