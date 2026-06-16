@@ -6,6 +6,9 @@ Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths
 
 > **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (tag `ceralive-v0.0.7.2`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
+[![CI](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml)
+[![Release](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml)
+
 ---
 
 ## Example Pipelines
