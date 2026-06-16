@@ -62,48 +62,24 @@ WORKDIR /app/build
 RUN meson compile
 RUN meson install --no-rebuild
 
-# --- Second Stage: Create a smaller image for just the plugin ---
-# Same pinned digest as the build stage (see note above).
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54 AS runtime
-
-# Multi-architecture support
+# Stage the runtime payload — only the plugin .so + libuvc.so* — under /out,
+# mirroring the on-device /usr layout. cp -a preserves the libuvc.so symlink
+# chain; the libuvc.a/.pc are build-only and excluded. TARGETARCH is a
+# buildx-predefined arg, re-declared here so the RUN can read it.
 ARG TARGETARCH
-
-# Install runtime dependencies (GStreamer)
-# TODO(libjpeg runtime gap): libuvc is built with libjpeg-dev present in the
-# build stage, so libuvc.so* carries a DT_NEEDED on libjpeg.so.8 — but this
-# runtime stage does not install libjpeg, so loading the plugin here would fail
-# on a missing libjpeg.so.8. Out of scope for Task 22 (build unification); add
-# `libjpeg-turbo8` (or build libuvc without JPEG) in a follow-up before relying
-# on this runtime image.
-RUN apt-get update && apt-get install -y \
-	libgstreamer1.0-0 \
-	libgstreamer-plugins-base1.0-0 \
-	libusb-1.0-0 \
-	&& rm -rf /var/lib/apt/lists/*
-
-# Map TARGETARCH ("arm64"/"amd64") to the GNU multiarch triplet and create the
-# destination directory under /usr. Everything must live under /usr so the
-# build-check workflow finds build/usr/lib/*/gstreamer-1.0/ and the release
-# workflow packages build/usr/=/usr/.
 RUN GNUARCH=$(case "${TARGETARCH}" in \
 	"arm64") echo "aarch64-linux-gnu" ;; \
 	"amd64") echo "x86_64-linux-gnu" ;; \
 	*) echo "Unsupported architecture: '${TARGETARCH}' (expected arm64 or amd64)" >&2; exit 1 ;; \
 	esac) && \
-	mkdir -p /usr/lib/${GNUARCH}/gstreamer-1.0 && \
-	echo "${GNUARCH}" > /tmp/gnuarch
+	mkdir -p /out/usr/lib/${GNUARCH}/gstreamer-1.0 && \
+	cp -a /usr/local/lib/*/gstreamer-1.0/libgstlibuvch264src.so /out/usr/lib/${GNUARCH}/gstreamer-1.0/ && \
+	cp -a /usr/local/lib/libuvc.so* /out/usr/lib/${GNUARCH}/
 
-# Copy the built GStreamer plugin and libuvc from the build stage. meson
-# installs the plugin under /usr/local/lib/<triplet>/gstreamer-1.0/ and libuvc
-# installs flat under /usr/local/lib/; relocate both under /usr/lib/<triplet>/
-# while preserving the libgstlibuvch264src.so / libuvc.so* file names.
-# TODO(Task 22): unify with scripts/build-libuvc.sh --prefix option so the
-# install prefix is set once at meson setup time and this manual relocation
-# (and the matching copy in CMakeLists.txt) can be dropped.
-COPY --from=build /usr/local/lib/*/gstreamer-1.0/libgstlibuvch264src.so /tmp/stage/
-COPY --from=build /usr/local/lib/libuvc.* /tmp/stage/
-RUN GNUARCH=$(cat /tmp/gnuarch) && \
-	mv /tmp/stage/libgstlibuvch264src.so /usr/lib/${GNUARCH}/gstreamer-1.0/ && \
-	mv /tmp/stage/libuvc.* /usr/lib/${GNUARCH}/ && \
-	rm -rf /tmp/stage /tmp/gnuarch
+# Runtime stage MUST stay `FROM scratch`. The release workflow exports this final
+# stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`).
+# An ubuntu stage here exported the entire distro /usr, producing a ~56 MB .deb
+# that dpkg-file-conflicts with coreutils/libc on install. GStreamer/libusb/libjpeg
+# are runtime deps from the target system (see package Depends), not bundled.
+FROM scratch AS runtime
+COPY --from=build /out/ /
