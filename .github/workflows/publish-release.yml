@@ -12,6 +12,9 @@ on:
           - beta
         default: stable
 
+permissions:
+  contents: write
+
 jobs:
   calculate-version:
     name: Calculate Version
