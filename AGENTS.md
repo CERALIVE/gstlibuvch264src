@@ -240,6 +240,8 @@ FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae
 
 libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `eae7f49`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
+**Two stages: pinned-ubuntu `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to an Ubuntu base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (package `Depends: libgstreamer1.0-0`), not bundled in the image.
+
 ---
 
 ## TEST
