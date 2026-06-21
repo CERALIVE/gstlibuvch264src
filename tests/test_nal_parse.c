@@ -18,6 +18,7 @@
  */
 
 #include <glib.h>
+#include <gst/gst.h>
 #include <stdio.h>
 #include <string.h>
 #include <libuvc/libuvc.h>
@@ -688,11 +689,74 @@ static int run_fuzz_seed(void) {
     return g_failures;
 }
 
+/* Counter raised by overflow_log_fn whenever the parser's truncation GST_WARNING
+   reaches the debug system. Asserting on it - not merely on "no crash" - is what
+   proves the warning is actually emitted when the NAL count exceeds max. */
+static int g_overflow_warnings;
+
+static void overflow_log_fn(GstDebugCategory *category, GstDebugLevel level,
+                            const gchar *file, const gchar *function, gint line,
+                            GObject *object, GstDebugMessage *message,
+                            gpointer user_data) {
+    (void)category; (void)file; (void)function; (void)line;
+    (void)object; (void)user_data;
+    if (level == GST_LEVEL_WARNING) {
+        const gchar *text = gst_debug_message_get(message);
+        if (text && strstr(text, "exceeds max") != NULL) g_overflow_warnings++;
+    }
+}
+
+static int run_nal_overflow(void) {
+    enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H264;
+
+    /* SPS + PPS + IDR + 2 non-IDR slices = 5 NAL units. */
+    gsize size = (4 + 1 + 8) + (4 + 1 + 4) + (4 + 1 + 16) + 2 * (4 + 1 + 8);
+    unsigned char *buf = g_malloc(size);
+    gsize pos = 0;
+    pos = append_nal(buf, pos, 4, NH_SPS, 8);
+    pos = append_nal(buf, pos, 4, NH_PPS, 4);
+    pos = append_nal(buf, pos, 4, NH_IDR, 16);
+    pos = append_nal(buf, pos, 4, NH_NONIDR, 8);
+    pos = append_nal(buf, pos, 4, NH_NONIDR, 8);
+    CHECK(pos == size, "overflow buffer filled to its exact length");
+    CHECK(count_nal_units(fmt, buf, size) == 5, "count_nal_units sees all 5 units");
+
+    /* Raise the category threshold (default NONE keeps the warning suppressed)
+       and route it into our counter. */
+    gst_debug_category_set_threshold(gst_libuvc_h264_src_debug, GST_LEVEL_WARNING);
+    gst_debug_add_log_function(overflow_log_fn, NULL, NULL);
+
+    g_overflow_warnings = 0;
+    nal_unit_t small_units[3];
+    gsize c = parse_nal_units(fmt, small_units, 3, buf, size);
+    CHECK(c == 3, "parse_nal_units returns exactly max when truncating");
+    CHECK(g_overflow_warnings >= 1, "truncation warning emitted when count > max");
+
+    g_overflow_warnings = 0;
+    nal_unit_t exact_units[5];
+    gsize c2 = parse_nal_units(fmt, exact_units, 5, buf, size);
+    CHECK(c2 == 5, "parse_nal_units returns every unit when max == count");
+    CHECK(g_overflow_warnings == 0, "no warning when max == count");
+
+    g_overflow_warnings = 0;
+    nal_unit_t big_units[8];
+    gsize c3 = parse_nal_units(fmt, big_units, 8, buf, size);
+    CHECK(c3 == 5, "parse_nal_units returns every unit when max > count");
+    CHECK(g_overflow_warnings == 0, "no warning when max > count");
+
+    gst_debug_remove_log_function(overflow_log_fn);
+    g_free(buf);
+    return g_failures;
+}
+
 int main(int argc, char **argv) {
+    gst_init(&argc, &argv);
+    GST_DEBUG_CATEGORY_INIT(gst_libuvc_h264_src_debug, "libuvch264src", 0,
+                            "libuvch264src NAL parser test");
     if (argc < 2) {
         fprintf(stderr, "usage: %s <multislice|startcode|bounds|"
                         "multislice_h265|startcode_h265|bounds_h265|"
-                        "store_bounds|fuzz_seed>\n", argv[0]);
+                        "store_bounds|fuzz_seed|overflow>\n", argv[0]);
         return 2;
     }
 
@@ -721,6 +785,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "fuzz_seed") == 0) {
         printf("nal_parse fuzz_seed:\n");
         failures = run_fuzz_seed();
+    } else if (strcmp(argv[1], "overflow") == 0) {
+        printf("nal_parse overflow:\n");
+        failures = run_nal_overflow();
     } else {
         fprintf(stderr, "unknown suite: %s\n", argv[1]);
         return 2;

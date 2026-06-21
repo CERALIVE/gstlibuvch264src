@@ -1053,7 +1053,7 @@ function(add_nal_parse_variant variant sanitizer)
 
   foreach(_suite multislice startcode bounds
                  multislice_h265 startcode_h265 bounds_h265
-                 store_bounds fuzz_seed)
+                 store_bounds fuzz_seed overflow)
     add_test(NAME nal_parse_${_suite}${suffix} COMMAND ${testexe} ${_suite})
     if(_nal_env)
       set_tests_properties(nal_parse_${_suite}${suffix} PROPERTIES ENVIRONMENT "${_nal_env}")

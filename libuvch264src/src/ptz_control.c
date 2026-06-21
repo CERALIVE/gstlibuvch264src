@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <errno.h>
 #include "gstlibuvch264src_internal.h"
 #include "ptz_control.h"
 #include "gstlibuvch264src_error.h"
@@ -34,8 +35,11 @@ gboolean gst_libuvc_h264_src_control_socket_bind(GstLibuvcH264Src *self) {
     }
 
     if (strlen(self->control_socket_path) >= sizeof(addr.sun_path)) {
-        GST_ERROR_OBJECT(self, "Control socket path too long: %s",
-                         self->control_socket_path);
+        GST_ERROR_OBJECT(self, "Control socket path too long (%zu bytes; the "
+                         "AF_UNIX sun_path limit is %zu): %s: %s",
+                         strlen(self->control_socket_path),
+                         sizeof(addr.sun_path) - 1, self->control_socket_path,
+                         g_strerror(ENAMETOOLONG));
         return FALSE;
     }
 

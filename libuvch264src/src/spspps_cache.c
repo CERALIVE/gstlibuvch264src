@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include "gstlibuvch264src_internal.h"
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
@@ -64,7 +65,8 @@ static void create_hidden_directory(GstLibuvcH264Src *self) {
     struct stat st;
     if (stat(hidden_dir, &st) == -1) {
         if (mkdir(hidden_dir, 0700) != 0)
-            GST_ERROR_OBJECT(self, "Error creating directory %s\n", hidden_dir);
+            GST_ERROR_OBJECT(self, "Failed to create SPS/PPS cache directory %s: %s",
+                             hidden_dir, g_strerror(errno));
         else
             GST_WARNING_OBJECT(self, "Directory %s created successfully.\n", hidden_dir);
     } else if (!S_ISDIR(st.st_mode))

@@ -128,6 +128,15 @@ gsize parse_nal_units(enum uvc_frame_format format,
         i++;
     }
 
+    /* next_type >= 0 here can only mean the loop stopped on i == max with a NAL
+       still pending: the array was under-sized and the tail is dropped. Log it
+       rather than truncate silently (diagnostic only; return value unchanged). */
+    if (next_type >= 0) {
+        GST_WARNING("NAL unit count exceeds max=%" G_GSIZE_FORMAT "; stored %"
+                    G_GSIZE_FORMAT " unit(s) and dropped the remainder. "
+                    "Size the array with count_nal_units().", max, i);
+    }
+
     return i;
 }
 
