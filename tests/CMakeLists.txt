@@ -1005,6 +1005,8 @@ set(_live_source_cases
   "live_source_latency_pre_negotiate:test_latency_pre_negotiate:"
   "spspps_write_on_change:test_spspps_write_on_change:"
   "cache_h265_vps_write_on_change:test_h265_vps_write_on_change:MOCK_UVC_FRAME_FORMAT=H265"
+  "spspps_key_snapshot:test_spspps_key_snapshot:"
+  "cache_open_null_path:test_cache_open_null_path:"
 )
 # start() may spawn the control thread, so keep these off the shared socket
 # resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
@@ -1053,7 +1055,7 @@ function(add_nal_parse_variant variant sanitizer)
 
   foreach(_suite multislice startcode bounds
                  multislice_h265 startcode_h265 bounds_h265
-                 store_bounds fuzz_seed overflow)
+                 store_bounds fuzz_seed overflow count_bound)
     add_test(NAME nal_parse_${_suite}${suffix} COMMAND ${testexe} ${_suite})
     if(_nal_env)
       set_tests_properties(nal_parse_${_suite}${suffix} PROPERTIES ENVIRONMENT "${_nal_env}")

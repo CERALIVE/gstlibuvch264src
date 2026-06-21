@@ -749,6 +749,43 @@ static int run_nal_overflow(void) {
     return g_failures;
 }
 
+/* count_nal_units is the sizing primitive every caller relies on: it must equal
+   the real unit number and bound parse_nal_units so a sized-to-count array gets
+   every unit and no oversized `max` ever makes parse exceed the real count. */
+static int run_nal_count_bound(void) {
+    enum uvc_frame_format fmt = UVC_FRAME_FORMAT_H264;
+
+    gsize size = (4 + 1 + 8) + (4 + 1 + 4) + (4 + 1 + 16);
+    for (int s = 0; s < 17; s++) size += (4 + 1 + 8);
+    unsigned char *buf = g_malloc(size);
+    gsize pos = 0;
+    pos = append_nal(buf, pos, 4, NH_SPS, 8);
+    pos = append_nal(buf, pos, 4, NH_PPS, 4);
+    pos = append_nal(buf, pos, 4, NH_IDR, 16);
+    for (int s = 0; s < 17; s++) pos = append_nal(buf, pos, 4, NH_NONIDR, 8);
+    CHECK(pos == size, "count-bound buffer filled to its exact length");
+
+    gsize total = count_nal_units(fmt, buf, size);
+    CHECK(total == 20, "count_nal_units returns the exact unit count (20)");
+
+    nal_unit_t *units = g_new(nal_unit_t, total);
+    gsize c = parse_nal_units(fmt, units, total, buf, size);
+    CHECK(c == total, "parse_nal_units sized to count returns exactly count");
+
+    gsize over = parse_nal_units(fmt, units, total + 50, buf, size);
+    CHECK(over == total, "parse never exceeds the real count even with a larger max");
+
+    gsize half = parse_nal_units(fmt, units, total / 2, buf, size);
+    CHECK(half == total / 2, "a smaller max bounds the result below count");
+    CHECK(half <= total, "the bounded result never exceeds count");
+
+    CHECK(count_nal_units(fmt, buf, 0) == 0, "zero-length buffer counts 0");
+
+    g_free(units);
+    g_free(buf);
+    return g_failures;
+}
+
 int main(int argc, char **argv) {
     gst_init(&argc, &argv);
     GST_DEBUG_CATEGORY_INIT(gst_libuvc_h264_src_debug, "libuvch264src", 0,
@@ -788,6 +825,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "overflow") == 0) {
         printf("nal_parse overflow:\n");
         failures = run_nal_overflow();
+    } else if (strcmp(argv[1], "count_bound") == 0) {
+        printf("nal_parse count_bound:\n");
+        failures = run_nal_count_bound();
     } else {
         fprintf(stderr, "unknown suite: %s\n", argv[1]);
         return 2;
