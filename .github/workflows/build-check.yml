@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.config.arch }}
@@ -19,17 +26,19 @@ jobs:
             runner: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build with Docker
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           outputs: build
           platforms: linux/${{ matrix.config.arch }}
+          cache-from: type=gha,scope=${{ matrix.config.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.config.arch }}
 
       - name: Verify plugin was built
         run: |
@@ -37,17 +46,19 @@ jobs:
 
       - name: Build Summary
         run: |
-          echo "## ✅ Build Check Passed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Architecture:** ${{ matrix.config.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Runner:** ${{ matrix.config.runner }}" >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## ✅ Build Check Passed
+
+          **Architecture:** ${{ matrix.config.arch }}
+          **Runner:** ${{ matrix.config.runner }}
+          EOF
 
   fork-guard:
     name: Fork pin + capability + source-list guard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The fork is PUBLIC (see libuvch264src/docs/notes/libuvc-fork-adr.md):
       # the capability check clones CeraLive/libuvc with NO credentials. Only
@@ -61,16 +72,22 @@ jobs:
       - name: Guard Summary
         if: always()
         run: |
-          echo "## 🔒 Fork + source-list guard" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '`check-source-list.sh` asserts sources.txt agrees with what CMake/Meson compile; `check-libuvc-fork.sh` asserts the pinned fork SHA matches the ADR and the fork carries UVC_FRAME_FORMAT_H265, the 0x0150 UVC 1.5 case, and the LIBUVC_AUTO_DETACH_KERNEL_DRIVER option (capability-presence, not upstream-drift). The fork clone uses no credentials.' >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 🔒 Fork + source-list guard
+
+          `check-source-list.sh` asserts sources.txt agrees with what CMake/Meson compile; `check-libuvc-fork.sh` asserts the pinned fork SHA matches the ADR and the fork carries UVC_FRAME_FORMAT_H265, the 0x0150 UVC 1.5 case, and the LIBUVC_AUTO_DETACH_KERNEL_DRIVER option (capability-presence, not upstream-drift). The fork clone uses no credentials.
+          EOF
 
   reproducibility:
     name: Plugin .so build reproducibility
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install build + GStreamer dev dependencies
         run: |
@@ -85,7 +102,16 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libjpeg-dev \
             libusb-1.0-0-dev \
+            ccache \
             binutils
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-reproducibility-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-reproducibility-
 
       # Builds libgstlibuvch264src.so twice from the same pinned fork SHA and
       # compares sha256sums. Exits non-zero on real non-determinism; a build-id
@@ -97,16 +123,20 @@ jobs:
       - name: Reproducibility Summary
         if: always()
         run: |
-          echo "## ♻️ Build reproducibility" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '`check-reproducibility.sh` built the plugin .so twice and compared sha256sums to confirm a deterministic build (raw match, or byte-identical after normalizing the linker .note.gnu.build-id).' >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## ♻️ Build reproducibility
+
+          `check-reproducibility.sh` built the plugin .so twice and compared sha256sums to confirm a deterministic build (raw match, or byte-identical after normalizing the linker .note.gnu.build-id).
+          EOF
 
   functional-test:
     name: Functional suite + TSan/ASAN (ctest)
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install build + GStreamer dev dependencies
         run: |
@@ -120,14 +150,25 @@ jobs:
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libjpeg-dev \
-            libusb-1.0-0-dev
+            libusb-1.0-0-dev \
+            ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-functional-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-functional-
 
       # ENABLE_SANITIZERS is load-bearing: without it ctest runs only the plain
       # variants, dropping all ASan (SPS/PPS overflow) and TSan (frame/PTS race)
       # coverage. Keep it on so the full hardware-independent suite is gated.
       - name: Configure and build (with sanitizers)
         run: |
-          cmake -B build -DENABLE_SANITIZERS=ON
+          cmake -B build -DENABLE_SANITIZERS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build
 
       - name: Run ctest (full suite incl. TSan/ASAN)
@@ -136,6 +177,8 @@ jobs:
       - name: Functional Test Summary
         if: always()
         run: |
-          echo "## 🔌 Functional test suite (ctest + TSan/ASAN)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '`ctest --test-dir build` ran the full hardware-independent suite against the libuvc mock: plugin-load smoke, mock streaming, lifecycle, device selection, negotiate edges, SPS/PPS overflow (ASan), frame/PTS thread-safety (TSan), and the consolidated functional caps (H.264/H.265) + backpressure suite.' >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 🔌 Functional test suite (ctest + TSan/ASAN)
+
+          `ctest --test-dir build` ran the full hardware-independent suite against the libuvc mock: plugin-load smoke, mock streaming, lifecycle, device selection, negotiate edges, SPS/PPS overflow (ASan), frame/PTS thread-safety (TSan), and the consolidated functional caps (H.264/H.265) + backpressure suite.
+          EOF

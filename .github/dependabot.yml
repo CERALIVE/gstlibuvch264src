@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # C/GStreamer repo: no JS/TS or Rust manifests, so only the GitHub Actions
+  # ecosystem is tracked. Weekly, grouped into one PR; no upstream-fork auto-sync.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
