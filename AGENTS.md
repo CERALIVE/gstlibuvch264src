@@ -269,6 +269,23 @@ ctest --test-dir build -R "ptz_properties|ptz_capability_gate"
 
 **Dual-codec status [EXISTS].** Both H.264 and H.265 pad templates are present and asserted by the test suite. `cerastream` uses this element for both `InputKind::UvcH264` (negotiated to `video/x-h264`) and `InputKind::UvcH265` (negotiated to `video/x-h265`). The `libuvch26xsrc` factory alias reflects this dual-codec capability.
 
+### Hardware-Independent Test Scope
+
+The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in for libuvc and `tests/mock_libusb.c` for libusb, so CI needs no UVC camera. This bounds what the suite can and cannot prove:
+
+**The suite proves (in software, deterministically):**
+- Element registration, pad templates, property/signal surface, and caps negotiation (`test_plugin_load`, `test_compat`, `test_functional`, `test_negotiate`).
+- The pure logic that does NOT depend on a real device: the Annex-B NAL parser and its count/overflow bounds (`test_nal_parse` — including the `overflow` truncation-warning and `count_bound` suites), the SPS/PPS path builder, cache-key snapshot, and the cache file-open NULL/missing-file path (`test_cache`, `test_live_source` `spspps_key_snapshot`/`cache_open_null_path`).
+- Concurrency/teardown invariants observable in-process under sanitizers: the PTS/clock lock (`test_pts_thread_safety` TSan), the SPS/PPS-bounds clamp and cache index race (ASan/TSan), USB single-`libusb_close` teardown (`test_usb_teardown`), and the CVE-2026-1991 null-guard against the vendored libuvc.
+- Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
+
+**The suite does NOT prove (requires real hardware — out of scope here):**
+- Actual USB enumeration, `uvc_open()`/streaming against a physical DJI/UVC camera, real bandwidth at a given `max-payload`, or real PTZ motion on a device.
+- The V4L2 `VIDIOC_TRY_FMT` probe result for a real `/dev/videoN` (the test only asserts the probe is non-fatal when the node is absent).
+- Mid-stream physical replug/reconnect timing (the backoff schedule is asserted via a test hook, not a real unplug).
+
+When adding tests, keep them inside the mock-coverable boundary above — assert software behavior the mock can deterministically drive, never a hardware outcome the mock cannot model. Real-hardware validation tracks separately (see `cerastream/docs/notes/hardware-validation.md` for the device-class profiles).
+
 ---
 
 ## VERSION SCHEME

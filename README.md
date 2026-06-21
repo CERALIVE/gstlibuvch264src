@@ -339,3 +339,65 @@ cmake -B build -DENABLE_SANITIZERS=ON && cmake --build build && ctest --test-dir
 cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
+---
+
+## Troubleshooting
+
+These are manual checks for a real device on real hardware — they are **not** part
+of the (hardware-independent) ctest suite. Work top-down: confirm the library,
+then the plugin, then the device.
+
+### 1. libuvc is present and resolvable
+
+The plugin links the pinned CeraLive libuvc fork. Confirm the shared object and
+its version are visible to the loader:
+
+```bash
+# Is a libuvc resolvable, and which one?
+pkg-config --modversion libuvc 2>/dev/null || echo "libuvc not on pkg-config path"
+ldconfig -p | grep -i libuvc
+
+# What does the installed plugin actually link against?
+MULTIARCH=$(gcc -print-multiarch)
+ldd /lib/${MULTIARCH}/gstreamer-1.0/libgstlibuvch264src.so | grep -i 'libuvc\|not found'
+```
+
+A `libuvc.so* => not found` line means the loader cannot find libuvc — copy it
+to the system lib dir (see **Build Steps** step 3) or add its directory to
+`LD_LIBRARY_PATH`.
+
+### 2. The element is registered with GStreamer
+
+```bash
+gst-inspect-1.0 libuvch264src
+```
+
+This must print the element's factory details (pads, the `index`/`pan`/`tilt`/
+`zoom`/`control-socket`/`reconnect`/`max-payload` properties, and the
+`set-ptz` action signal). If instead you see *"No such element or plugin"*:
+
+- Confirm the `.so` is on the plugin path: `gst-inspect-1.0 --version` then
+  `GST_PLUGIN_PATH=/lib/${MULTIARCH}/gstreamer-1.0 gst-inspect-1.0 libuvch264src`.
+- Force a clean scan after copying the `.so`: `rm -f ~/.cache/gstreamer-1.0/registry.*.bin`.
+- Re-run with `GST_DEBUG=GST_PLUGIN_LOADING:5 gst-inspect-1.0 libuvch264src` to
+  see *why* the load was rejected (an unresolved libuvc symbol points back to
+  step 1). The `libuvch26xsrc` alias should also resolve.
+
+### 3. The device enumerates over USB
+
+```bash
+# Is the camera on the USB bus at all?
+lsusb
+
+# Does libuvc see it as a UVC device? (uvc_find_devices / any libuvc example tool)
+GST_DEBUG=libuvch264src:5 \
+  gst-launch-1.0 libuvch264src index=0 ! fakesink 2>&1 | head -40
+```
+
+Useful selectors when `index=0` resolves to the wrong device (see **Properties**):
+`index="vid:pid"`, `index="serial:<sn>"`, or `index="bus:<bus>:<addr>"`. A
+malformed selector fails `start()` loudly with a `RESOURCE/SETTINGS` error rather
+than silently selecting device 0. If enumeration works but `start()` cannot claim
+the interface, check that no other process (a desktop webcam app, `v4l2` capture)
+already holds the device.
+

@@ -33,6 +33,7 @@
 #include "gstlibuvch264src_internal.h"
 #include "frame_pipeline.h"
 #include "spspps_path.h"
+#include "spspps_cache.h"
 #include "mock_libuvc.h"
 
 /* The mock advertises a single 30 fps interval (333333 * 100 ns), so negotiate()
@@ -497,6 +498,95 @@ GST_START_TEST (test_h265_vps_write_on_change)
 
 GST_END_TEST;
 
+/* ------------------------------------------------------------------------- */
+/* spspps_key_snapshot: the cache-key handshake must copy the live index +    */
+/* geometry by value so the unlocked cache I/O never dereferences self->index.*/
+/* ------------------------------------------------------------------------- */
+
+GST_START_TEST (test_spspps_key_snapshot)
+{
+  register_element ();
+
+  GstLibuvcH264Src *self =
+      GST_LIBUVC_H264_SRC (g_object_new (GST_TYPE_LIBUVC_H264_SRC, NULL));
+
+  g_free (self->index);
+  self->index = g_strdup ("serial:CAM-XYZ");
+  self->frame_format = UVC_FRAME_FORMAT_H264;
+  self->negotiated_width = 1280;
+  self->negotiated_height = 720;
+
+  spspps_key_t key;
+  memset (&key, 0xAB, sizeof (key));
+  spspps_key_snapshot (self, &key);
+  fail_unless (key.have_index, "snapshot dropped a present index");
+  fail_unless (strcmp (key.index, "serial:CAM-XYZ") == 0,
+      "snapshot index '%s' != 'serial:CAM-XYZ'", key.index);
+  fail_unless (key.is_h265 == 0, "H.264 snapshot wrongly flagged is_h265");
+  fail_unless (key.width == 1280 && key.height == 720,
+      "snapshot geometry %dx%d != 1280x720", key.width, key.height);
+
+  g_free (self->index);
+  self->index = NULL;
+  self->frame_format = UVC_FRAME_FORMAT_H265;
+  self->negotiated_width = 3840;
+  self->negotiated_height = 2160;
+  spspps_key_snapshot (self, &key);
+  fail_if (key.have_index, "snapshot kept have_index for a NULL index");
+  fail_unless (key.index[0] == '\0', "NULL-index snapshot left a non-empty key");
+  fail_unless (key.is_h265 == 1, "H.265 snapshot did not flag is_h265");
+  fail_unless (key.width == 3840 && key.height == 2160,
+      "H.265 snapshot geometry %dx%d != 3840x2160", key.width, key.height);
+
+  gst_object_unref (self);
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
+/* cache_open_null_path: a load against a MISSING cache file makes the cache  */
+/* open's fopen() return NULL; load_spspps() must take the fp == NULL branch  */
+/* and leave the element's parameter-set state byte-for-byte untouched.       */
+/* ------------------------------------------------------------------------- */
+
+GST_START_TEST (test_cache_open_null_path)
+{
+  register_element ();
+
+  GstLibuvcH264Src *self =
+      GST_LIBUVC_H264_SRC (g_object_new (GST_TYPE_LIBUVC_H264_SRC, NULL));
+  self->frame_format = UVC_FRAME_FORMAT_H264;
+  self->negotiated_width = 1920;
+  self->negotiated_height = 1080;
+
+  spspps_key_t key;
+  spspps_key_snapshot (self, &key);
+
+  char path[4096];
+  fail_unless (spspps_build_path (path, sizeof (path), g_getenv ("HOME"),
+          self->index, 0, 1920, 1080) > 0, "could not build the cache path");
+  unlink (path);                /* guarantee the read open returns NULL */
+
+  self->sps_length = 0;
+  self->pps_length = 0;
+  self->vps_length = 0;
+  self->sps[0] = 0xEE;          /* sentinel: a no-op load must not overwrite it */
+
+  load_spspps (self, &key);
+
+  fail_unless (self->sps_length == 0 && self->pps_length == 0
+      && self->vps_length == 0,
+      "load_spspps mutated state on a missing cache file (NULL open not handled)");
+  fail_unless (self->sps[0] == 0xEE,
+      "load_spspps touched the SPS buffer on a NULL open");
+  fail_if (cache_exists (path),
+      "load_spspps('r') must not create the cache file");
+
+  gst_object_unref (self);
+}
+
+GST_END_TEST;
+
 static Suite *
 live_source_suite (void)
 {
@@ -521,6 +611,16 @@ live_source_suite (void)
   tcase_set_timeout (tc_h265, 60);
   tcase_add_test (tc_h265, test_h265_vps_write_on_change);
   suite_add_tcase (s, tc_h265);
+
+  TCase *tc_keysnap = tcase_create ("spspps_key_snapshot");
+  tcase_set_timeout (tc_keysnap, 60);
+  tcase_add_test (tc_keysnap, test_spspps_key_snapshot);
+  suite_add_tcase (s, tc_keysnap);
+
+  TCase *tc_nullopen = tcase_create ("cache_open_null_path");
+  tcase_set_timeout (tc_nullopen, 60);
+  tcase_add_test (tc_nullopen, test_cache_open_null_path);
+  suite_add_tcase (s, tc_nullopen);
 
   return s;
 }
