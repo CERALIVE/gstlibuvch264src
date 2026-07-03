@@ -36,7 +36,7 @@ set -euo pipefail
 
 # --- Pinned coordinates — the ONLY place these SHAs/URLs live ----------------
 FORK_URL="https://github.com/CeraLive/libuvc.git"
-FORK_SHA="a1949ae04f6dfa40e6a7e8c156feda2567462117"      # main (hardened v0.0.7.5: v0.0.7.3 base [eae7f49 CVE-2026-1991 + A2 configurable transfer buffers + A4 degenerate-descriptor repair + A5 bounded stream_stop + A7/A9 zero-GET_MAX & corrupt-payload guards + A12 VC-header dwClockFrequency] + UAF hotfix v0.0.7.4: quarantine strmh on A5 stop-timeout in uvc_stream_close + UAF hotfix v0.0.7.5: quarantine devh in uvc_close so a late LIBUSB_TRANSFER_COMPLETED callback deref of strmh->devh->is_isight is lifetime-safe; tag ceralive-v0.0.7.5)
+FORK_SHA="3ede00e0a432beb175792f88b6b7e552bbdc2487"      # main (hardened v0.0.7.6: v0.0.7.3 base [eae7f49 CVE-2026-1991 + A2 configurable transfer buffers + A4 degenerate-descriptor repair + A5 bounded stream_stop + A7/A9 zero-GET_MAX & corrupt-payload guards + A12 VC-header dwClockFrequency] + UAF hotfix v0.0.7.4: quarantine strmh on A5 stop-timeout in uvc_stream_close + UAF hotfix v0.0.7.5: quarantine devh in uvc_close so a late LIBUSB_TRANSFER_COMPLETED callback deref of strmh->devh->is_isight is lifetime-safe + context-lifetime hotfix v0.0.7.6: quarantine uvc_context so uvc_exit skips libusb_exit/free and uvc_open_internal skips a duplicate handler thread while a stop-timeout event thread still runs on ctx->usb_ctx; tag ceralive-v0.0.7.6)
 UPSTREAM_URL="https://github.com/libuvc/libuvc.git"
 UPSTREAM_SHA="68d07a00e11d1944e27b7295ee69673239c00b4b"  # v0.0.7 base
 
