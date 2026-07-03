@@ -10,7 +10,7 @@
 # Two modes (see libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
 #   fork     (default): clone the CeraLive/libuvc fork at the pinned
-#            ceralive-v0.0.7.1 SHA. The UVC 1.5 / H.265 / configurable
+#            ceralive-v0.0.7.3 SHA. The UVC 1.5 / H.265 / configurable
 #            auto-detach changes are commits on the fork, so NO patch(1) step
 #            is needed.
 #   upstream (rollback): clone upstream libuvc v0.0.7 at its pinned SHA and
@@ -36,7 +36,7 @@ set -euo pipefail
 
 # --- Pinned coordinates — the ONLY place these SHAs/URLs live ----------------
 FORK_URL="https://github.com/CeraLive/libuvc.git"
-FORK_SHA="eae7f49c2978b6cdb21edc61fde006195588fec7"      # main (hardened: CVE-2026-1991 guard + 047920b + e001f04; rebased onto main from harden/2026.6, tag ceralive-v0.0.7.2)
+FORK_SHA="6210f2f64965af532440be357e6971b9b618797f"      # main (hardened v0.0.7.3: eae7f49 CVE-2026-1991 base + A2 configurable transfer buffers + A4 degenerate-descriptor repair + A5 bounded stream_stop + A7/A9 zero-GET_MAX & corrupt-payload guards + A12 VC-header dwClockFrequency; tag ceralive-v0.0.7.3)
 UPSTREAM_URL="https://github.com/libuvc/libuvc.git"
 UPSTREAM_SHA="68d07a00e11d1944e27b7295ee69673239c00b4b"  # v0.0.7 base
 
