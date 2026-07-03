@@ -55,6 +55,14 @@ struct _GstLibuvcH264Src {
    * reconnect streaming thread form a proper happens-before. */
   guint max_payload;
   guint max_payload_effective;
+  /* Opt-in USB transfer-buffer count override (Task 11, fork A2
+   * uvc_set_transfer_buffers). transfer_buffers is the REQUESTED value
+   * (PROP_TRANSFER_BUFFERS); 0 is the sentinel "leave libuvc's default count
+   * unchanged" that never touches the fork API. transfer_buffers_effective is the
+   * clamped value actually applied to the device handle and is what a read-back
+   * reports. Both are guarded by GST_OBJECT_LOCK, mirroring max_payload. */
+  guint transfer_buffers;
+  guint transfer_buffers_effective;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;

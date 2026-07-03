@@ -418,6 +418,31 @@ GST_START_TEST (test_compat_caps_contract)
 
 GST_END_TEST;
 
+/* The opt-in transfer-buffers property is additive: it must exist as a uint with
+ * the 0 sentinel default, without disturbing the rest of the property surface.
+ * The [2,100] clamp lives in the apply helper, so the param spec stays the full
+ * 0..255 uint8 range and is not asserted here. */
+GST_START_TEST (test_compat_transfer_buffers_property)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL, "could not instantiate '%s'", ELEMENT_NAME);
+
+  GParamSpec *pspec = g_object_class_find_property (
+      G_OBJECT_GET_CLASS (element), "transfer-buffers");
+  fail_unless (pspec != NULL, "expected 'transfer-buffers' property is missing");
+  fail_unless (pspec->value_type == G_TYPE_UINT,
+      "'transfer-buffers' should be a uint");
+
+  guint tb = 7;
+  g_object_get (element, "transfer-buffers", &tb, NULL);
+  fail_unless (tb == 0,
+      "default 'transfer-buffers' should be 0 (sentinel), got %u", tb);
+
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 /* ---------------------------------------------------------------------------
  * GROUP 3 tests - pipeline-parse contract (README fakesink variants)
  * ------------------------------------------------------------------------- */
@@ -463,6 +488,7 @@ compat_suite (void)
 
   tcase_add_test (tc, test_compat_api_surface);
   tcase_add_test (tc, test_compat_caps_contract);
+  tcase_add_test (tc, test_compat_transfer_buffers_property);
   tcase_add_test (tc, test_compat_pipeline_parse_h264);
   tcase_add_test (tc, test_compat_pipeline_parse_h265);
 
