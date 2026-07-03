@@ -91,6 +91,45 @@ Tasks 17/22/23 may now pin the SHA above.
 
 ---
 
+## v0.0.7.3 Addendum (Task 9/13, 2026-07-02)
+
+This section records the next release on top of `ceralive-v0.0.7.2` above. It
+does not modify any row in the "Fork URL" or "Commit history" sections above;
+those remain the historical record of how the fork reached `v0.0.7.2`.
+
+- **New release tag:** `ceralive-v0.0.7.3` (hardening release: 8 additional robustness backports)
+- **Tag/HEAD commit SHA:** `6210f2f64965af532440be357e6971b9b618797f`
+- **Hardening branch:** `hardening/v0.0.7.3` (true fast-forward merge into `main`, so the merged main SHA, branch tip, and tag target are identical)
+- **Current pin:** `scripts/build-libuvc.sh:39` `FORK_SHA` in `gstlibuvch264src`
+
+```
+GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
+GIT_TAG        6210f2f64965af532440be357e6971b9b618797f   # main, tag ceralive-v0.0.7.3
+```
+
+New commits landed on `hardening/v0.0.7.3` since `ceralive-v0.0.7.2` (`eae7f49`):
+
+| SHA | Commit | Backlog ID(s) |
+|-----|--------|-----|
+| `3195bbc` | `fix(stream): retry alt-setting on failure; free metadata buf in stream_close (upstream #293, #295)` | A1, A3 |
+| `001e8d3` | `feat(stream): runtime-configurable transfer buffer count; fail loudly on zero submitted transfers (#291)` | A2 |
+| `5df5401` | `fix(device): repair degenerate frame descriptors (zero buffer size / bad default interval)` | A4 |
+| `ab49e21` | `fix(stream): bounded wait in uvc_stream_stop; return TIMEOUT instead of hanging` | A5 |
+| `69c7da8` | `fix(stream): zero GET_MAX payload fallback; corrupt/oversized payload guards (#277/#184/#212 + saki 9e95b8a)` | A7, A9 (A8 folded into A9) |
+| `9874f4c` | `fix(device,stream): preserve VC-header dwClockFrequency (A12); A13 confirmed no-op` | A12 |
+| `6210f2f` | `chore(release): finalize CHANGELOG for ceralive-v0.0.7.3` (doc-only) | — |
+
+Skip-equivalent items in this wave (A6, A10, A11, A13) and the plugin-only
+item (A14, a `gstlibuvch264src` quirk seam rather than a fork patch) are
+detailed in `libuvch264src/docs/notes/camera-compat.md` §3, which is the
+authoritative provenance table for this hardening wave. Ancestry gates
+(`68d07a00e11d1944e27b7295ee69673239c00b4b` and `eae7f49` both ancestors of
+`6210f2f`) hold; `LICENSE.txt` remains byte-identical to the base.
+
+Full detail: `.omo/evidence/task-9-uvc-camera-compat-stability.txt`.
+
+---
+
 ## Patches as Commits
 
 Each patch hunk becomes one commit on the fork, in application order. Commit messages carry the rationale that the patch files currently lack.

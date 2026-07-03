@@ -4,7 +4,7 @@ GStreamer source element for UVC H.264 (and H.265) capture devices — DJI actio
 
 Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths bypass this element entirely.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (tag `ceralive-v0.0.7.2`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in the current `ceralive-v0.0.7.3`, SHA `6210f2f64965af532440be357e6971b9b618797f`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 [![CI](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml)
 [![Release](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml)
@@ -294,6 +294,7 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `control-socket-path` | string | `null` | Explicit socket path; auto-selects `$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock` when null |
 | `reconnect` | bool | `false` | Auto-reconnect on mid-stream disconnect with exponential backoff (default off) |
 | `max-payload` | uint | `0` | USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`); `0` = device default; nonzero clamped to `[512, 4194304]` with read-back |
+| `transfer-buffers` | uint | `0` | USB transfer buffer count hint; `0` = library default (no device write); nonzero clamped to `[2, 100]`, applied right before streaming starts (CeraLive fork only; no-op with a warning on upstream libuvc) |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 
