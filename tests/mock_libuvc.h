@@ -78,6 +78,11 @@ typedef enum {
   /* A non-codec format (fourcc "MJPG"): negotiate() must find no H264/H265
    * descriptor and post a bus error instead of streaming. */
   MOCK_UVC_FORMAT_NO_CODEC,
+  /* A CHAIN of non-codec formats (MJPG + YUY2 + NV12), each with a distinct
+   * resolution: negotiate() still finds no H264/H265 and posts the same bus
+   * error, but first logs an inventory of every advertised descriptor. Lets a
+   * test assert the descriptor-inventory diagnostics (Task 12). */
+  MOCK_UVC_FORMAT_MULTI_NO_CODEC,
   /* No interval list and dwMin/MaxFrameInterval == 0: the device-interval
    * branch of negotiate() must not divide by zero. */
   MOCK_UVC_FORMAT_ZERO_DEVICE_INTERVAL,
@@ -185,6 +190,11 @@ uint32_t mock_uvc_last_started_payload(void);
 /* uvc_probe_stream_ctrl() calls since reset. 0 proves the element issued NO
  * extra probe (max-payload unset = byte-for-byte unchanged negotiation). */
 int mock_uvc_probe_call_count(void);
+
+/* uvc_get_stream_ctrl_format_size() calls since reset (Task 12 quirk seam). A
+ * default negotiation issues exactly 1; a device keyed to QUIRK_DOUBLE_PROBE
+ * issues exactly 2 (the first result discarded). */
+int mock_uvc_format_size_call_count(void);
 
 /* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). The last
  * count the element pushed via uvc_set_transfer_buffers() and how many times it

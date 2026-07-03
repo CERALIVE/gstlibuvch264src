@@ -853,6 +853,7 @@ function(add_negotiate_variant variant sanitizer)
   # leak case is only meaningful (and only registered) for the asan variant.
   set(_neg_cases
     "negotiate_edge_zero_format${suffix}:test_negotiate_zero_format"
+    "negotiate_inventory_logged${suffix}:test_negotiate_inventory_logged"
     "negotiate_edge_framerate${suffix}:test_negotiate_framerate_zero"
     "negotiate_edge_zero_interval${suffix}:test_negotiate_zero_interval"
     "negotiate_extreme_fps_low${suffix}:test_negotiate_extreme_fps_low"
@@ -909,6 +910,34 @@ add_negotiate_variant("" "")
 if(ENABLE_SANITIZERS)
   add_negotiate_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# vid:pid quirk-seam tests (Task 12).
+#
+# Same single-executable, statically-registered shape as test_negotiate so the
+# mock's device descriptor (mock_uvc_set_device_descriptor) and its
+# uvc_get_stream_ctrl_format_size() call counter are observable in-process. This
+# is the ONLY target that defines LIBUVCH264SRC_TESTING, so quirks.c compiles the
+# uvc_quirks_set_test_table() seam here and NOWHERE else - the production Meson
+# plugin and the mock-plugin .so never see it (asserted via nm -D in the todo-12
+# acceptance). quirks.c itself ships in every build shape via sources.txt; only
+# the test seam is gated by this PRIVATE compile definition.
+# -----------------------------------------------------------------------------
+add_static_gstcheck_exe(test_quirks)
+target_compile_definitions(test_quirks PRIVATE LIBUVCH264SRC_TESTING)
+
+set(_quirks_cases
+  "quirks_lookup_hit:test_quirks_lookup_hit"
+  "quirks_lookup_miss:test_quirks_lookup_miss"
+  "quirks_production_table_empty:test_quirks_production_table_empty"
+  "quirks_double_probe:test_quirks_double_probe"
+  "quirks_empty_table_single_probe:test_quirks_empty_table_single_probe"
+)
+# The double-probe/empty-table cases enter PLAYING -> start(), which may spawn
+# the control thread, so keep them off the shared control-socket resource like
+# the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_quirks "quirks"
+  "${STATIC_SUITE_SANITIZER}" "${_quirks_cases}")
 
 # -----------------------------------------------------------------------------
 # PTS clamp + restart-state tests (Task 14).

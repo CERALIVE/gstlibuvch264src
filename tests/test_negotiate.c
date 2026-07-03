@@ -528,6 +528,94 @@ GST_START_TEST (test_negotiate_max_payload_accepted_applied)
 
 GST_END_TEST;
 
+/* ------------------------------------------------------------------------- *
+ * Descriptor-inventory diagnostics (Task 12). When the device exposes no
+ * H264/H265 format, negotiate() must GST_WARNING_OBJECT an inventory of every
+ * format descriptor it DID advertise (fourcc + per-frame WxH + interval range)
+ * BEFORE posting the unchanged RESOURCE/SETTINGS bus error. A capturing log
+ * function collects the WARNING lines; the assertions prove all three offered
+ * formats appear AND the bus error is byte-identical to the single-format case.
+ * ------------------------------------------------------------------------- */
+
+static GMutex g_inventory_lock;
+static GString *g_inventory_text; /* accumulates WARNING messages under lock */
+
+static void
+inventory_log_func (GstDebugCategory * category, GstDebugLevel level,
+    const gchar * file, const gchar * function, gint line, GObject * object,
+    GstDebugMessage * message, gpointer user_data)
+{
+  (void) category; (void) file; (void) function; (void) line; (void) object;
+  (void) user_data;
+  if (level > GST_LEVEL_WARNING)
+    return;
+  const gchar *m = gst_debug_message_get (message);
+  if (m == NULL)
+    return;
+  g_mutex_lock (&g_inventory_lock);
+  if (g_inventory_text != NULL) {
+    g_string_append (g_inventory_text, m);
+    g_string_append_c (g_inventory_text, '\n');
+  }
+  g_mutex_unlock (&g_inventory_lock);
+}
+
+GST_START_TEST (test_negotiate_inventory_logged)
+{
+  g_mutex_lock (&g_inventory_lock);
+  g_inventory_text = g_string_new (NULL);
+  g_mutex_unlock (&g_inventory_lock);
+
+  gst_debug_set_active (TRUE);
+  gst_debug_set_threshold_for_name ("libuvch264src", GST_LEVEL_WARNING);
+  gst_debug_add_log_function (inventory_log_func, NULL, NULL);
+
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_MULTI_NO_CODEC);
+
+  GstElement *pipeline = build_pipeline ();
+  GstMessage *msg = play_and_wait_error (pipeline);
+
+  GError *gerr = NULL;
+  gboolean is_resource = FALSE;
+  if (msg != NULL) {
+    gchar *dbg = NULL;
+    gst_message_parse_error (msg, &gerr, &dbg);
+    g_free (dbg);
+    is_resource = g_error_matches (gerr, GST_RESOURCE_ERROR,
+        GST_RESOURCE_ERROR_SETTINGS);
+    g_clear_error (&gerr);
+    gst_message_unref (msg);
+  }
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  gst_debug_remove_log_function (inventory_log_func);
+
+  g_mutex_lock (&g_inventory_lock);
+  gchar *captured = g_string_free (g_inventory_text, FALSE);
+  g_inventory_text = NULL;
+  g_mutex_unlock (&g_inventory_lock);
+
+  fail_unless (msg != NULL,
+      "expected a bus ERROR for a multi-format device with no H264/H265 format");
+  fail_unless (is_resource,
+      "the multi-format no-codec bus error must stay RESOURCE/SETTINGS "
+      "(byte-identical to the single-format case)");
+
+  fail_unless (captured != NULL, "no diagnostics were logged");
+  fail_unless (strstr (captured, "MJPG") != NULL,
+      "inventory must list the MJPG descriptor");
+  fail_unless (strstr (captured, "YUY2") != NULL,
+      "inventory must list the YUY2 descriptor");
+  fail_unless (strstr (captured, "NV12") != NULL,
+      "inventory must list the NV12 descriptor");
+  fail_unless (strstr (captured, "1280x720") != NULL,
+      "inventory must report each descriptor's resolution");
+  g_free (captured);
+}
+
+GST_END_TEST;
+
 static Suite *
 negotiate_suite (void)
 {
@@ -540,6 +628,7 @@ negotiate_suite (void)
 
   tcase_add_test (tc, test_negotiate_leak);
   tcase_add_test (tc, test_negotiate_zero_format);
+  tcase_add_test (tc, test_negotiate_inventory_logged);
   tcase_add_test (tc, test_negotiate_framerate_zero);
   tcase_add_test (tc, test_negotiate_zero_interval);
   tcase_add_test (tc, test_negotiate_extreme_fps_low);
