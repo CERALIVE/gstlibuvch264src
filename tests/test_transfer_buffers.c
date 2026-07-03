@@ -193,6 +193,7 @@ GST_START_TEST (test_transfer_buffers_applied_before_start)
   gst_object_unref (pipeline);
 
   fail_unless (got, "stream must start with an in-range transfer-buffers value");
+#if TB_API_AVAILABLE
   fail_unless (calls >= 1,
       "a nonzero transfer-buffers must call uvc_set_transfer_buffers; got %d",
       calls);
@@ -201,6 +202,17 @@ GST_START_TEST (test_transfer_buffers_applied_before_start)
       started);
   fail_unless (effective == 4u,
       "read-back must report the applied transfer-buffers (4); got %u", effective);
+#else
+  /* LIBUVC_USE_FORK=OFF: fork API absent -> warn-and-no-op (setter never called,
+   * library default kept); the one-warning no-op is covered by _off_noop. */
+  fail_unless (calls == 0,
+      "with the fork API absent, transfer-buffers must NOT call the setter; "
+      "got %d call(s)", calls);
+  fail_unless (started == 0,
+      "with the fork API absent, the library default must be left in place; "
+      "got %u", started);
+  (void) effective;
+#endif
 }
 
 GST_END_TEST;
@@ -242,13 +254,22 @@ GST_START_TEST (test_transfer_buffers_clamped)
 
   fail_unless (got, "stream must start with an out-of-band transfer-buffers value");
   fail_unless (g_atomic_int_get (&saw_transfer_warning),
-      "an out-of-range transfer-buffers must log a clamp warning");
+      "an out-of-range transfer-buffers must log a warning");
+#if TB_API_AVAILABLE
   fail_unless (started == 100,
       "transfer-buffers 200 must clamp to 100 before streaming start; got %u",
       started);
   fail_unless (effective == 100u,
       "read-back must report the clamped transfer-buffers (100); got %u",
       effective);
+#else
+  /* LIBUVC_USE_FORK=OFF: the no-op path warns (message carries "transfer-buffers",
+   * asserted above) and never pushes a count to the device. */
+  fail_unless (started == 0,
+      "with the fork API absent, no transfer-buffers count must reach the "
+      "device; got %u", started);
+  (void) effective;
+#endif
 }
 
 GST_END_TEST;
@@ -331,12 +352,24 @@ GST_START_TEST (test_transfer_buffers_reconnect_reapply)
       "errored out");
   fail_unless (resumed && open_count >= 2,
       "stream did not reopen+resume after reconnect (open count %d)", open_count);
+#if TB_API_AVAILABLE
   fail_unless (tb_calls >= 2,
       "transfer-buffers must be re-applied on the successful reconnect "
       "(>= 2 setter calls: initial + reconnect); got %d", tb_calls);
   fail_unless (started_tb == 4,
       "the resumed stream must start on the re-applied transfer-buffers (4); "
       "got %u", started_tb);
+#else
+  /* LIBUVC_USE_FORK=OFF: transfer-buffers no-ops (fork API absent), so no setter
+   * call fires on either the initial start or the reconnect re-arm; max-payload
+   * is NOT fork-gated and still re-arms (asserted below). */
+  fail_unless (tb_calls == 0,
+      "with the fork API absent, transfer-buffers must NOT call the setter "
+      "across reconnect; got %d", tb_calls);
+  fail_unless (started_tb == 0,
+      "with the fork API absent, the library default must be left in place; "
+      "got %u", started_tb);
+#endif
   fail_unless (started_payload == 32768u,
       "the resumed stream must start on the re-applied max-payload (32768); "
       "got %u", started_payload);
