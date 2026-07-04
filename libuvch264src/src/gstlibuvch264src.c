@@ -13,6 +13,7 @@
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
 #include "ptz_control.h"
+#include "quirks.h"
 #include <gst/gst.h>
 #include <libuvc/libuvc.h>
 
@@ -28,6 +29,7 @@ enum {
   PROP_CONTROL_SOCKET_PATH,
   PROP_RECONNECT,
   PROP_MAX_PAYLOAD,
+  PROP_TRANSFER_BUFFERS,
   PROP_LAST
 };
 
@@ -51,6 +53,29 @@ enum {
 #define MAX_PAYLOAD_DEFAULT 0u
 #define MAX_PAYLOAD_MIN_LEGAL 512u
 #define MAX_PAYLOAD_MAX (4u * 1024u * 1024u)
+
+/* Opt-in USB transfer-buffer count override (Task 11, fork A2
+ * uvc_set_transfer_buffers). TRANSFER_BUFFERS_DEFAULT is the sentinel: 0 = "leave
+ * libuvc's default transfer-buffer count unchanged", so the unset default never
+ * touches the fork API. A nonzero request is clamped to the fork's own
+ * [TRANSFER_BUFFERS_MIN, TRANSFER_BUFFERS_MAX] band in the apply helper (NOT the
+ * param spec, whose range stays the full 0..255 uint8 so an in-range set never
+ * trips a GObject range warning). */
+#define TRANSFER_BUFFERS_DEFAULT 0u
+#define TRANSFER_BUFFERS_MIN 2u
+#define TRANSFER_BUFFERS_MAX 100u
+#define TRANSFER_BUFFERS_SPEC_MAX 255u
+
+/* The fork exports uvc_set_transfer_buffers(); raw upstream libuvc does not. The
+ * build's feature guard (HAVE_UVC_TRANSFER_BUFFERS) is set by meson.build /
+ * CMakeLists.txt after probing the selected libuvc. When it is absent the
+ * property stays registered but a nonzero value warns and no-ops so the
+ * upstream-fallback build stays green. */
+#if defined(HAVE_UVC_TRANSFER_BUFFERS) && !defined(LIBUVCH264SRC_NO_TRANSFER_BUFFERS_API)
+#define TRANSFER_BUFFERS_API_AVAILABLE 1
+#else
+#define TRANSFER_BUFFERS_API_AVAILABLE 0
+#endif
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -90,6 +115,7 @@ static gboolean gst_libuvc_h264_src_negotiate_clean_payload(GstLibuvcH264Src *se
                                             gint width, gint height, gint fps);
 static void gst_libuvc_h264_src_apply_max_payload(GstLibuvcH264Src *self,
                                             gint width, gint height, gint fps);
+static void gst_libuvc_h264_src_apply_transfer_buffers(GstLibuvcH264Src *self);
 
 /* GAsyncQueue forbids NULL payloads, so create() can never receive a NULL
  * "no more frames" marker. unlock() instead pushes this dedicated address to
@@ -169,6 +195,24 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                       0, MAX_PAYLOAD_MAX, MAX_PAYLOAD_DEFAULT,
                       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Opt-in USB transfer-buffer count override (Task 11, fork A2). Default 0 is
+   * the "leave libuvc's default count unchanged" sentinel. The param-spec range
+   * is the full 0..255 uint8 domain; the conservative [2, 100] clamp is applied
+   * at streaming-start time in the apply helper, NOT here, so a value inside the
+   * spec never trips a GObject range warning (which gst-check would turn into a
+   * longjmp). A read-back reports the effective committed value. */
+  g_object_class_install_property(gobject_class, PROP_TRANSFER_BUFFERS,
+    g_param_spec_uint("transfer-buffers", "USB transfer buffer count",
+                      "Number of USB transfer buffers libuvc submits per stream. "
+                      "0 = use the library default (default; unchanged). A "
+                      "nonzero value is clamped to [2, 100] and applied via the "
+                      "fork's uvc_set_transfer_buffers() right before streaming "
+                      "starts; a read-back reports the effective value. Requires "
+                      "the CeraLive libuvc fork; ignored (with a warning) on "
+                      "upstream libuvc.",
+                      0, TRANSFER_BUFFERS_SPEC_MAX, TRANSFER_BUFFERS_DEFAULT,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -206,6 +250,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->reconnect_enabled = FALSE;
   self->max_payload = MAX_PAYLOAD_DEFAULT;
   self->max_payload_effective = 0;
+  self->transfer_buffers = TRANSFER_BUFFERS_DEFAULT;
+  self->transfer_buffers_effective = 0;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -308,6 +354,84 @@ static void gst_libuvc_h264_src_apply_max_payload(GstLibuvcH264Src *self,
   GST_OBJECT_LOCK(self);
   self->max_payload_effective = committed;
   GST_OBJECT_UNLOCK(self);
+}
+
+/* Apply the opt-in transfer-buffers override to the open device handle, called
+ * right before uvc_start_streaming() in both the initial start and the reconnect
+ * re-arm (the fork rejects the setter mid-stream, so it must precede start).
+ * Unset (0) is the sentinel: it never calls the fork API, leaving libuvc's
+ * default transfer-buffer count byte-for-byte unchanged (ZERO extra device
+ * writes). A nonzero request is clamped to [TRANSFER_BUFFERS_MIN,
+ * TRANSFER_BUFFERS_MAX] and pushed via uvc_set_transfer_buffers(); the committed
+ * (clamped) value is recorded for read-back. A device that refuses it keeps
+ * libuvc's default (graceful; the stream never fails because of the hint). When
+ * the fork symbol is absent a nonzero request emits ONE warning and no-ops. */
+static void gst_libuvc_h264_src_apply_transfer_buffers(GstLibuvcH264Src *self) {
+  GST_OBJECT_LOCK(self);
+  guint requested = self->transfer_buffers;
+  GST_OBJECT_UNLOCK(self);
+
+  if (requested == 0)
+    return;
+
+#if TRANSFER_BUFFERS_API_AVAILABLE
+  guint clamped = requested;
+  if (clamped < TRANSFER_BUFFERS_MIN)
+    clamped = TRANSFER_BUFFERS_MIN;
+  if (clamped > TRANSFER_BUFFERS_MAX)
+    clamped = TRANSFER_BUFFERS_MAX;
+  if (clamped != requested)
+    GST_WARNING_OBJECT(self, "transfer-buffers %u out of range [%u, %u]; "
+                       "clamped to %u", requested, TRANSFER_BUFFERS_MIN,
+                       TRANSFER_BUFFERS_MAX, clamped);
+
+  uvc_error_t res = uvc_set_transfer_buffers(self->uvc_devh, (uint8_t) clamped);
+  if (res < 0) {
+    GST_WARNING_OBJECT(self,
+        "transfer-buffers %u not applied by libuvc (%s); using the library "
+        "default count", clamped, uvc_strerror(res));
+    return;
+  }
+
+  GST_INFO_OBJECT(self, "transfer-buffers applied: requested %u, applied %u",
+                  requested, clamped);
+  GST_OBJECT_LOCK(self);
+  self->transfer_buffers_effective = clamped;
+  GST_OBJECT_UNLOCK(self);
+#else
+  GST_WARNING_OBJECT(self,
+      "transfer-buffers %u requested but this libuvc lacks "
+      "uvc_set_transfer_buffers (built without the CeraLive fork API); ignoring",
+      requested);
+#endif
+}
+
+/* Log a full inventory of every format/frame descriptor the device advertises.
+ * Called from negotiate() right before the no-H264/H265 bus error so field
+ * triage (GST_DEBUG=libuvch264src:3) can see WHAT the camera actually offered -
+ * fourcc/guid plus each frame's resolution and interval range - when it exposes
+ * no codec the element can stream. */
+static void gst_libuvc_h264_src_log_format_inventory(GstLibuvcH264Src *self) {
+    for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
+         format_desc; format_desc = format_desc->next)
+    {
+        const guint8 *g = format_desc->guidFormat;
+        GST_WARNING_OBJECT(self,
+            "  format fourcc '%.4s' guid "
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            format_desc->fourccFormat,
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+            g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+
+        for (const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
+             frame_desc; frame_desc = frame_desc->next)
+        {
+            GST_WARNING_OBJECT(self,
+                "    %ux%u frame interval [%u..%u] (100ns units)",
+                frame_desc->wWidth, frame_desc->wHeight,
+                frame_desc->dwMinFrameInterval, frame_desc->dwMaxFrameInterval);
+        }
+    }
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -423,9 +547,13 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     if (!found_codec_format) {
         // The device exposes no H264/H265 format descriptor at all, so there is
-        // nothing to stream. Post a bus ERROR (not just a debug log) so
+        // nothing to stream. Log a full inventory of what it DID advertise first
+        // (field triage), then post a bus ERROR (not just a debug log) so
         // downstream consumers (cerastream/CeraUI) can react, instead of falling
         // through with uninitialized width/height/framerate.
+        GST_WARNING_OBJECT(self,
+            "device exposes no H264/H265 format; advertised formats follow:");
+        gst_libuvc_h264_src_log_format_inventory(self);
         gst_libuvc_h264_src_post_error(GST_ELEMENT(self), UVC_ERROR_NOT_SUPPORTED,
             "negotiating caps: device exposes no H264/H265 format");
         goto out;
@@ -436,6 +564,25 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     if (width < 0 || height < 0 || framerate <= 0 || !best_caps) {
         GST_ERROR_OBJECT(self, "Unable to negotiate common caps");
         goto out;
+    }
+
+    // vid:pid quirk seam (A14). The production table ships empty, so
+    // uvc_quirks_lookup() returns 0 for every device and the probe count below
+    // is unchanged; a matching entry can request QUIRK_DOUBLE_PROBE (libuvc #242)
+    // to issue the format-size probe twice, discarding the first result.
+    guint32 quirks = 0;
+    uvc_device_descriptor_t *quirk_desc = NULL;
+    if (uvc_get_device_descriptor(self->uvc_dev, &quirk_desc) == UVC_SUCCESS
+        && quirk_desc != NULL) {
+        quirks = uvc_quirks_lookup(quirk_desc->idVendor, quirk_desc->idProduct);
+        uvc_free_device_descriptor(quirk_desc);
+    }
+
+    if (quirks & QUIRK_DOUBLE_PROBE) {
+        // Some devices return a stale/rejected stream control on the first
+        // probe; run it once and discard the result before the real probe.
+        uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                        self->frame_format, width, height, framerate);
     }
 
     int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
@@ -551,6 +698,15 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       self->max_payload = g_value_get_uint(value);
       GST_OBJECT_UNLOCK(self);
       break;
+    case PROP_TRANSFER_BUFFERS:
+      /* Stored verbatim (the [2,100] clamp is applied at streaming-start time in
+       * the apply helper). Read on the negotiate/reconnect streaming thread, so
+       * mutate under the object lock for a proper happens-before, mirroring
+       * max-payload. */
+      GST_OBJECT_LOCK(self);
+      self->transfer_buffers = g_value_get_uint(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -590,6 +746,13 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       g_value_set_uint(value, self->max_payload_effective > 0
                               ? self->max_payload_effective
                               : self->max_payload);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_TRANSFER_BUFFERS:
+      GST_OBJECT_LOCK(self);
+      g_value_set_uint(value, self->transfer_buffers_effective > 0
+                              ? self->transfer_buffers_effective
+                              : self->transfer_buffers);
       GST_OBJECT_UNLOCK(self);
       break;
     default:
@@ -1192,6 +1355,11 @@ gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
 
+    // Re-apply the opt-in transfer-buffers override on the reopened handle right
+    // before restarting the stream (Task 11): the reopened handle starts at the
+    // library default, so the count must be re-armed here like max-payload.
+    gst_libuvc_h264_src_apply_transfer_buffers(self);
+
     if (uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback,
                             self, 0) < 0) {
       uvc_close(self->uvc_devh);
@@ -1221,6 +1389,11 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 
     self->streaming = TRUE;
 
+    // Apply the opt-in transfer-buffers override right before streaming starts
+    // (the fork rejects it mid-stream); unset leaves libuvc's default count
+    // unchanged (Task 11).
+    gst_libuvc_h264_src_apply_transfer_buffers(self);
+
     // Start streaming
     res = uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback, self, 0);
     if (res < 0) {
@@ -1245,7 +1418,8 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       }
       if (res < 0) {
         self->streaming = FALSE;
-        GST_ERROR_OBJECT(self, "Unable to start streaming: %s", uvc_strerror(res));
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), res,
+            "starting UVC stream");
         return GST_FLOW_ERROR;
       }
     }

@@ -100,6 +100,27 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
+# Feature guard: the CeraLive fork exports uvc_set_transfer_buffers() (A2 API);
+# raw upstream libuvc (LIBUVC_USE_FORK=OFF) does not. Probe the SELECTED libuvc
+# target with its include dir - a bare check_function_exists() ignores that
+# context and is unreliable - and, when present, propagate HAVE_UVC_TRANSFER_
+# BUFFERS to the plugin AND every test target: add_compile_definitions() here
+# (top-level dir scope) cascades into add_subdirectory(tests). The element's
+# opt-in transfer-buffers property then compiles its real apply path against the
+# fork and a benign warn-and-no-op path against upstream.
+# -----------------------------------------------------------------------------
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_LIBRARIES ${LIBUVC_LINK_TARGET})
+set(CMAKE_REQUIRED_INCLUDES ${LIBUVC_EXTRA_INCLUDES} ${LIBUVC_INCLUDE_DIRS})
+check_symbol_exists(uvc_set_transfer_buffers "libuvc/libuvc.h"
+  HAVE_UVC_TRANSFER_BUFFERS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+unset(CMAKE_REQUIRED_INCLUDES)
+if(HAVE_UVC_TRANSFER_BUFFERS)
+  add_compile_definitions(HAVE_UVC_TRANSFER_BUFFERS)
+endif()
+
+# -----------------------------------------------------------------------------
 # GStreamer plugin module (compiled from the unmodified plugin source).
 # Output: <build>/gstreamer-1.0/libgstlibuvch264src.so
 # -----------------------------------------------------------------------------

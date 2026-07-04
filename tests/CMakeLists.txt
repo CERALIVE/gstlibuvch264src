@@ -853,6 +853,7 @@ function(add_negotiate_variant variant sanitizer)
   # leak case is only meaningful (and only registered) for the asan variant.
   set(_neg_cases
     "negotiate_edge_zero_format${suffix}:test_negotiate_zero_format"
+    "negotiate_inventory_logged${suffix}:test_negotiate_inventory_logged"
     "negotiate_edge_framerate${suffix}:test_negotiate_framerate_zero"
     "negotiate_edge_zero_interval${suffix}:test_negotiate_zero_interval"
     "negotiate_extreme_fps_low${suffix}:test_negotiate_extreme_fps_low"
@@ -909,6 +910,34 @@ add_negotiate_variant("" "")
 if(ENABLE_SANITIZERS)
   add_negotiate_variant("asan" "address")
 endif()
+
+# -----------------------------------------------------------------------------
+# vid:pid quirk-seam tests (Task 12).
+#
+# Same single-executable, statically-registered shape as test_negotiate so the
+# mock's device descriptor (mock_uvc_set_device_descriptor) and its
+# uvc_get_stream_ctrl_format_size() call counter are observable in-process. This
+# is the ONLY target that defines LIBUVCH264SRC_TESTING, so quirks.c compiles the
+# uvc_quirks_set_test_table() seam here and NOWHERE else - the production Meson
+# plugin and the mock-plugin .so never see it (asserted via nm -D in the todo-12
+# acceptance). quirks.c itself ships in every build shape via sources.txt; only
+# the test seam is gated by this PRIVATE compile definition.
+# -----------------------------------------------------------------------------
+add_static_gstcheck_exe(test_quirks)
+target_compile_definitions(test_quirks PRIVATE LIBUVCH264SRC_TESTING)
+
+set(_quirks_cases
+  "quirks_lookup_hit:test_quirks_lookup_hit"
+  "quirks_lookup_miss:test_quirks_lookup_miss"
+  "quirks_production_table_empty:test_quirks_production_table_empty"
+  "quirks_double_probe:test_quirks_double_probe"
+  "quirks_empty_table_single_probe:test_quirks_empty_table_single_probe"
+)
+# The double-probe/empty-table cases enter PLAYING -> start(), which may spawn
+# the control thread, so keep them off the shared control-socket resource like
+# the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_quirks "quirks"
+  "${STATIC_SUITE_SANITIZER}" "${_quirks_cases}")
 
 # -----------------------------------------------------------------------------
 # PTS clamp + restart-state tests (Task 14).
@@ -1286,6 +1315,64 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # -----------------------------------------------------------------------------
+# Opt-in transfer-buffers property tests (Task 11).
+#
+# Same single-executable, statically-registered shape as test_reconnect so the
+# mock's uvc_set_transfer_buffers() call counter and the count latched at
+# uvc_start_streaming() are observable in-process. The normal target inherits
+# HAVE_UVC_TRANSFER_BUFFERS from the top-level dir scope (see the feature guard in
+# the root CMakeLists.txt), so it compiles the real fork apply path and runs the
+# ON cases. A dedicated test_transfer_buffers_off target defines
+# LIBUVCH264SRC_NO_TRANSFER_BUFFERS_API to simulate a libuvc WITHOUT the symbol
+# (the LIBUVC_USE_FORK=OFF path) without a second build, and runs the OFF case
+# that asserts the one-GST_WARNING no-op instead of a setter call.
+# -----------------------------------------------------------------------------
+add_static_gstcheck_exe(test_transfer_buffers)
+
+set(_transfer_buffers_cases
+  "transfer_buffers_sentinel:test_transfer_buffers_sentinel_no_call"
+  "transfer_buffers_applied:test_transfer_buffers_applied_before_start"
+  "transfer_buffers_clamped:test_transfer_buffers_clamped"
+  "transfer_buffers_reconnect_reapply:test_transfer_buffers_reconnect_reapply"
+  "transfer_buffers_io_error:test_transfer_buffers_start_streaming_io_error"
+)
+# start() binds the fixed /tmp/libuvc_control socket via the control thread, so
+# these must not run concurrently (RESOURCE_LOCK, applied by helper).
+add_gstcheck_multicase_test(test_transfer_buffers "transfer-buffers"
+  "${STATIC_SUITE_SANITIZER}" "${_transfer_buffers_cases}")
+
+# OFF-path simulation target: force the fork API absent via a compile-time
+# override so the element takes the warn-and-no-op branch, without a second
+# LIBUVC_USE_FORK=OFF build.
+add_executable(test_transfer_buffers_off
+  test_transfer_buffers.c
+  ${_element_srcs}
+  mock_libuvc.c
+)
+target_compile_definitions(test_transfer_buffers_off PRIVATE
+  LIBUVCH264SRC_NO_TRANSFER_BUFFERS_API)
+target_include_directories(test_transfer_buffers_off PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${LIBUVC_EXTRA_INCLUDES}
+  ${LIBUVC_INCLUDE_DIRS}
+)
+target_link_libraries(test_transfer_buffers_off PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+  PkgConfig::LIBUSB
+  Threads::Threads
+)
+apply_sanitizer_flags(test_transfer_buffers_off "${STATIC_SUITE_SANITIZER}")
+
+set(_transfer_buffers_off_cases
+  "transfer_buffers_off_noop:test_transfer_buffers_off_noop"
+)
+add_gstcheck_multicase_test(test_transfer_buffers_off "transfer-buffers-off"
+  "${STATIC_SUITE_SANITIZER}" "${_transfer_buffers_off_cases}")
+
+# -----------------------------------------------------------------------------
 # PTS drift-bound regression guard (Task 1, harden-v2). Committed RED.
 #
 # Same single-executable, statically-registered shape as test_pts_thread_safety
@@ -1608,6 +1695,7 @@ add_static_gstcheck_exe(test_compat)
 set(_compat_cases
   "compat_api_surface:test_compat_api_surface"
   "compat_caps_contract:test_compat_caps_contract"
+  "compat_transfer_buffers_property:test_compat_transfer_buffers_property"
   "compat_pipeline_parse_h264:test_compat_pipeline_parse_h264"
   "compat_pipeline_parse_h265:test_compat_pipeline_parse_h265"
 )

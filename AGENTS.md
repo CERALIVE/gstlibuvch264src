@@ -2,7 +2,7 @@
 
 GStreamer source element that pulls H.264 frames directly from DJI action cameras and UVC devices via libuvc. Developed by UnlimitedIRL; forked/maintained under CeraLive.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (tag `ceralive-v0.0.7.2`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in the current `ceralive-v0.0.7.3`, SHA `6210f2f64965af532440be357e6971b9b618797f`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 Parent manifest: [`../AGENTS.md`](../AGENTS.md)
 
@@ -33,14 +33,16 @@ gstlibuvch264src/
 │   │   ├── spspps_cache.{c,h}          # SPS/PPS/VPS disk cache (path safety, resolution key)
 │   │   ├── spspps_path.h               # Pure path-builder (no GObject dep, unit-testable)
 │   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
-│   │   └── uvc_device.{c,h}            # USB teardown helper + V4L2 capability probe
+│   │   ├── uvc_device.{c,h}            # USB teardown helper + V4L2 capability probe
+│   │   └── quirks.{c,h}                 # vid:pid quirk seam (table + lookup + logging); ships empty
 │   ├── docs/notes/
 │   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
 │   │   ├── bmaxpayload-analysis.md     # max-payload bandwidth tuning analysis
 │   │   ├── dji-xu-investigation.md     # DJI XU control investigation (report only; no code shipped)
 │   │   ├── v4l2src-spike.md            # v4l2src evaluation spike (report only; no code shipped)
 │   │   ├── scr-investigation.md        # SCR-based PTS investigation (verdict: SCR-ABSENT; no code change)
-│   │   └── libuvc-fork-adr.md          # ADR: CeraLive fork as canonical libuvc dependency
+│   │   ├── libuvc-fork-adr.md          # ADR: CeraLive fork as canonical libuvc dependency
+│   │   └── camera-compat.md            # Mechanism-per-family compat matrix + field-triage + fork provenance
 │   └── meson.build                     # Canonical production build
 ├── tests/                   # Hardware-independent ctest suite (mock-backed)
 │   ├── mock_libuvc.{c,h}    # libuvc mock (~16 fns); env/API config; PTZ + descriptor support
@@ -50,7 +52,7 @@ gstlibuvch264src/
 │   ├── test_device_select.c # Device selection: ordinal/vid:pid/serial/bus + index validation
 │   ├── test_ptz.c           # PTZ properties + capability gate
 │   ├── test_socket.c        # Control socket: default-off, per-instance path, mode 0600
-│   ├── test_negotiate.c     # Caps negotiation: leak (LSAN), zero-format, framerate edge cases
+│   ├── test_negotiate.c     # Caps negotiation: leak (LSAN), zero-format, framerate edge cases, inventory log
 │   ├── test_usb_teardown.c  # USB teardown: single libusb_close, real interface count
 │   ├── test_pts_thread_safety.c # PTS/clock race + frame throughput
 │   ├── test_pts_monotonic.c # PTS monotonicity + restart IDR gate
@@ -63,6 +65,8 @@ gstlibuvch264src/
 │   ├── test_compat.c        # API compatibility: property existence + type assertions
 │   ├── test_cve_2026_1991.c # CVE-2026-1991 regression: null-deref guard in scan-streaming path
 │   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
+│   ├── test_transfer_buffers.c # transfer-buffers property: sentinel/clamp/reconnect re-arm, fork-only gated
+│   ├── test_quirks.c        # vid:pid quirk lookup: empty table, match, QUIRK_DOUBLE_PROBE
 │   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
 │   ├── tsan.suppressions    # TSan suppressions for third-party + baselined GMutex blind spots
 │   └── tsan_pts.suppressions# TSan suppressions for PTS/clock GMutex (permanent blind spot)
@@ -78,7 +82,7 @@ gstlibuvch264src/
 
 > `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
 > `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
-> (`eae7f49` on `main`, tag `ceralive-v0.0.7.2`) — no patch step needed. With
+> (`6210f2f` on `main`, tag `ceralive-v0.0.7.3`) — no patch step needed. With
 > `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
 > (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
 > `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
@@ -96,6 +100,7 @@ gstlibuvch264src/
 | USB teardown + V4L2 probe | `libuvch264src/src/uvc_device.c` |
 | SPS/PPS cache | `libuvch264src/src/spspps_cache.c` |
 | Error mapping helper | `libuvch264src/src/gstlibuvch264src_error.c` |
+| vid:pid quirk seam (table + lookup) | `libuvch264src/src/quirks.c` |
 | Meson build config | `libuvch264src/meson.build` |
 | Build environment | `Dockerfile` |
 | Reconnect feasibility verdict | `libuvch264src/docs/notes/reconnect-spike.md` |
@@ -104,6 +109,7 @@ gstlibuvch264src/
 | v4l2src evaluation spike (report only) | `libuvch264src/docs/notes/v4l2src-spike.md` |
 | SCR/PTS investigation (verdict: SCR-ABSENT) | `libuvch264src/docs/notes/scr-investigation.md` |
 | libuvc fork ADR | `libuvch264src/docs/notes/libuvc-fork-adr.md` |
+| Camera compat matrix + field triage + fork provenance | `libuvch264src/docs/notes/camera-compat.md` |
 | Example pipelines | `README.md` |
 
 ---
@@ -156,6 +162,10 @@ Opt-in in-element auto-reconnect on a mid-stream disconnect. Default is **off**:
 ### `max-payload` (uint, range 0..4194304, default `0`)
 
 USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`). `0` (the default) leaves the device-negotiated value unchanged. A nonzero value is clamped to `[512, 4194304]`, applied via UVC probe/commit with read-back, and falls back to the device-negotiated value if the device refuses it. Read-back reports the effective committed value. See `libuvch264src/docs/notes/bmaxpayload-analysis.md` for tuning guidance.
+
+### `transfer-buffers` (uint, range 0..255, default `0`)
+
+USB transfer buffer count hint: the number of USB transfer buffers `libuvc` submits per stream. `0` (the default, and the sentinel) leaves the library's default count unchanged — no device write at all. A nonzero value is clamped to `[2, 100]` and applied via the CeraLive fork's `uvc_set_transfer_buffers()` right before streaming starts, in both the initial `start()` and on every reconnect re-arm (the fork API rejects the call mid-stream, so it must precede `uvc_start_streaming()`). Read-back reports the effective (clamped) value once applied; before that it reports the requested value. Requires the CeraLive libuvc fork (backs fork item A2, `libuvch264src/docs/notes/camera-compat.md` §3); on upstream libuvc (`LIBUVC_USE_FORK=OFF`) a nonzero request is a no-op with one warning, and the property itself is otherwise harmless to set on either build.
 
 ### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
 
@@ -238,7 +248,7 @@ The `Dockerfile` pins both the base image and the libuvc source:
 FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 ```
 
-libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `eae7f49`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
+libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `6210f2f` / tag `ceralive-v0.0.7.3`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
 **Two stages: pinned-ubuntu `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to an Ubuntu base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (package `Depends: libgstreamer1.0-0`), not bundled in the image.
 
@@ -278,6 +288,7 @@ The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in fo
 - The pure logic that does NOT depend on a real device: the Annex-B NAL parser and its count/overflow bounds (`test_nal_parse` — including the `overflow` truncation-warning and `count_bound` suites), the SPS/PPS path builder, cache-key snapshot, and the cache file-open NULL/missing-file path (`test_cache`, `test_live_source` `spspps_key_snapshot`/`cache_open_null_path`).
 - Concurrency/teardown invariants observable in-process under sanitizers: the PTS/clock lock (`test_pts_thread_safety` TSan), the SPS/PPS-bounds clamp and cache index race (ASan/TSan), USB single-`libusb_close` teardown (`test_usb_teardown`), and the CVE-2026-1991 null-guard against the vendored libuvc.
 - Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
+- The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk lookup (`test_quirks`: empty-table default, a matching entry, `QUIRK_DOUBLE_PROBE` behavior) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
 
 **The suite does NOT prove (requires real hardware — out of scope here):**
 - Actual USB enumeration, `uvc_open()`/streaming against a physical DJI/UVC camera, real bandwidth at a given `max-payload`, or real PTZ motion on a device.

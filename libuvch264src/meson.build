@@ -20,4 +20,22 @@ gst_base_dep = dependency('gstreamer-base-1.0', version: '>=1.14')
 libuvc_dep = dependency('libuvc', required: true)
 libusb_dep = dependency('libusb-1.0', required: true)
 
+# Feature guard: the CeraLive fork exports uvc_set_transfer_buffers() (A2 API);
+# raw upstream libuvc (LIBUVC_USE_FORK=OFF) does not. Probe the SELECTED libuvc
+# dependency and, when present, define HAVE_UVC_TRANSFER_BUFFERS for every element
+# TU (add_project_arguments applies to the library built in subdir('src')). The
+# opt-in transfer-buffers property then compiles its real apply path against the
+# fork and a benign warn-and-no-op path against upstream.
+#
+# args '-D_GNU_SOURCE': compiler checks do NOT inherit add_project_arguments, and
+# under strict -std=c11 libuvc.h's `struct timespec capture_time_finished` is an
+# incomplete type without the feature macro, so the probe's header include fails
+# and the check falsely reports NO. Pass it here so the probe matches the element
+# TUs' own build environment (mirrors the _GNU_SOURCE rationale above).
+cc = meson.get_compiler('c')
+if cc.has_function('uvc_set_transfer_buffers', dependencies: libuvc_dep,
+    prefix: '#include <libuvc/libuvc.h>', args: '-D_GNU_SOURCE')
+  add_project_arguments('-DHAVE_UVC_TRANSFER_BUFFERS', language: 'c')
+endif
+
 subdir('src')

@@ -67,10 +67,15 @@ struct uvc_device {
 struct uvc_device_handle {
   uvc_device_t *dev;
 
-  /* Format descriptor returned verbatim by uvc_get_format_descs(). */
+  /* Format descriptor returned verbatim by uvc_get_format_descs(). fmt_desc is
+   * the chain head; extra_fmt/extra_frame back the optional multi-format chain
+   * (MOCK_UVC_FORMAT_MULTI_NO_CODEC). In every other mode fmt_desc.next is NULL,
+   * so the single-descriptor behavior is unchanged. */
   uvc_format_desc_t fmt_desc;
   uvc_frame_desc_t frame_desc;
   uint32_t intervals[2];
+  uvc_format_desc_t extra_fmt[2];
+  uvc_frame_desc_t extra_frame[2];
 
   /* Feeder thread state. */
   pthread_t feeder;
@@ -113,7 +118,20 @@ static int g_uvc_close_count = 0; /* uvc_close() calls on a live handle */
  * the element committed when it called uvc_start_streaming(). */
 static mock_uvc_payload_mode_t g_payload_mode = MOCK_UVC_PAYLOAD_ACCEPT;
 static int g_probe_call_count = 0;
+static int g_format_size_call_count = 0;
 static uint32_t g_last_started_payload = 0;
+
+/* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). Records the
+ * last count the element pushed, the number of setter calls, and the count
+ * latched at uvc_start_streaming() (proving the element applied it before the
+ * stream started). g_start_streaming_result injects a start failure for the
+ * zero-transfer error path; g_reopen_fail_next fails the next N opens then
+ * recovers so a SUCCESSFUL reconnect (and its re-apply) is assertable. */
+static uint8_t g_last_transfer_buffers = 0;
+static int g_transfer_buffers_call_count = 0;
+static uint8_t g_last_started_transfer_buffers = 0;
+static uvc_error_t g_start_streaming_result = UVC_SUCCESS;
+static int g_reopen_fail_next = 0;
 
 /* Open-failure injection (Task 8). g_uvc_open_attempts counts every uvc_open()
  * past the param/refcount checks (successes AND injected failures). After
@@ -190,7 +208,13 @@ void mock_uvc_reset(void) {
   g_uvc_open_fail_after = -1;
   g_payload_mode = MOCK_UVC_PAYLOAD_ACCEPT;
   g_probe_call_count = 0;
+  g_format_size_call_count = 0;
   g_last_started_payload = 0;
+  g_last_transfer_buffers = 0;
+  g_transfer_buffers_call_count = 0;
+  g_last_started_transfer_buffers = 0;
+  g_start_streaming_result = UVC_SUCCESS;
+  g_reopen_fail_next = 0;
   g_pan_min = -180000; g_pan_max = 180000; g_pan_cur = 0;
   g_tilt_min = -90000; g_tilt_max = 90000; g_tilt_cur = 0;
   g_zoom_min = 0; g_zoom_max = 100; g_zoom_cur = 0;
@@ -358,6 +382,46 @@ int mock_uvc_probe_call_count(void) {
   int n = g_probe_call_count;
   pthread_mutex_unlock(&g_lock);
   return n;
+}
+
+int mock_uvc_format_size_call_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_format_size_call_count;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+uint8_t mock_uvc_last_transfer_buffers(void) {
+  pthread_mutex_lock(&g_lock);
+  uint8_t n = g_last_transfer_buffers;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+int mock_uvc_transfer_buffers_call_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_transfer_buffers_call_count;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+uint8_t mock_uvc_last_started_transfer_buffers(void) {
+  pthread_mutex_lock(&g_lock);
+  uint8_t n = g_last_started_transfer_buffers;
+  pthread_mutex_unlock(&g_lock);
+  return n;
+}
+
+void mock_uvc_set_start_streaming_result(uvc_error_t result) {
+  pthread_mutex_lock(&g_lock);
+  g_start_streaming_result = result;
+  pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_reopen_fail_count(int n) {
+  pthread_mutex_lock(&g_lock);
+  g_reopen_fail_next = n;
+  pthread_mutex_unlock(&g_lock);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -686,6 +750,10 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   g_uvc_open_attempts++;
   bool inject_fail =
       (g_uvc_open_fail_after >= 0 && g_uvc_open_count >= g_uvc_open_fail_after);
+  if (!inject_fail && g_reopen_fail_next > 0) {
+    g_reopen_fail_next--;
+    inject_fail = true;
+  }
   pthread_mutex_unlock(&g_lock);
   if (inject_fail)
     return UVC_ERROR_NO_DEVICE;
@@ -752,7 +820,8 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   }
 
   memset(&h->fmt_desc, 0, sizeof(h->fmt_desc));
-  if (format_mode == MOCK_UVC_FORMAT_NO_CODEC) {
+  if (format_mode == MOCK_UVC_FORMAT_NO_CODEC ||
+      format_mode == MOCK_UVC_FORMAT_MULTI_NO_CODEC) {
     /* A format the element does not handle, so negotiate() finds no codec. */
     memcpy(h->fmt_desc.fourccFormat, "MJPG", 4);
   } else {
@@ -761,6 +830,34 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   }
   h->fmt_desc.frame_descs = &h->frame_desc;
   h->fmt_desc.next = NULL;
+
+  if (format_mode == MOCK_UVC_FORMAT_MULTI_NO_CODEC) {
+    /* Chain two more non-codec formats after the MJPG head, each with a distinct
+     * resolution and interval, so negotiate()'s descriptor inventory has several
+     * entries to enumerate (fourcc + per-frame WxH + interval range). */
+    memset(h->extra_frame, 0, sizeof(h->extra_frame));
+    memset(h->extra_fmt, 0, sizeof(h->extra_fmt));
+
+    h->extra_frame[0].bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED;
+    h->extra_frame[0].wWidth = 1280;
+    h->extra_frame[0].wHeight = 720;
+    h->extra_frame[0].dwMinFrameInterval = 333333; /* 30 fps */
+    h->extra_frame[0].dwMaxFrameInterval = 333333;
+    memcpy(h->extra_fmt[0].fourccFormat, "YUY2", 4);
+    h->extra_fmt[0].frame_descs = &h->extra_frame[0];
+    h->extra_fmt[0].next = &h->extra_fmt[1];
+
+    h->extra_frame[1].bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED;
+    h->extra_frame[1].wWidth = 640;
+    h->extra_frame[1].wHeight = 480;
+    h->extra_frame[1].dwMinFrameInterval = 333333;  /* 30 fps */
+    h->extra_frame[1].dwMaxFrameInterval = 666666;  /* 15 fps (a real range) */
+    memcpy(h->extra_fmt[1].fourccFormat, "NV12", 4);
+    h->extra_fmt[1].frame_descs = &h->extra_frame[1];
+    h->extra_fmt[1].next = NULL;
+
+    h->fmt_desc.next = &h->extra_fmt[0];
+  }
 
 #ifdef MOCK_LIBUSB_TEARDOWN
   h->usb_handle = mock_libusb_alloc_handle();
@@ -818,6 +915,9 @@ uvc_error_t uvc_get_stream_ctrl_format_size(uvc_device_handle_t *devh,
   (void)format; (void)width; (void)height; (void)fps;
   if (!devh || !ctrl)
     return UVC_ERROR_INVALID_PARAM;
+  pthread_mutex_lock(&g_lock);
+  g_format_size_call_count++;
+  pthread_mutex_unlock(&g_lock);
   memset(ctrl, 0, sizeof(*ctrl));
   ctrl->bFormatIndex = 1;
   ctrl->bFrameIndex = 1;
@@ -849,6 +949,28 @@ uvc_error_t uvc_probe_stream_ctrl(uvc_device_handle_t *devh,
   return UVC_SUCCESS;
 }
 
+/* Fork A2 API. Records the requested count and the call tally, then mirrors the
+ * fork contract: NULL handle -> INVALID_PARAM, a set while the stream is running
+ * -> BUSY (the element must apply it before uvc_start_streaming). The clamp to
+ * [2,100] lives in the element; the mock accepts any value the element passes. */
+uvc_error_t uvc_set_transfer_buffers(uvc_device_handle_t *devh, uint8_t count) {
+  if (!devh)
+    return UVC_ERROR_INVALID_PARAM;
+
+  pthread_mutex_lock(&g_lock);
+  g_transfer_buffers_call_count++;
+  g_last_transfer_buffers = count;
+  pthread_mutex_unlock(&g_lock);
+
+  pthread_mutex_lock(&devh->lock);
+  int running = devh->running;
+  pthread_mutex_unlock(&devh->lock);
+  if (running)
+    return UVC_ERROR_BUSY;
+
+  return UVC_SUCCESS;
+}
+
 uvc_error_t uvc_start_streaming(uvc_device_handle_t *devh,
                                 uvc_stream_ctrl_t *ctrl,
                                 uvc_frame_callback_t *cb, void *user_ptr,
@@ -858,8 +980,15 @@ uvc_error_t uvc_start_streaming(uvc_device_handle_t *devh,
     return UVC_ERROR_INVALID_PARAM;
 
   pthread_mutex_lock(&g_lock);
+  uvc_error_t inject = g_start_streaming_result;
+  pthread_mutex_unlock(&g_lock);
+  if (inject != UVC_SUCCESS)
+    return inject;
+
+  pthread_mutex_lock(&g_lock);
   g_frames_delivered = 0;
   g_last_started_payload = (ctrl != NULL) ? ctrl->dwMaxPayloadTransferSize : 0;
+  g_last_started_transfer_buffers = g_last_transfer_buffers;
   pthread_mutex_unlock(&g_lock);
 
   devh->cb = cb;

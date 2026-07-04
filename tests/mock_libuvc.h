@@ -78,6 +78,11 @@ typedef enum {
   /* A non-codec format (fourcc "MJPG"): negotiate() must find no H264/H265
    * descriptor and post a bus error instead of streaming. */
   MOCK_UVC_FORMAT_NO_CODEC,
+  /* A CHAIN of non-codec formats (MJPG + YUY2 + NV12), each with a distinct
+   * resolution: negotiate() still finds no H264/H265 and posts the same bus
+   * error, but first logs an inventory of every advertised descriptor. Lets a
+   * test assert the descriptor-inventory diagnostics (Task 12). */
+  MOCK_UVC_FORMAT_MULTI_NO_CODEC,
   /* No interval list and dwMin/MaxFrameInterval == 0: the device-interval
    * branch of negotiate() must not divide by zero. */
   MOCK_UVC_FORMAT_ZERO_DEVICE_INTERVAL,
@@ -185,6 +190,38 @@ uint32_t mock_uvc_last_started_payload(void);
 /* uvc_probe_stream_ctrl() calls since reset. 0 proves the element issued NO
  * extra probe (max-payload unset = byte-for-byte unchanged negotiation). */
 int mock_uvc_probe_call_count(void);
+
+/* uvc_get_stream_ctrl_format_size() calls since reset (Task 12 quirk seam). A
+ * default negotiation issues exactly 1; a device keyed to QUIRK_DOUBLE_PROBE
+ * issues exactly 2 (the first result discarded). */
+int mock_uvc_format_size_call_count(void);
+
+/* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). The last
+ * count the element pushed via uvc_set_transfer_buffers() and how many times it
+ * called the setter. A call count of 0 proves the sentinel (transfer-buffers=0)
+ * never touched the fork API, so negotiation is byte-for-byte unchanged. */
+uint8_t mock_uvc_last_transfer_buffers(void);
+int mock_uvc_transfer_buffers_call_count(void);
+
+/* The transfer-buffer count latched at the last uvc_start_streaming(): the value
+ * uvc_set_transfer_buffers() had recorded when the stream started. Because the
+ * fork rejects the setter mid-stream, this proves the element applied the count
+ * BEFORE starting (0 = never applied). */
+uint8_t mock_uvc_last_started_transfer_buffers(void);
+
+/* Force the NEXT uvc_start_streaming() to fail with this error, modelling the
+ * A2 zero-transfer error path (a transfer count that submits no transfers).
+ * UVC_SUCCESS (the default) starts normally. */
+void mock_uvc_set_start_streaming_result(uvc_error_t result);
+
+/* Reconnect-SUCCESS injection: fail the next N uvc_open() calls with
+ * UVC_ERROR_NO_DEVICE, then let opens succeed again. Unlike
+ * mock_uvc_set_open_fail_after() - which fails FOREVER and drives the reconnect
+ * loop to exhaustion - this models a device that returns after a few failed
+ * reopen attempts, so a SUCCESSFUL reconnect (and the re-apply on it) is
+ * assertable. Set it AFTER the initial open so only the reopens fail. 0
+ * (default) injects no failure. */
+void mock_uvc_set_reopen_fail_count(int n);
 
 #ifdef __cplusplus
 }
