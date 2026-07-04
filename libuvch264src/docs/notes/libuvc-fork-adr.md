@@ -53,6 +53,29 @@ Do not use upstream `main` or re-tag from a later upstream commit. The fork base
 
 ## Fork URL (filled by Task 11)
 
+> **CURRENT PIN (authoritative):** the build pins the fork at
+> `ceralive-v0.0.7.8`. The v0.0.7.2 block immediately below is retained as the
+> historical record of how the fork first reached a hardening release; the
+> v0.0.7.3 and v0.0.7.4→v0.0.7.8 addenda further down record the subsequent
+> hardening wave and the five emergency UAF/lifetime hotfix rounds. This
+> callout is the pin the CI guard (`scripts/check-libuvc-fork.sh`) reads.
+
+- **Current release tag:** `ceralive-v0.0.7.8` (UAF/lifetime hotfix rounds on top of the v0.0.7.3 hardening wave)
+- **Tag/HEAD commit SHA:** `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`
+- **Base SHA (provenance only):** `68d07a00e11d1944e27b7295ee69673239c00b4b` — confirmed ancestor of HEAD.
+
+**Pin downstream builds by SHA** (the value `FORK_SHA` carries at `scripts/build-libuvc.sh:39`):
+
+```
+GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
+GIT_TAG        71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d   # main, tag ceralive-v0.0.7.8
+```
+
+See the "v0.0.7.8 Addendum" section below for the full v0.0.7.4→v0.0.7.8
+hotfix chain. The v0.0.7.2 record follows.
+
+---
+
 - **Fork URL:** `https://github.com/CeraLive/libuvc`
 - **Clone (HTTPS):** `https://github.com/CeraLive/libuvc.git`
 - **Visibility:** PUBLIC (no auth required to clone)
@@ -127,6 +150,43 @@ authoritative provenance table for this hardening wave. Ancestry gates
 `6210f2f`) hold; `LICENSE.txt` remains byte-identical to the base.
 
 Full detail: `.omo/evidence/task-9-uvc-camera-compat-stability.txt`.
+
+---
+
+## v0.0.7.8 Addendum (post-release UAF/lifetime hotfix rounds)
+
+This section records five emergency hotfix rounds landed on `main` on top of
+`ceralive-v0.0.7.3` (`6210f2f`). They were surfaced by an adversarial
+code-quality review of the new bounded `uvc_stream_stop()`/A5 teardown path,
+which caught a use-after-free chain reachable when a stop-timeout leaves an
+event/handler thread alive while teardown proceeds. Each round is a single,
+narrowly-scoped commit; none change default behavior. This addendum does not
+modify the v0.0.7.2 or v0.0.7.3 records above.
+
+- **Current release tag:** `ceralive-v0.0.7.8`
+- **Tag/HEAD commit SHA:** `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`
+- **Current pin:** `scripts/build-libuvc.sh:39` `FORK_SHA` in `gstlibuvch264src`
+
+```
+GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
+GIT_TAG        71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d   # main, tag ceralive-v0.0.7.8
+```
+
+Hotfix chain (v0.0.7.3 → v0.0.7.8), each on top of the previous:
+
+| Tag | Fix |
+|-----|-----|
+| `ceralive-v0.0.7.4` | UAF hotfix: quarantine `strmh` on the A5 stop-timeout path in `uvc_stream_close` so a late transfer callback cannot deref freed stream state. |
+| `ceralive-v0.0.7.5` | `devh` lifetime hotfix: quarantine `devh` in `uvc_close` so a late `LIBUSB_TRANSFER_COMPLETED` callback deref of `strmh->devh->is_isight` is lifetime-safe. |
+| `ceralive-v0.0.7.6` | Context lifetime hotfix: quarantine `uvc_context` so `uvc_exit` skips `libusb_exit`/free and `uvc_open_internal` skips a duplicate handler thread while a stop-timeout event thread still runs on `ctx->usb_ctx`. |
+| `ceralive-v0.0.7.7` | Handler-thread guard: gate `uvc_close`'s last-device `kill_handler_thread`/`pthread_join` on `!has_quarantined_device` so a normal close of a device reopened on a quarantined ctx never kills the surviving event thread. |
+| `ceralive-v0.0.7.8` | Safe iteration: `uvc_exit` iterates `ctx->open_devices` with `DL_FOREACH_SAFE` so `uvc_close` freeing the current device does not leave the loop increment reading a freed node's `next` pointer (pre-existing general defect, reproducible with 2+ devices open, with or without quarantine). |
+
+Ancestry gates (`68d07a00e11d1944e27b7295ee69673239c00b4b`, `eae7f49`, and
+`6210f2f` all ancestors of `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`) hold;
+`LICENSE.txt` remains byte-identical to the base. Full per-round detail lives in
+the fork's own `CHANGELOG.ceralive.md` and in
+`libuvch264src/docs/notes/camera-compat.md`.
 
 ---
 
