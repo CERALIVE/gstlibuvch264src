@@ -129,10 +129,8 @@ something the field-triage steps above can toggle at the command line today.
 The CeraLive `libuvc` fork (tag `ceralive-v0.0.7.3`, SHA
 `6210f2f64965af532440be357e6971b9b618797f`) carries a tiered backlog of
 robustness backports, audited item-by-item against the fork's pre-hardening
-state (`.omo/evidence/task-1-uvc-camera-compat-stability.md`) and finalized
-in the fork's `CHANGELOG.ceralive.md` (`.omo/evidence/task-9-uvc-camera-compat-stability.txt`).
-Each backlog ID (A1-A14) maps to either a landed fork commit or a
-skip-equivalent reason.
+state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
+(A1-A14) maps to either a landed fork commit or a skip-equivalent reason.
 
 | ID | Source | Verdict | Fork commit | What it fixes / why it's skipped |
 |----|--------|---------|--------------|-----------------------------------|
