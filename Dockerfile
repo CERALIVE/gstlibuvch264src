@@ -38,7 +38,7 @@ COPY . /app
 # Source selected by the LIBUVC_USE_FORK build arg (see the ADR at
 # libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
-#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.3 SHA. The
+#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.8 SHA. The
 #                three changes are commits on the fork, so NO patch(1) step runs.
 #   0 (rollback): upstream v0.0.7 at its pinned SHA + the UVC 1.5 / H.265 patches
 #                from patches/ (the pre-fork path). Build with
