@@ -10,7 +10,7 @@
 # Two modes (see libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
 #   fork     (default): clone the CeraLive/libuvc fork at the pinned
-#            ceralive-v0.0.7.3 SHA. The UVC 1.5 / H.265 / configurable
+#            ceralive-v0.0.7.8 SHA. The UVC 1.5 / H.265 / configurable
 #            auto-detach changes are commits on the fork, so NO patch(1) step
 #            is needed.
 #   upstream (rollback): clone upstream libuvc v0.0.7 at its pinned SHA and

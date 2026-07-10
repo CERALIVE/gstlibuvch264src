@@ -106,7 +106,7 @@ jobs:
             binutils
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-${{ runner.os }}-reproducibility-${{ github.sha }}
@@ -154,7 +154,7 @@ jobs:
             ccache
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-${{ runner.os }}-functional-${{ github.sha }}

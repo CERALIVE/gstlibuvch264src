@@ -109,6 +109,16 @@ jobs:
           ARCH: ${{ matrix.config.arch }}
         run: |
           mkdir -p dist
+          GNUARCH=$([[ "$ARCH" == "arm64" ]] && echo "aarch64-linux-gnu" || echo "x86_64-linux-gnu")
+          PLUGIN="build/usr/lib/${GNUARCH}/gstreamer-1.0/libgstlibuvch264src.so"
+          LIBUVC="build/usr/lib/${GNUARCH}/libuvc.so.0"
+          readelf -d "$PLUGIN" "$LIBUVC" | tee "dist/needed-${ARCH}.txt"
+          readelf --version-info "$PLUGIN" "$LIBUVC" | tee "dist/versions-${ARCH}.txt"
+          grep -q "Shared library: \\[libjpeg.so.62\\]" "dist/needed-${ARCH}.txt"
+          if grep -Eq "GLIBC_2\\.3[89]" "dist/versions-${ARCH}.txt"; then
+            echo "Plugin payload was built against a newer glibc than Debian bookworm provides" >&2
+            exit 1
+          fi
 
           # Create .deb package
           fpm -s dir -t deb \
@@ -120,6 +130,9 @@ jobs:
             --url "https://github.com/CERALIVE/gstlibuvch264src" \
             --license "LGPL-2.1" \
             --depends "libgstreamer1.0-0" \
+            --depends "libusb-1.0-0" \
+            --depends "libjpeg62-turbo" \
+            --depends "libc6 (>= 2.36)" \
             -p "dist/gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.deb" \
             build/usr/=/usr/
 

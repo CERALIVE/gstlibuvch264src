@@ -108,7 +108,7 @@ in commit `2f32812` (default `ON`); the UVC 1.5 header (Hunk B) and H.265 suppor
 (Hunk C) are unconditional. `LICENSE.txt` is byte-identical to the base (BSD-3-Clause
 preserved verbatim). Standalone build verified (`cmake . && make`).
 
-Evidence: `.omo/evidence/task-11-fork-build.txt`, `.omo/evidence/task-11-license.txt`.
+Standalone build and license parity were verified before pinning this fork SHA.
 
 Tasks 17/22/23 may now pin the SHA above.
 
@@ -149,7 +149,8 @@ authoritative provenance table for this hardening wave. Ancestry gates
 (`68d07a00e11d1944e27b7295ee69673239c00b4b` and `eae7f49` both ancestors of
 `6210f2f`) hold; `LICENSE.txt` remains byte-identical to the base.
 
-Full detail: `.omo/evidence/task-9-uvc-camera-compat-stability.txt`.
+Full detail: see `libuvch264src/docs/notes/camera-compat.md` §3 and the fork's
+`CHANGELOG.ceralive.md`.
 
 ---
 

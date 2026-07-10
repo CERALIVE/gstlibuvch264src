@@ -1,10 +1,10 @@
 # Multi-architecture support (driven by buildx --platform; CI builds amd64 + arm64)
 ARG TARGETARCH
 
-# Base pinned to a digest (not the mutable :latest / floating :24.04 tag) so the
+# Base pinned to a digest (not the mutable :latest / floating :bookworm tag) so the
 # build is reproducible and verifiable offline. Refresh via:
-#   docker buildx imagetools inspect ubuntu:24.04   (use the index Digest)
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54 AS build
+#   docker buildx imagetools inspect debian:bookworm-slim   (use the index Digest)
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS build
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -38,7 +38,7 @@ COPY . /app
 # Source selected by the LIBUVC_USE_FORK build arg (see the ADR at
 # libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
-#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.3 SHA. The
+#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.8 SHA. The
 #                three changes are commits on the fork, so NO patch(1) step runs.
 #   0 (rollback): upstream v0.0.7 at its pinned SHA + the UVC 1.5 / H.265 patches
 #                from patches/ (the pre-fork path). Build with
@@ -78,7 +78,7 @@ RUN GNUARCH=$(case "${TARGETARCH}" in \
 
 # Runtime stage MUST stay `FROM scratch`. The release workflow exports this final
 # stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`).
-# An ubuntu stage here exported the entire distro /usr, producing a ~56 MB .deb
+# A distro stage here exported the entire distro /usr, producing a ~56 MB .deb
 # that dpkg-file-conflicts with coreutils/libc on install. GStreamer/libusb/libjpeg
 # are runtime deps from the target system (see package Depends), not bundled.
 FROM scratch AS runtime

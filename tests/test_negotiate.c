@@ -351,9 +351,9 @@ GST_END_TEST;
  * negotiate instead of failing with UVC_ERROR_INVALID_MODE.
  *
  * That check lives entirely inside libuvc, which this suite replaces with
- * mock_libuvc.c, so the libuvc-layer RED->GREEN proof for the backport is the
- * fork-level harness recorded in .omo/evidence/task-10-tdd-redgreen.txt (probe
- * RED -51 pre-backport, GREEN 0 post-backport for a 512<3072 payload). This
+ * mock_libuvc.c, so the libuvc-layer RED->GREEN proof for the backport lives in
+ * the CeraLive libuvc fork harness (probe RED -51 pre-backport, GREEN 0
+ * post-backport for a 512<3072 payload). This
  * element-level case guards the consumer side: the negotiate() path must reach
  * PLAYING and deliver frames against a device that negotiated successfully, the
  * very outcome the backport now unlocks for smaller-payload cameras. */

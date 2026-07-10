@@ -2,7 +2,7 @@
 
 GStreamer source element that pulls H.264 frames directly from DJI action cameras and UVC devices via libuvc. Developed by UnlimitedIRL; forked/maintained under CeraLive.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in the current `ceralive-v0.0.7.3`, SHA `6210f2f64965af532440be357e6971b9b618797f`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in the current `ceralive-v0.0.7.8`, SHA `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 Parent manifest: [`../AGENTS.md`](../AGENTS.md)
 
@@ -76,13 +76,13 @@ gstlibuvch264src/
 │   ├── libuvc-h265-support.patch  # H.265 stream format support
 │   └── README.md
 ├── CMakeLists.txt           # TEST-ONLY build: compiles plugin + full ctest suite
-├── Dockerfile               # Reproducible build environment (pinned ubuntu:24.04 + libuvc SHA)
+├── Dockerfile               # Reproducible build environment (pinned Debian bookworm + libuvc SHA)
 └── README.md
 ```
 
 > `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
 > `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
-> (`6210f2f` on `main`, tag `ceralive-v0.0.7.3`) — no patch step needed. With
+> (`71588db` on `main`, tag `ceralive-v0.0.7.8`) — no patch step needed. With
 > `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
 > (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
 > `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
@@ -245,12 +245,12 @@ On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP 
 The `Dockerfile` pins both the base image and the libuvc source:
 
 ```
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 ```
 
-libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `6210f2f` / tag `ceralive-v0.0.7.3`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
+libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `71588db` / tag `ceralive-v0.0.7.8`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
-**Two stages: pinned-ubuntu `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to an Ubuntu base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (package `Depends: libgstreamer1.0-0`), not bundled in the image.
+**Two stages: pinned Debian bookworm `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to a distro base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (`Depends: libgstreamer1.0-0`, `libusb-1.0-0`, `libjpeg62-turbo`, `libc6 (>= 2.36)`), not bundled in the image. The base image intentionally matches the device image's Debian bookworm ABI so the plugin cannot pick up Ubuntu 24.04-only symbols such as `GLIBC_2.38` or `libjpeg.so.8`.
 
 ---
 
