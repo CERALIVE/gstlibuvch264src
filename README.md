@@ -4,7 +4,7 @@ GStreamer source element for UVC H.264 (and H.265) capture devices — DJI actio
 
 Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths bypass this element entirely.
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in the current `ceralive-v0.0.7.8`, SHA `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in `ceralive-v0.0.7.9`, SHA `ada082b5009e38a89eb7cd6176683b508cd99ff5`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
 [![CI](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml)
 [![Release](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml)
