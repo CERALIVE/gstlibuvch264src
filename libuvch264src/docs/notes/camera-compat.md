@@ -126,8 +126,8 @@ something the field-triage steps above can toggle at the command line today.
 
 ## 3. Fork-Backport Provenance Table
 
-The CeraLive `libuvc` fork (tag `ceralive-v0.0.7.8`, SHA
-`71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`) carries a tiered backlog of
+The CeraLive `libuvc` fork (tag `ceralive-v0.0.7.9`, SHA
+`ada082b5009e38a89eb7cd6176683b508cd99ff5`) carries a tiered backlog of
 robustness backports, audited item-by-item against the fork's pre-hardening
 state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
 (A1-A14) maps to either a landed fork commit or a skip-equivalent reason.
