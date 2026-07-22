@@ -54,21 +54,21 @@ Do not use upstream `main` or re-tag from a later upstream commit. The fork base
 ## Fork URL (filled by Task 11)
 
 > **CURRENT PIN (authoritative):** the build pins the fork at
-> `ceralive-v0.0.7.8`. The v0.0.7.2 block immediately below is retained as the
+> `ceralive-v0.0.7.9`. The v0.0.7.2 block immediately below is retained as the
 > historical record of how the fork first reached a hardening release; the
 > v0.0.7.3 and v0.0.7.4→v0.0.7.8 addenda further down record the subsequent
 > hardening wave and the five emergency UAF/lifetime hotfix rounds. This
 > callout is the pin the CI guard (`scripts/check-libuvc-fork.sh`) reads.
 
-- **Current release tag:** `ceralive-v0.0.7.8` (UAF/lifetime hotfix rounds on top of the v0.0.7.3 hardening wave)
-- **Tag/HEAD commit SHA:** `71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d`
+- **Current release tag:** `ceralive-v0.0.7.9` (descriptor scanner length bounds on top of the UAF/lifetime hotfix rounds)
+- **Tag/HEAD commit SHA:** `ada082b5009e38a89eb7cd6176683b508cd99ff5`
 - **Base SHA (provenance only):** `68d07a00e11d1944e27b7295ee69673239c00b4b` — confirmed ancestor of HEAD.
 
 **Pin downstream builds by SHA** (the value `FORK_SHA` carries at `scripts/build-libuvc.sh:39`):
 
 ```
 GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
-GIT_TAG        71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d   # main, tag ceralive-v0.0.7.8
+GIT_TAG        ada082b5009e38a89eb7cd6176683b508cd99ff5   # main, tag ceralive-v0.0.7.9
 ```
 
 See the "v0.0.7.8 Addendum" section below for the full v0.0.7.4→v0.0.7.8
