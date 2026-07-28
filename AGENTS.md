@@ -82,7 +82,7 @@ gstlibuvch264src/
 
 > `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
 > `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
-> (`ada082b` on `main`, tag `ceralive-v0.0.7.9`) — no patch step needed. With
+> (`f3eda76` on `main`, PR #7 — the `uvc_close()` status-transfer + interface-release fix; supersedes tag `ceralive-v0.0.7.9`/`ada082b`, which is an ancestor) — no patch step needed. With
 > `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
 > (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
 > `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
@@ -98,6 +98,7 @@ gstlibuvch264src/
 | NAL parsing / PTS / frame callback | `libuvch264src/src/frame_pipeline.c` |
 | PTZ probe/set + control socket | `libuvch264src/src/ptz_control.c` |
 | USB teardown + V4L2 probe | `libuvch264src/src/uvc_device.c` |
+| Wedged-device USB port-reset recovery | `libuvch264src/src/gstlibuvch264src.c` → `gst_libuvc_h264_src_reset_silent_device()` |
 | SPS/PPS cache | `libuvch264src/src/spspps_cache.c` |
 | Error mapping helper | `libuvch264src/src/gstlibuvch264src_error.c` |
 | vid:pid quirk seam (table + lookup) | `libuvch264src/src/quirks.c` |
@@ -187,6 +188,14 @@ Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_T
 
 ## DISCONNECT / RECONNECT BEHAVIOR
 
+**Wedged-device recovery (always on, one-shot per silence episode).** Sustained silence has TWO causes that are indistinguishable from inside `create()`: the device was unplugged, or it is still fully present but **wedged** — enumerated, answering every control transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the streaming endpoint. Measured on a DJI Osmo Pocket 3 (`2ca3:0023`) after the holding process died without `uvc_close()`; reproduced identically through libuvc AND through the kernel `uvcvideo` driver, which is what proves it is device state and not an element bug. **A close/reopen does not clear it — only a USB port reset does.** So before claiming a disconnect (which is factually wrong for a device still on the bus), `create()` calls `gst_libuvc_h264_src_reset_silent_device()`: `libusb_reset_device()` on the live handle, a `RESET_SETTLE_MS` (4 s) interruptible settle window, then ONE reopen. Notes:
+
+- `LIBUSB_ERROR_NOT_FOUND` counts as **success** — libusb returns it when the reset re-enumerated the device, which is the outcome we want. Any other non-zero status means the port reset did not happen, so the device really is unreachable and the disconnect error surfaces as before.
+- The settle window is load-bearing and measured: reopening ~1 s after the reset returns OK from both `uvc_open()` and `uvc_start_streaming()` and then delivers zero frames — indistinguishable from the wedge just cleared.
+- It is **one reopen, not the `reconnect` ladder**. `reconnect` remains the property that buys the 1/2/4/8/16 s retry schedule; when `reconnect=true` that path runs instead and is unchanged.
+- The one-shot re-arms only after the device has PROVEN it recovered (`RESET_RECOVERY_REARM_FRAMES` = 30 frames, ~1 s at 30 fps). Re-arming on the first frame back lets a device that emits one frame and re-wedges reset the port forever.
+- Cost to a genuinely absent device: nothing — the reset fails and the error surfaces. Cost to the error latency with `reconnect=false`: the disconnect error is now reported later (measured ~14 s vs ~5 s) because the reset, settle and reopen run first.
+
 **Disconnect detection (always on):** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently — in callback mode it does **not** invoke the callback with a NULL frame, it simply goes quiet (Task 4 spike). `create()` therefore infers a disconnect from sustained silence: it counts consecutive `g_async_queue_timeout_pop` timeouts (each `TIMEOUT_DURATION` = 1 s), and after `DISCONNECT_TIMEOUT_COUNT` (5) in a row — i.e. ~5 s with no frame — it treats the device as gone. The counter resets on every real frame and in `start()`, so an isolated gap never trips it. On a confirmed disconnect with `reconnect=false` (the default), it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and returns `GST_FLOW_ERROR`; downstream (cerastream) handles the error.
 
 **Reconnect (opt-in, default off):** With the `reconnect` property set to `true`, a confirmed disconnect first triggers an in-element reconnect before any error is posted. The path uses the spike's verified **native** teardown — `uvc_stop_streaming()` → `uvc_close()` → `uvc_unref_device()` (the callback thread joins cleanly and the libusb handle is closed exactly once) — then re-enumerates and re-resolves the `index` selector against a fresh device list (bus/address can change across a replug; a `vid:pid`/`serial:` selector survives it, a `bus:`/ordinal one may resolve to a different device), reopens, re-runs `uvc_get_stream_ctrl_format_size` with the negotiated geometry, and restarts streaming. Retries use bounded exponential backoff (1, 2, 4, 8, 16 s; `RECONNECT_MAX_RETRIES` = 5); the backoff is interruptible so a state change to NULL/PAUSED tears down promptly. If every retry is exhausted, it falls back to the disconnect error above. On success the IDR gate and PTS baseline are re-armed so the resumed stream waits for a fresh IDR.
@@ -248,7 +257,7 @@ The `Dockerfile` pins both the base image and the libuvc source:
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 ```
 
-libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `ada082b` / tag `ceralive-v0.0.7.9`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
+libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `f3eda76` on `main`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
 **Two stages: pinned Debian bookworm `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to a distro base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (`Depends: libgstreamer1.0-0`, `libusb-1.0-0`, `libjpeg62-turbo`, `libc6 (>= 2.36)`), not bundled in the image. The base image intentionally matches the device image's Debian bookworm ABI so the plugin cannot pick up Ubuntu 24.04-only symbols such as `GLIBC_2.38` or `libjpeg.so.8`.
 
@@ -329,6 +338,10 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT link against system libuvc if it exists; the pinned fork/upstream copy is intentional for version pinning.
 - Do NOT modify `scripts/build-libuvc.sh` SHA constants without updating both `FORK_SHA` and `UPSTREAM_SHA` together — they are the single source of truth for the dependency.
 - Do NOT hardcode `aarch64-linux-gnu` in build paths — use `$(gcc -print-multiarch)`.
+- Do NOT delete the `RESET_SETTLE_MS` wait in `gst_libuvc_h264_src_reset_silent_device()` — it looks like a gratuitous sleep and is not. A reopen issued too soon after a port reset succeeds and then delivers zero frames, which is exactly the bug the reset exists to fix.
+- Do NOT treat `LIBUSB_ERROR_NOT_FOUND` from `libusb_reset_device()` as a failure — it means the reset re-enumerated the device, which is success.
+- Do NOT re-arm the port-reset one-shot on the first frame after a recovery; a device that emits one frame and re-wedges would then reset the port in an endless loop.
+- Do NOT give the reset-recovery path the full `reconnect` retry ladder — the exhaustion tests assert an exact reopen-attempt count, and `reconnect` is the property that buys the ladder.
 - Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
 - Do NOT enable `control-socket` by default or fall back to a world-accessible path when `XDG_RUNTIME_DIR` is unset — the socket must be opt-in and per-instance.
 - Do NOT set PTZ properties outside the param-spec range in tests — GObject emits a range warning that gst-check turns into a longjmp, skipping teardown and hanging the process.

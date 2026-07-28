@@ -1243,6 +1243,9 @@ set(_reconnect_cases
   "reconnect_exhaustion:test_reconnect_exhaustion"
   "reconnect_backoff_sequence:test_reconnect_backoff_sequence"
   "reconnect_backoff_interrupt:test_reconnect_backoff_interrupt"
+  "wedged_device_reset_recovers:test_wedged_device_reset_recovers"
+  "wedged_device_reset_is_one_shot:test_wedged_device_reset_is_one_shot"
+  "absent_device_reset_fails_through:test_absent_device_reset_fails_through"
 )
 # start() may spawn the control thread, so keep these off the shared socket
 # resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).

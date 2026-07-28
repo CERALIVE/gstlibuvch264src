@@ -53,23 +53,41 @@ Do not use upstream `main` or re-tag from a later upstream commit. The fork base
 
 ## Fork URL (filled by Task 11)
 
-> **CURRENT PIN (authoritative):** the build pins the fork at
-> `ceralive-v0.0.7.9`. The v0.0.7.2 block immediately below is retained as the
-> historical record of how the fork first reached a hardening release; the
-> v0.0.7.3 and v0.0.7.4→v0.0.7.8 addenda further down record the subsequent
-> hardening wave and the five emergency UAF/lifetime hotfix rounds. This
-> callout is the pin the CI guard (`scripts/check-libuvc-fork.sh`) reads.
+> **CURRENT PIN (authoritative):** the build pins the fork at `main` commit
+> `f3eda76` (libuvc PR #7 — device teardown). The `ceralive-v0.0.7.9` block is
+> retained just below as the previous pin; the v0.0.7.2 block further down is the
+> historical record of how the fork first reached a hardening release, and the
+> v0.0.7.3 and v0.0.7.4→v0.0.7.8 addenda record the subsequent hardening wave and
+> the five emergency UAF/lifetime hotfix rounds. This callout is the pin the CI
+> guard (`scripts/check-libuvc-fork.sh`) reads.
 
-- **Current release tag:** `ceralive-v0.0.7.9` (descriptor scanner length bounds on top of the UAF/lifetime hotfix rounds)
-- **Tag/HEAD commit SHA:** `ada082b5009e38a89eb7cd6176683b508cd99ff5`
+- **Current release tag:** _none — pinned by SHA on `main`._ `f3eda76` is untagged; cut
+  `ceralive-v0.0.7.10` on it when convenient and update this block. Pinning by SHA is
+  already the rule here (tags are mutable), so the absence of a tag does not weaken the pin.
+- **Tag/HEAD commit SHA:** `f3eda761b69acdfa6c0ffc02119b2bda172b9d46`
 - **Base SHA (provenance only):** `68d07a00e11d1944e27b7295ee69673239c00b4b` — confirmed ancestor of HEAD.
+- **Supersedes:** `ada082b5009e38a89eb7cd6176683b508cd99ff5` (`ceralive-v0.0.7.9`), which is an
+  ancestor of this SHA — no work is dropped by moving the pin forward.
+
+**Why this pin moved.** `uvc_close()` never stopped the VideoControl status interrupt
+transfer and released only the control interface, so a close could leave the kernel
+`uvcvideo` driver detached and the camera's `/dev/videoN` gone. That is one of the ways a
+UVC device ends up **wedged** — enumerated and answering control transfers while
+delivering nothing on its streaming endpoint (see AGENTS.md → DISCONNECT / RECONNECT
+BEHAVIOR). Until this pin moved, a built `.deb` shipped the unfixed teardown even though
+the fix was merged in the fork.
 
 **Pin downstream builds by SHA** (the value `FORK_SHA` carries at `scripts/build-libuvc.sh:39`):
 
 ```
 GIT_REPOSITORY https://github.com/CeraLive/libuvc.git
-GIT_TAG        ada082b5009e38a89eb7cd6176683b508cd99ff5   # main, tag ceralive-v0.0.7.9
+GIT_TAG        f3eda761b69acdfa6c0ffc02119b2bda172b9d46   # main, untagged (PR #7 device teardown)
 ```
+
+### Previous pin — `ceralive-v0.0.7.9`
+
+- **Release tag:** `ceralive-v0.0.7.9` (descriptor scanner length bounds on top of the UAF/lifetime hotfix rounds)
+- **Tag/HEAD commit SHA:** `ada082b5009e38a89eb7cd6176683b508cd99ff5`
 
 See the "v0.0.7.8 Addendum" section below for the full v0.0.7.4→v0.0.7.8
 hotfix chain. The v0.0.7.2 record follows.

@@ -36,7 +36,7 @@ set -euo pipefail
 
 # --- Pinned coordinates — the ONLY place these SHAs/URLs live ----------------
 FORK_URL="https://github.com/CeraLive/libuvc.git"
-FORK_SHA="ada082b5009e38a89eb7cd6176683b508cd99ff5"      # main (ceralive-v0.0.7.9: descriptor scanner length bounds; rejects malformed VC/VS descriptors with UVC_ERROR_INVALID_DEVICE; tag ceralive-v0.0.7.9)
+FORK_SHA="f3eda761b69acdfa6c0ffc02119b2bda172b9d46"      # main (untagged, PR #7): uvc_close() stops+drains the VideoControl status transfer and releases EVERY claimed interface (VideoControl LAST). Without it a close leaves the kernel uvcvideo driver detached and /dev/videoN gone, which is one of the ways a device ends up wedged. Supersedes ada082b (tag ceralive-v0.0.7.9, descriptor scanner length bounds) — that work is an ancestor of this SHA.
 UPSTREAM_URL="https://github.com/libuvc/libuvc.git"
 UPSTREAM_SHA="68d07a00e11d1944e27b7295ee69673239c00b4b"  # v0.0.7 base
 

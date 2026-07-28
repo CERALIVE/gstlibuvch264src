@@ -197,6 +197,17 @@ gst-launch-1.0 libuvch264src index="1234:5678" \
 
 ---
 
+### Wedged-device recovery (always on)
+
+A UVC device can go silent while still fully present on the bus — enumerated and
+answering every control transfer, but delivering nothing. A close/reopen does not
+clear that state; only a USB port reset does. Before reporting a disconnect the
+element therefore issues one `libusb_reset_device()`, waits for the device to
+re-enumerate, and reopens once. This needs no configuration and no extra
+privilege, and a genuinely unplugged device still surfaces the usual
+`RESOURCE/READ` error (the reset simply fails). The recovery re-arms only after
+the device has delivered frames again, so it can never loop.
+
 ### Reconnect on Disconnect
 
 Set `reconnect=true` to enable in-element auto-reconnect when the device is unplugged
