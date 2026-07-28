@@ -24,6 +24,7 @@
  */
 
 #include <gst/check/gstcheck.h>
+#include <libusb-1.0/libusb.h>
 
 #include "gstlibuvch264src.h"
 #include "mock_libuvc.h"
@@ -254,6 +255,158 @@ GST_START_TEST (test_reconnect_resume)
   fail_unless (resumed && final_buffers >= baseline + 5,
       "stream did not resume after reconnect: %d buffers (baseline %d), "
       "open count %d", final_buffers, baseline, open_count);
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
+/* Wedged-device port-reset recovery                                          */
+/*                                                                            */
+/* A UVC device can go silent while still fully present on the bus: it answers */
+/* every control transfer but delivers nothing on the streaming endpoint.      */
+/* Measured on a DJI Osmo Pocket 3 after the holding process died without      */
+/* uvc_close(); a close/reopen does NOT clear it, only a USB port reset does.  */
+/* These cases pin the recovery contract with `reconnect` at its default FALSE,*/
+/* because that is how cerastream runs the element.                            */
+/* ------------------------------------------------------------------------- */
+
+static gint reset_hook_calls;   /* atomic: gst_libuvc_h264_src_reset_silent_device hits */
+static gint reset_hook_status;  /* libusb status the hook returns */
+
+static gint
+recording_reset_hook (GstLibuvcH264Src * self)
+{
+  (void) self;
+  g_atomic_int_inc (&reset_hook_calls);
+  return g_atomic_int_get (&reset_hook_status);
+}
+
+/* Drive a silent source with reconnect OFF and report what the element did.
+ * `hook_status` is the libusb status the port reset reports. */
+typedef struct
+{
+  gint reset_calls;
+  gint open_count;
+  gint buffers_after;
+  gboolean errored;
+} WedgeResult;
+
+static void
+run_wedge_scenario (gint hook_status, gboolean replug_heals, WedgeResult * out)
+{
+  load_core_elements ();
+  register_element ();
+  mock_uvc_reset ();
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+  mock_uvc_set_max_frames (1);
+
+  g_atomic_int_set (&buffers_seen, 0);
+  g_atomic_int_set (&reset_hook_calls, 0);
+  g_atomic_int_set (&reset_hook_status, hook_status);
+  gst_libuvc_h264_src_set_reset_device_hook (recording_reset_hook);
+
+  GstElement *src = NULL;
+  GstElement *pipeline = build_pipeline (&src);
+  /* reconnect stays FALSE: the recovery under test must not need the opt-in. */
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
+      != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&buffers_seen) < 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  if (replug_heals) {
+    /* The reset cleared the wedge: the reopened device streams normally. */
+    mock_uvc_set_frame_mode (MOCK_UVC_FRAME_VALID);
+    mock_uvc_set_max_frames (0);
+  }
+
+  gint baseline = g_atomic_int_get (&buffers_seen);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gboolean errored = FALSE;
+  deadline = g_get_monotonic_time () + 30 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    GstMessage *msg =
+        gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg != NULL) {
+      errored = (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR);
+      gst_message_unref (msg);
+      break;
+    }
+    if (replug_heals && g_atomic_int_get (&buffers_seen) >= baseline + 5
+        && mock_uvc_open_count () >= 2) {
+      break;
+    }
+    g_usleep (20 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  out->reset_calls = g_atomic_int_get (&reset_hook_calls);
+  out->open_count = mock_uvc_open_count ();
+  out->buffers_after = g_atomic_int_get (&buffers_seen) - baseline;
+  out->errored = errored;
+  gst_object_unref (bus);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  gst_libuvc_h264_src_set_reset_device_hook (NULL);
+}
+
+GST_START_TEST (test_wedged_device_reset_recovers)
+{
+  WedgeResult res;
+  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , TRUE, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "a silent source must trigger exactly one port reset with reconnect off, "
+      "got %d", res.reset_calls);
+  fail_unless (res.open_count >= 2,
+      "the reset must be followed by a reopen (open count >= 2), got %d",
+      res.open_count);
+  fail_unless (!res.errored,
+      "a recoverable wedge must NOT surface as a disconnect error");
+  fail_unless (res.buffers_after >= 5,
+      "frames must resume after the port reset, got %d new buffers",
+      res.buffers_after);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_wedged_device_reset_is_one_shot)
+{
+  WedgeResult res;
+  /* The reset succeeds but the device stays silent, so no frame ever re-arms the
+   * one-shot. The element must give up and report the disconnect rather than
+   * resetting the port in a loop. */
+  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , FALSE, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the port reset must fire at most once per silence episode, got %d",
+      res.reset_calls);
+  fail_unless (res.errored,
+      "a device that stays silent after the reset must still surface the "
+      "disconnect error");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_absent_device_reset_fails_through)
+{
+  WedgeResult res;
+  /* LIBUSB_ERROR_NO_DEVICE: the device really is gone, so the port reset cannot
+   * happen. This is the negative control — the recovery must not swallow, delay
+   * past its single attempt, or otherwise mask a genuine unplug. */
+  run_wedge_scenario (LIBUSB_ERROR_NO_DEVICE, FALSE, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "expected exactly one reset attempt, got %d", res.reset_calls);
+  fail_unless (res.open_count == 1,
+      "a failed port reset must NOT be followed by a reopen, got open count %d",
+      res.open_count);
+  fail_unless (res.errored,
+      "a genuinely absent device must still surface the disconnect error");
 }
 
 GST_END_TEST;
@@ -825,6 +978,21 @@ reconnect_suite (void)
   tcase_set_timeout (tc_recon, 60);
   tcase_add_test (tc_recon, test_reconnect_resume);
   suite_add_tcase (s, tc_recon);
+
+  TCase *tc_wedge = tcase_create ("wedged_device_reset_recovers");
+  tcase_set_timeout (tc_wedge, 60);
+  tcase_add_test (tc_wedge, test_wedged_device_reset_recovers);
+  suite_add_tcase (s, tc_wedge);
+
+  TCase *tc_wedge_once = tcase_create ("wedged_device_reset_is_one_shot");
+  tcase_set_timeout (tc_wedge_once, 60);
+  tcase_add_test (tc_wedge_once, test_wedged_device_reset_is_one_shot);
+  suite_add_tcase (s, tc_wedge_once);
+
+  TCase *tc_absent = tcase_create ("absent_device_reset_fails_through");
+  tcase_set_timeout (tc_absent, 60);
+  tcase_add_test (tc_absent, test_absent_device_reset_fails_through);
+  suite_add_tcase (s, tc_absent);
 
   TCase *tc_regate = tcase_create ("reconnect_idr_regate");
   tcase_set_timeout (tc_regate, 90);

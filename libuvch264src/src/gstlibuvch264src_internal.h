@@ -37,6 +37,18 @@ struct _GstLibuvcH264Src {
    * timeouts. Reset in start() and whenever a real frame arrives. */
   gint consecutive_timeouts;
   gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
+  /* One-shot USB port-reset recovery for a WEDGED device: enumerated, answering
+   * every control transfer, yet delivering no payload on the streaming endpoint.
+   * Close/reopen and a kernel-driver reattach both leave it wedged; only a port
+   * reset clears it. Armed in start(), consumed once per silence episode, and
+   * re-armed whenever a real frame arrives (so a later wedge is recoverable too).
+   * See gst_libuvc_h264_src_reset_silent_device(). */
+  gboolean reset_recovery_used;
+  /* Frames delivered since the last port reset. The one-shot above is re-armed
+   * only once the device has PROVEN it recovered (RESET_RECOVERY_REARM_FRAMES),
+   * never on the first frame back: a device that emits one frame and re-wedges
+   * would otherwise re-arm every cycle and reset the port forever. */
+  guint frames_since_reset;
   /* Interruptible reconnect backoff (Task 7). The backoff between retries parks
    * in g_cond_wait_until() on reconnect_cond; unlock() sets flushing and
    * broadcasts the cond so a state change to NULL/PAUSED tears the element down
@@ -116,6 +128,15 @@ void gst_libuvc_h264_src_set_reconnect_backoff_hook(
     GstLibuvcReconnectBackoffHook hook);
 
 gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self);
+
+/* Test seam for the USB port reset, mirroring the backoff hook above: a test
+ * cannot reset a real port, and the mock libusb has no port to reset. The hook
+ * returns the libusb status the element should act on. A NULL hook (production
+ * default) calls libusb_reset_device() on the live handle. */
+typedef gint (*GstLibuvcResetDeviceHook)(GstLibuvcH264Src *self);
+void gst_libuvc_h264_src_set_reset_device_hook(GstLibuvcResetDeviceHook hook);
+
+gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self);
 
 G_END_DECLS
 
