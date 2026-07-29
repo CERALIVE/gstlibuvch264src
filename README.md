@@ -202,11 +202,29 @@ gst-launch-1.0 libuvch264src index="1234:5678" \
 A UVC device can go silent while still fully present on the bus — enumerated and
 answering every control transfer, but delivering nothing. A close/reopen does not
 clear that state; only a USB port reset does. Before reporting a disconnect the
-element therefore issues one `libusb_reset_device()`, waits for the device to
-re-enumerate, and reopens once. This needs no configuration and no extra
-privilege, and a genuinely unplugged device still surfaces the usual
-`RESOURCE/READ` error (the reset simply fails). The recovery re-arms only after
-the device has delivered frames again, so it can never loop.
+element therefore issues one `libusb_reset_device()`, then polls for the device
+to re-enumerate, reopens, and waits for a real frame — because a successful
+`uvc_start_streaming()` on a still-wedged device returns OK and delivers nothing,
+so only a delivered frame proves recovery. This needs no configuration and no
+extra privilege, and a genuinely unplugged device still surfaces the usual
+`RESOURCE/READ` error (the reset simply fails).
+
+Nothing here is timed against a particular camera: recovery finishes as soon as
+frames actually flow. `reset-settle-max-ms` (default 8000) budgets the element's
+own readiness loop and `reset-rearm-frames` (default 30) is the delivered-frame
+proof required before the one-shot re-arms, so it can never loop.
+
+`reset-settle-max-ms` is not a worst-case guarantee: `uvc_stop_streaming()` and
+`uvc_close()` are synchronous with no interruption seam, so a device that is
+still re-enumerating can push the total past the budget (measured ~22 s against
+an 8 s budget). Size it for the fast path.
+
+**Recover a wedged device with a wider budget (slow-enumerating camera):**
+```
+gst-launch-1.0 libuvch264src index=0 reset-settle-max-ms=15000 \
+  ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h264parse ! fakesink
+```
 
 ### Reconnect on Disconnect
 
@@ -306,6 +324,8 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `reconnect` | bool | `false` | Auto-reconnect on mid-stream disconnect with exponential backoff (default off) |
 | `max-payload` | uint | `0` | USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`); `0` = device default; nonzero clamped to `[512, 4194304]` with read-back |
 | `transfer-buffers` | uint | `0` | USB transfer buffer count hint; `0` = library default (no device write); nonzero clamped to `[2, 100]`, applied right before streaming starts (CeraLive fork only; no-op with a warning on upstream libuvc) |
+| `reset-settle-max-ms` | uint | `8000` | Budget (ms) for the element's own readiness loop after a port reset: re-enumeration polling + reopen retries + wait for the first real frame. A budget, not a delay. Does **not** bound the synchronous libuvc teardown, which can push the total past it |
+| `reset-rearm-frames` | uint | `30` | Frames the device must deliver after a recovery before the one-shot port reset re-arms for a later wedge |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 

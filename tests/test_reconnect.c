@@ -412,6 +412,366 @@ GST_START_TEST (test_absent_device_reset_fails_through)
 GST_END_TEST;
 
 /* ------------------------------------------------------------------------- */
+/* Readiness-based reset policy (Task 14)                                     */
+/*                                                                            */
+/* The recovery no longer waits a fixed, device-measured settle before its one */
+/* reopen. It polls re-enumeration with micro-backoff, reopens, and then       */
+/* requires an ACTUAL frame before calling the device recovered - all inside   */
+/* the `reset-settle-max-ms` budget. These cases pin each half of that         */
+/* contract, plus the two properties that bound it.                            */
+/* ------------------------------------------------------------------------- */
+
+/* Private to the element; these pin the contract and must track the element's
+ * RESET_SETTLE_MAX_MS_DEFAULT / RESET_REARM_FRAMES_DEFAULT / RESET_POLL_MAX_MS. */
+#define EXPECTED_SETTLE_MAX_MS 8000
+#define EXPECTED_REARM_FRAMES 30
+#define EXPECTED_POLL_MAX_MS 200
+
+static gint poll_hook_calls;
+static guint recorded_polls[64];
+static gint64 poll_first_us;
+static gint64 poll_last_us;
+
+/* What the reset hook should do to the mock the moment the port reset fires -
+ * i.e. how the device behaves once it has been reset. */
+typedef enum
+{
+  RESET_THEN_VANISH_THEN_HEAL,  /* re-enumerates only after a few polls */
+  RESET_THEN_GONE,              /* never re-enumerates */
+  RESET_THEN_SILENT,            /* re-enumerates, opens, starts, delivers nothing */
+  RESET_THEN_BOUNDED_FEED,      /* re-enumerates and delivers a fixed frame count */
+  RESET_THEN_REOPEN_FLAKY,      /* re-enumerates, refuses the first reopens, then streams */
+} ResetOutcome;
+
+static ResetOutcome reset_outcome;
+static gint reset_heal_after_polls;
+static gint reset_bounded_frames;
+
+static gint
+policy_reset_hook (GstLibuvcH264Src * self)
+{
+  (void) self;
+  if (g_atomic_int_add (&reset_hook_calls, 1) == 0) {
+    switch (reset_outcome) {
+      case RESET_THEN_VANISH_THEN_HEAL:
+        mock_uvc_set_device_count (0);
+        mock_uvc_set_frame_mode (MOCK_UVC_FRAME_VALID);
+        mock_uvc_set_max_frames (0);
+        break;
+      case RESET_THEN_GONE:
+        mock_uvc_set_device_count (0);
+        break;
+      case RESET_THEN_SILENT:
+        mock_uvc_set_frame_mode (MOCK_UVC_FRAME_SILENT);
+        mock_uvc_set_max_frames (0);
+        break;
+      case RESET_THEN_BOUNDED_FEED:
+        mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+        mock_uvc_set_max_frames (reset_bounded_frames);
+        break;
+      case RESET_THEN_REOPEN_FLAKY:
+        mock_uvc_set_reopen_fail_count (2);
+        mock_uvc_set_frame_mode (MOCK_UVC_FRAME_VALID);
+        mock_uvc_set_max_frames (0);
+        break;
+    }
+  }
+  return g_atomic_int_get (&reset_hook_status);
+}
+
+/* Records every readiness-poll interval and collapses the wall-clock wait,
+ * mirroring record_and_skip_backoff. Heals the device on the configured poll so
+ * a test can prove the poll - not a fixed sleep - is what ends the wait. */
+static gint64
+record_readiness_poll (GstLibuvcH264Src * self, gint attempt, guint interval_ms)
+{
+  (void) self;
+  (void) attempt;
+  gint n = g_atomic_int_add (&poll_hook_calls, 1);
+  if (n < (gint) G_N_ELEMENTS (recorded_polls))
+    recorded_polls[n] = interval_ms;
+  gint64 now = g_get_monotonic_time ();
+  if (n == 0)
+    poll_first_us = now;
+  poll_last_us = now;
+
+  if (reset_outcome == RESET_THEN_VANISH_THEN_HEAL
+      && n + 1 >= reset_heal_after_polls)
+    mock_uvc_set_device_count (1);
+
+  /* RESET_THEN_GONE measures the budget, so it must burn real time. */
+  return reset_outcome == RESET_THEN_GONE
+      ? (gint64) interval_ms * G_TIME_SPAN_MILLISECOND : 0;
+}
+
+typedef struct
+{
+  gint reset_calls;
+  gint poll_calls;
+  gint open_count;
+  gint init_count;
+  gint buffers_after;
+  gboolean errored;
+} PolicyResult;
+
+static void
+run_policy_scenario (ResetOutcome outcome, guint settle_max_ms,
+    guint rearm_frames, gint heal_after_polls, gint bounded_frames,
+    PolicyResult * out)
+{
+  load_core_elements ();
+  register_element ();
+  mock_uvc_reset ();
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+  mock_uvc_set_max_frames (1);
+
+  g_atomic_int_set (&buffers_seen, 0);
+  g_atomic_int_set (&reset_hook_calls, 0);
+  g_atomic_int_set (&reset_hook_status, 0 /* LIBUSB_SUCCESS */ );
+  g_atomic_int_set (&poll_hook_calls, 0);
+  reset_outcome = outcome;
+  reset_heal_after_polls = heal_after_polls;
+  reset_bounded_frames = bounded_frames;
+  poll_first_us = poll_last_us = 0;
+
+  gst_libuvc_h264_src_set_reset_device_hook (policy_reset_hook);
+  gst_libuvc_h264_src_set_reset_poll_hook (record_readiness_poll);
+
+  GstElement *src = NULL;
+  GstElement *pipeline = build_pipeline (&src);
+  /* reconnect stays FALSE: this recovery must not need the opt-in ladder. */
+  g_object_set (src, "reset-settle-max-ms", settle_max_ms,
+      "reset-rearm-frames", rearm_frames, NULL);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
+      != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&buffers_seen) < 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  gint baseline = g_atomic_int_get (&buffers_seen);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gboolean errored = FALSE;
+  deadline = g_get_monotonic_time () + 45 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    GstMessage *msg =
+        gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg != NULL) {
+      errored = (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR);
+      gst_message_unref (msg);
+      break;
+    }
+    if (outcome == RESET_THEN_VANISH_THEN_HEAL
+        && g_atomic_int_get (&buffers_seen) >= baseline + 5)
+      break;
+    if (outcome == RESET_THEN_BOUNDED_FEED
+        && g_atomic_int_get (&reset_hook_calls) >= 2)
+      break;
+    if (outcome == RESET_THEN_REOPEN_FLAKY
+        && g_atomic_int_get (&buffers_seen) >= baseline + 5)
+      break;
+    g_usleep (20 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  out->reset_calls = g_atomic_int_get (&reset_hook_calls);
+  out->poll_calls = g_atomic_int_get (&poll_hook_calls);
+  out->open_count = mock_uvc_open_count ();
+  out->init_count = mock_uvc_init_count ();
+  out->buffers_after = g_atomic_int_get (&buffers_seen) - baseline;
+  out->errored = errored;
+  gst_object_unref (bus);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  gst_libuvc_h264_src_set_reset_device_hook (NULL);
+  gst_libuvc_h264_src_set_reset_poll_hook (NULL);
+}
+
+GST_START_TEST (test_reset_policy_property_defaults)
+{
+  register_element ();
+
+  GstElement *src = gst_element_factory_make ("libuvch264src", "src");
+  fail_unless (src != NULL, "failed to create the element");
+
+  guint settle = 0, rearm = 0;
+  g_object_get (src, "reset-settle-max-ms", &settle,
+      "reset-rearm-frames", &rearm, NULL);
+  fail_unless (settle == EXPECTED_SETTLE_MAX_MS,
+      "reset-settle-max-ms default should be %d ms, got %u",
+      EXPECTED_SETTLE_MAX_MS, settle);
+  fail_unless (rearm == EXPECTED_REARM_FRAMES,
+      "reset-rearm-frames default should be %d, got %u",
+      EXPECTED_REARM_FRAMES, rearm);
+
+  g_object_set (src, "reset-settle-max-ms", 1234u, "reset-rearm-frames", 7u,
+      NULL);
+  g_object_get (src, "reset-settle-max-ms", &settle,
+      "reset-rearm-frames", &rearm, NULL);
+
+  gst_object_unref (src);
+
+  fail_unless (settle == 1234, "reset-settle-max-ms read back %u", settle);
+  fail_unless (rearm == 7, "reset-rearm-frames read back %u", rearm);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_readiness_polls_reenumeration)
+{
+  PolicyResult res;
+  /* The reset re-enumerates the device: it is GONE from uvc_find_devices() for
+   * the first few polls and only then comes back. A fixed settle would either
+   * overshoot or burn its one reopen too early; the poll must be what ends the
+   * wait, and the recovery must succeed as soon as the device reappears. */
+  run_policy_scenario (RESET_THEN_VANISH_THEN_HEAL, EXPECTED_SETTLE_MAX_MS,
+      EXPECTED_REARM_FRAMES, 3, 0, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the port reset must stay one-shot, got %d", res.reset_calls);
+  fail_unless (res.poll_calls >= 3,
+      "expected the re-enumeration poll to run at least 3 times before the "
+      "device returned, got %d", res.poll_calls);
+  fail_unless (!res.errored,
+      "a device that re-enumerated inside the budget must not error out");
+  fail_unless (res.open_count >= 2,
+      "the recovery must reopen once the device re-enumerated, got open "
+      "count %d", res.open_count);
+  fail_unless (res.buffers_after >= 5,
+      "frames must resume after the readiness-gated reopen, got %d",
+      res.buffers_after);
+
+  gint n = MIN (res.poll_calls, (gint) G_N_ELEMENTS (recorded_polls));
+  for (gint i = 1; i < n; i++) {
+    fail_unless (recorded_polls[i] >= recorded_polls[i - 1],
+        "poll interval %u followed %u - the micro-backoff must not shrink",
+        recorded_polls[i], recorded_polls[i - 1]);
+  }
+  for (gint i = 0; i < n; i++) {
+    fail_unless (recorded_polls[i] <= EXPECTED_POLL_MAX_MS,
+        "poll interval %u exceeds the %d ms micro-backoff cap",
+        recorded_polls[i], EXPECTED_POLL_MAX_MS);
+  }
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_readiness_bounded_by_property)
+{
+  PolicyResult res;
+  /* The device never comes back. The wait must be bounded by
+   * reset-settle-max-ms - the PROPERTY, not the 8 s default - and then fail
+   * through to the normal disconnect error. */
+  run_policy_scenario (RESET_THEN_GONE, 400, EXPECTED_REARM_FRAMES, 0, 0, &res);
+
+  gint64 polled_us = poll_last_us - poll_first_us;
+
+  fail_unless (res.reset_calls == 1,
+      "expected exactly one port reset, got %d", res.reset_calls);
+  fail_unless (res.poll_calls >= 1,
+      "the recovery must poll for re-enumeration at least once");
+  fail_unless (res.open_count == 1,
+      "a device that never re-enumerated must never be reopened, got open "
+      "count %d", res.open_count);
+  fail_unless (res.errored,
+      "an unrecoverable device must still surface the disconnect error");
+  fail_unless (polled_us < 3 * G_TIME_SPAN_SECOND,
+      "readiness polling ran %" G_GINT64_FORMAT " us - the 400 ms "
+      "reset-settle-max-ms property did not bound it", polled_us);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_requires_frame_delivery)
+{
+  PolicyResult res;
+  /* The reopened device answers everything and streams NOTHING - the measured
+   * wedge. A successful uvc_start_streaming() is therefore not proof of
+   * recovery: the policy must keep retrying inside the budget and then fail
+   * through, rather than declaring success on the first clean start. */
+  run_policy_scenario (RESET_THEN_SILENT, 3000, EXPECTED_REARM_FRAMES, 0, 0,
+      &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the port reset must stay one-shot across every reopen, got %d",
+      res.reset_calls);
+  fail_unless (res.open_count >= 3,
+      "a clean uvc_start_streaming() that delivers no frame must NOT be "
+      "accepted as recovery - expected further reopen attempts inside the "
+      "budget, got open count %d", res.open_count);
+  fail_unless (res.errored,
+      "a device that never delivers a frame must surface the disconnect error");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_survives_transient_reopen_failure)
+{
+  PolicyResult res;
+  /* The device is re-enumerating: it is back in the device list but refuses the
+   * first couple of opens. That is a device still coming back, NOT a verdict -
+   * so a failed reopen must cost one retry, not the whole recovery. Found on
+   * hardware, where the first reopen after a real port reset routinely fails
+   * while the budget still has seconds left. */
+  run_policy_scenario (RESET_THEN_REOPEN_FLAKY, EXPECTED_SETTLE_MAX_MS,
+      EXPECTED_REARM_FRAMES, 0, 0, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the port reset must stay one-shot, got %d", res.reset_calls);
+  fail_unless (!res.errored,
+      "a reopen that fails while the budget still has time left must be "
+      "retried, not treated as an unrecoverable device");
+  fail_unless (res.buffers_after >= 5,
+      "frames must resume once the device finally accepts a reopen, got %d",
+      res.buffers_after);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_refreshes_libuvc_context)
+{
+  PolicyResult res;
+  /* MEASURED on hardware: after a real port reset the device re-enumerates, and
+   * the libuvc context that was open across the reset can no longer open it -
+   * a FRESH process could stream again 14.4 s in while the element, holding its
+   * original context, still could not after 30 s. So the recovery must discard
+   * the context and re-init, exactly as a fresh process would. */
+  run_policy_scenario (RESET_THEN_VANISH_THEN_HEAL, EXPECTED_SETTLE_MAX_MS,
+      EXPECTED_REARM_FRAMES, 3, 0, &res);
+
+  fail_unless (res.init_count >= 2,
+      "the recovery must re-init the libuvc context after the device "
+      "re-enumerated (a context held across the reset cannot see it); "
+      "uvc_init was called %d time(s)", res.init_count);
+  fail_unless (!res.errored, "the recovery must still succeed");
+  fail_unless (res.buffers_after >= 5,
+      "frames must resume on the refreshed context, got %d", res.buffers_after);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_reset_rearm_frames_property)
+{
+  PolicyResult res;
+  /* reset-rearm-frames=2: the reopened device delivers 3 frames and wedges
+   * again. Three clears the (configured) proof bar, so the one-shot re-arms and
+   * the SECOND wedge gets its own port reset. At the 30-frame default it would
+   * not, and the device would stay wedged for the rest of the session. */
+  run_policy_scenario (RESET_THEN_BOUNDED_FEED, EXPECTED_SETTLE_MAX_MS, 2, 0, 3,
+      &res);
+
+  fail_unless (res.reset_calls == 2,
+      "reset-rearm-frames=2 must re-arm the one-shot after 3 delivered frames, "
+      "so a second wedge gets a second port reset; got %d resets",
+      res.reset_calls);
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
 /* test_reconnect_idr_regate (Task 15)                                       */
 /*                                                                           */
 /* A successful reconnect must re-arm the stream state (gstlibuvch264src.c    */
@@ -993,6 +1353,41 @@ reconnect_suite (void)
   tcase_set_timeout (tc_absent, 60);
   tcase_add_test (tc_absent, test_absent_device_reset_fails_through);
   suite_add_tcase (s, tc_absent);
+
+  TCase *tc_props = tcase_create ("reset_policy_property_defaults");
+  tcase_set_timeout (tc_props, 30);
+  tcase_add_test (tc_props, test_reset_policy_property_defaults);
+  suite_add_tcase (s, tc_props);
+
+  TCase *tc_poll = tcase_create ("reset_readiness_polls_reenumeration");
+  tcase_set_timeout (tc_poll, 90);
+  tcase_add_test (tc_poll, test_reset_readiness_polls_reenumeration);
+  suite_add_tcase (s, tc_poll);
+
+  TCase *tc_bound = tcase_create ("reset_readiness_bounded_by_property");
+  tcase_set_timeout (tc_bound, 60);
+  tcase_add_test (tc_bound, test_reset_readiness_bounded_by_property);
+  suite_add_tcase (s, tc_bound);
+
+  TCase *tc_proof = tcase_create ("reset_requires_frame_delivery");
+  tcase_set_timeout (tc_proof, 90);
+  tcase_add_test (tc_proof, test_reset_requires_frame_delivery);
+  suite_add_tcase (s, tc_proof);
+
+  TCase *tc_ctx = tcase_create ("reset_refreshes_libuvc_context");
+  tcase_set_timeout (tc_ctx, 90);
+  tcase_add_test (tc_ctx, test_reset_refreshes_libuvc_context);
+  suite_add_tcase (s, tc_ctx);
+
+  TCase *tc_flaky = tcase_create ("reset_survives_transient_reopen_failure");
+  tcase_set_timeout (tc_flaky, 90);
+  tcase_add_test (tc_flaky, test_reset_survives_transient_reopen_failure);
+  suite_add_tcase (s, tc_flaky);
+
+  TCase *tc_rearm = tcase_create ("reset_rearm_frames_property");
+  tcase_set_timeout (tc_rearm, 90);
+  tcase_add_test (tc_rearm, test_reset_rearm_frames_property);
+  suite_add_tcase (s, tc_rearm);
 
   TCase *tc_regate = tcase_create ("reconnect_idr_regate");
   tcase_set_timeout (tc_regate, 90);

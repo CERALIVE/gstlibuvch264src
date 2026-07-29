@@ -14,7 +14,7 @@
  *        MOCK_UVC_DEVICE_COUNT   integer, devices uvc_find_devices() exposes (default 1)
  *        MOCK_UVC_MAX_FRAMES     integer, frames the feeder delivers then stops (default 0 = until stop)
  *        MOCK_UVC_FRAME_FORMAT   "H264" | "H265" (default H264)
- *        MOCK_UVC_FRAME_MODE     "valid" | "oversized_sps" | "oversized_vps" | "disconnect" (default valid)
+ *        MOCK_UVC_FRAME_MODE     "valid" | "oversized_sps" | "oversized_vps" | "disconnect" | "silent" (default valid)
  *        MOCK_UVC_OPEN_FAIL_AFTER integer, succeed this many uvc_open() calls then fail the rest (default -1 = never)
  *   Environment variables, when present, win over the programmatic setters.
  */
@@ -50,6 +50,13 @@ typedef enum {
    * (no SPS/PPS/IDR) before the first IDR access unit. Lets a test prove the
    * element drops them until a fresh IDR, including across a stop/start cycle. */
   MOCK_UVC_FRAME_NONIDR_LEAD,
+  /* The WEDGED device, modelled: uvc_open() and uvc_start_streaming() both
+   * return success and the streaming endpoint then delivers NOTHING - not one
+   * frame, ever. This is the MEASURED post-crash state a reopen meets too soon
+   * after a port reset, and it is the only reason a successful start cannot be
+   * trusted as proof of recovery. DISCONNECT cannot model it: that mode always
+   * delivers at least one frame per stream before going quiet. */
+  MOCK_UVC_FRAME_SILENT,
 } mock_uvc_frame_mode_t;
 
 /* Device-negotiated dwMaxPayloadTransferSize the mock reports from
@@ -159,6 +166,10 @@ int mock_uvc_frames_delivered(void);
 /* uvc_open()/uvc_close() call counts since the last mock_uvc_reset(). A correct
  * teardown closes exactly once per successful open, so across N start/stop
  * cycles both counters reach N. */
+/* uvc_init() calls. A recovery that re-creates the libuvc context after the
+ * device re-enumerated (which a stale context cannot see) increments this. */
+int mock_uvc_init_count(void);
+
 int mock_uvc_open_count(void);
 int mock_uvc_close_count(void);
 

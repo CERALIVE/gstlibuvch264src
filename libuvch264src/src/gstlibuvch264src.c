@@ -31,6 +31,8 @@ enum {
   PROP_RECONNECT,
   PROP_MAX_PAYLOAD,
   PROP_TRANSFER_BUFFERS,
+  PROP_RESET_SETTLE_MAX_MS,
+  PROP_RESET_REARM_FRAMES,
   PROP_LAST
 };
 
@@ -41,15 +43,27 @@ enum {
 
 /* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
 #define RECONNECT_MAX_RETRIES 5
-/* Frames a port-reset recovery must deliver before the one-shot re-arms. ~1 s at
- * 30 fps: enough to distinguish a device that genuinely came back from one that
- * emits a frame and immediately re-wedges (which would otherwise reset forever). */
-#define RESET_RECOVERY_REARM_FRAMES 30
-/* Settle window between a USB port reset and the reopen. MEASURED on a DJI Osmo
- * Pocket 3: a reopen ~1 s after the reset succeeds but yields zero frames; the
- * device needs several seconds to re-enumerate and re-arm its streaming
- * endpoint. Interruptible, so it never delays a NULL/PAUSED transition. */
-#define RESET_SETTLE_MS 4000
+/* Frames a port-reset recovery must deliver before the one-shot re-arms
+ * (PROP_RESET_REARM_FRAMES default). Enough to distinguish a device that
+ * genuinely came back from one that emits a frame and immediately re-wedges
+ * (which would otherwise reset the port forever). */
+#define RESET_REARM_FRAMES_DEFAULT 30
+#define RESET_REARM_FRAMES_MIN 1
+#define RESET_REARM_FRAMES_MAX 100000
+/* Upper BOUND on the whole reset-to-advancing-frames recovery
+ * (PROP_RESET_SETTLE_MAX_MS default) - a budget, not a delay. The recovery
+ * spends only as long as the device actually needs: it polls re-enumeration,
+ * reopens, and requires a real frame, finishing the instant that succeeds. No
+ * per-device settle constant is encoded anywhere; a device that comes back in
+ * 200 ms recovers in 200 ms, and one that needs seconds still gets them. */
+#define RESET_SETTLE_MAX_MS_DEFAULT 8000
+#define RESET_SETTLE_MAX_MS_MAX 120000
+/* Micro-backoff for the re-enumeration poll: start tight so a fast return is
+ * detected almost immediately, then ease off so a long absence costs few
+ * syscalls. Generic polling geometry - neither value is derived from any
+ * device's measured behavior. */
+#define RESET_POLL_INITIAL_MS 25
+#define RESET_POLL_MAX_MS 200
 #define RECONNECT_BACKOFF_INITIAL_S 1
 
 /* Opt-in USB payload override (Task 12, gated on bmaxpayload-analysis.md §5).
@@ -132,6 +146,28 @@ static void gst_libuvc_h264_src_apply_transfer_buffers(GstLibuvcH264Src *self);
  * wake a blocked create(); its value is irrelevant, only its identity matters. */
 static const gchar flush_sentinel = 0;
 #define FLUSH_SENTINEL ((gpointer) &flush_sentinel)
+
+static GstLibuvcResetPollHook gst_libuvc_reset_poll_hook = NULL;
+
+/* Park for wait_us on reconnect_cond instead of sleeping, so unlock() - which
+ * sets flushing and broadcasts the cond - wakes every waiter at once and a
+ * NULL/PAUSED transition never blocks out a full wait window. Returns FALSE
+ * when a flush asked us to bail. */
+static gboolean gst_libuvc_h264_src_interruptible_wait(GstLibuvcH264Src *self,
+                                                       gint64 wait_us) {
+  if (wait_us > 0) {
+    gint64 deadline = g_get_monotonic_time() + wait_us;
+    g_mutex_lock(&self->reconnect_lock);
+    while (!g_atomic_int_get(&self->flushing)) {
+      if (!g_cond_wait_until(&self->reconnect_cond, &self->reconnect_lock,
+                             deadline)) {
+        break;
+      }
+    }
+    g_mutex_unlock(&self->reconnect_lock);
+  }
+  return !g_atomic_int_get(&self->flushing);
+}
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -223,6 +259,39 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                       0, TRANSFER_BUFFERS_SPEC_MAX, TRANSFER_BUFFERS_DEFAULT,
                       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Bounds of the wedged-device recovery (Task 14). The recovery is
+   * readiness-driven, not timed: these cap how long it may keep trying and how
+   * much delivered video it demands as proof, so no device's settle time is
+   * baked into the element. */
+  g_object_class_install_property(gobject_class, PROP_RESET_SETTLE_MAX_MS,
+    g_param_spec_uint("reset-settle-max-ms", "Reset settle budget",
+                      "Budget in milliseconds for the element's OWN readiness "
+                      "loop after a port reset: re-enumeration polling, the "
+                      "reopen retries and the wait for the first real frame. It "
+                      "is a budget, not a delay - the recovery returns as soon "
+                      "as frames are actually flowing, and stops starting new "
+                      "attempts once it is spent. It does NOT bound the "
+                      "underlying libuvc/libusb teardown: uvc_stop_streaming() "
+                      "and uvc_close() are synchronous and expose no "
+                      "interruption seam, and on a device that is still "
+                      "re-enumerating they can occasionally push the total well "
+                      "past this value (measured ~22 s against an 8 s budget). "
+                      "Size it for the fast path; do not treat it as a "
+                      "worst-case guarantee.",
+                      0, RESET_SETTLE_MAX_MS_MAX, RESET_SETTLE_MAX_MS_DEFAULT,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_RESET_REARM_FRAMES,
+    g_param_spec_uint("reset-rearm-frames", "Reset re-arm frames",
+                      "Frames the device must deliver after a recovery before "
+                      "the one-shot port reset re-arms for a LATER wedge. "
+                      "Re-arming on the first frame back would let a device "
+                      "that emits one frame and immediately re-wedges reset "
+                      "the port forever.",
+                      RESET_REARM_FRAMES_MIN, RESET_REARM_FRAMES_MAX,
+                      RESET_REARM_FRAMES_DEFAULT,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -264,6 +333,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->max_payload_effective = 0;
   self->transfer_buffers = TRANSFER_BUFFERS_DEFAULT;
   self->transfer_buffers_effective = 0;
+  self->reset_settle_max_ms = RESET_SETTLE_MAX_MS_DEFAULT;
+  self->reset_rearm_frames = RESET_REARM_FRAMES_DEFAULT;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -719,6 +790,18 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       self->transfer_buffers = g_value_get_uint(value);
       GST_OBJECT_UNLOCK(self);
       break;
+    case PROP_RESET_SETTLE_MAX_MS:
+      /* Read on the streaming thread by the recovery policy; mutate under the
+       * object lock so the write and that read form a happens-before. */
+      GST_OBJECT_LOCK(self);
+      self->reset_settle_max_ms = g_value_get_uint(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_RESET_REARM_FRAMES:
+      GST_OBJECT_LOCK(self);
+      self->reset_rearm_frames = g_value_get_uint(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -765,6 +848,16 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       g_value_set_uint(value, self->transfer_buffers_effective > 0
                               ? self->transfer_buffers_effective
                               : self->transfer_buffers);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_RESET_SETTLE_MAX_MS:
+      GST_OBJECT_LOCK(self);
+      g_value_set_uint(value, self->reset_settle_max_ms);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_RESET_REARM_FRAMES:
+      GST_OBJECT_LOCK(self);
+      g_value_set_uint(value, self->reset_rearm_frames);
       GST_OBJECT_UNLOCK(self);
       break;
     default:
@@ -989,6 +1082,67 @@ gst_libuvc_h264_src_selector_matches(const GstLibuvcDeviceSelector *sel,
   return FALSE;
 }
 
+/* Resolve `selector` against a fresh enumeration, returning a REFERENCED device.
+ *
+ * With deadline == 0 this is the single-shot lookup start() and the reconnect
+ * ladder have always done. With a nonzero deadline it keeps re-enumerating on a
+ * micro-backoff until the device appears or the deadline passes: libuvc exposes
+ * no "the device has finished re-enumerating" API, so a successful
+ * uvc_find_devices() match IS that readiness signal after a port reset. Polling
+ * for it is what lets the recovery cost only as long as the device actually
+ * takes, instead of a fixed settle sized for the slowest device anyone measured.
+ *
+ * out_enum_failed distinguishes "no devices at all" from "none matched", so the
+ * caller can keep posting the two different errors it always posted. */
+static gboolean gst_libuvc_h264_src_resolve_device(
+    GstLibuvcH264Src *self, const GstLibuvcDeviceSelector *selector,
+    gint64 deadline, uvc_device_t **out_dev, long *out_ordinal,
+    gboolean *out_enum_failed) {
+  guint interval_ms = RESET_POLL_INITIAL_MS;
+  gint attempt = 0;
+
+  for (;;) {
+    uvc_device_t **dev_list = NULL;
+    gboolean enum_ok = (uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL)
+                        >= 0 && dev_list != NULL);
+    if (enum_ok) {
+      for (int i = 0; dev_list[i] != NULL; i++) {
+        if (gst_libuvc_h264_src_selector_matches(selector, dev_list[i], i)) {
+          /* The list free unrefs every entry, so take our own ref first. */
+          uvc_ref_device(dev_list[i]);
+          *out_dev = dev_list[i];
+          if (out_ordinal != NULL) {
+            *out_ordinal = i;
+          }
+          uvc_free_device_list(dev_list, 1);
+          if (out_enum_failed != NULL) {
+            *out_enum_failed = FALSE;
+          }
+          return TRUE;
+        }
+      }
+      uvc_free_device_list(dev_list, 1);
+    }
+    if (out_enum_failed != NULL) {
+      *out_enum_failed = !enum_ok;
+    }
+
+    if (deadline == 0 || g_get_monotonic_time() >= deadline) {
+      return FALSE;
+    }
+
+    gint64 wait_us = (gint64) interval_ms * G_TIME_SPAN_MILLISECOND;
+    if (gst_libuvc_reset_poll_hook != NULL) {
+      wait_us = gst_libuvc_reset_poll_hook(self, attempt, interval_ms);
+    }
+    attempt++;
+    interval_ms = MIN(interval_ms * 2, (guint) RESET_POLL_MAX_MS);
+    if (!gst_libuvc_h264_src_interruptible_wait(self, wait_us)) {
+      return FALSE;
+    }
+  }
+}
+
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
@@ -996,10 +1150,11 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GST_DEBUG_OBJECT(self, "Starting libuvc source");
 
   // Check if we need to cleanup a previous session
+  gboolean forced_cleanup = FALSE;
   if (self->uvc_ctx != NULL || self->uvc_devh != NULL) {
     GST_WARNING_OBJECT(self, "Previous session not fully cleaned up, forcing cleanup");
     gst_libuvc_h264_src_stop(src);
-    usleep(1000000); // Wait 1 second for USB to settle
+    forced_cleanup = TRUE;
   }
 
   // Reset per-session frame state so a restart never forwards stale non-IDR
@@ -1035,39 +1190,38 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     return FALSE;
   }
   
-  uvc_device_t **dev_list;
-  res = uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL);
-  if (res < 0) {
-    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
-        ("No UVC devices found"),
-        ("uvc_find_devices failed: %s", uvc_strerror(res)));
-    uvc_exit(self->uvc_ctx);
-    self->uvc_ctx = NULL;
-    return FALSE;
+  // A restart after a forced cleanup can race the bus: the previous session's
+  // handle has only just closed, and the device may not be enumerable again for
+  // a moment. Poll for it within the recovery budget rather than sleeping a
+  // fixed second and hoping it was long enough. A NORMAL start stays single-shot,
+  // so a genuinely absent device still fails immediately, exactly as before.
+  gint64 resolve_deadline = 0;
+  if (forced_cleanup) {
+    guint budget_ms;
+    GST_OBJECT_LOCK(self);
+    budget_ms = self->reset_settle_max_ms;
+    GST_OBJECT_UNLOCK(self);
+    resolve_deadline = g_get_monotonic_time()
+        + (gint64) budget_ms * G_TIME_SPAN_MILLISECOND;
   }
 
-  for (int i = 0; dev_list[i] != NULL; ++i) {
-    if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
-      self->uvc_dev = dev_list[i];
-      device_ordinal = i;
-      break;
+  gboolean enum_failed = FALSE;
+  if (!gst_libuvc_h264_src_resolve_device(self, &selector, resolve_deadline,
+                                          &self->uvc_dev, &device_ordinal,
+                                          &enum_failed)) {
+    if (enum_failed) {
+      GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+          ("No UVC devices found"),
+          ("uvc_find_devices found no enumerable UVC device"));
+    } else {
+      GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+          ("No UVC device matching \"%s\"", self->index ? self->index : "(null)"),
+          ("selector matched none of the enumerated UVC devices"));
     }
-  }
-
-  if (!self->uvc_dev) {
-    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
-        ("No UVC device matching \"%s\"", self->index ? self->index : "(null)"),
-        ("selector matched none of the enumerated UVC devices"));
-    uvc_free_device_list(dev_list, 1);
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
     return FALSE;
   }
-
-  // The selected device aliases an entry in dev_list, and uvc_free_device_list()
-  // unrefs every entry; take our own reference first so it survives the free.
-  uvc_ref_device(self->uvc_dev);
-  uvc_free_device_list(dev_list, 1);
 
   res = uvc_open(self->uvc_dev, &self->uvc_devh);
   if (res < 0) {
@@ -1245,6 +1399,10 @@ void gst_libuvc_h264_src_set_reset_device_hook(GstLibuvcResetDeviceHook hook) {
   gst_libuvc_reset_device_hook = hook;
 }
 
+void gst_libuvc_h264_src_set_reset_poll_hook(GstLibuvcResetPollHook hook) {
+  gst_libuvc_reset_poll_hook = hook;
+}
+
 /* Clear a WEDGED device: still enumerated, still answering every control
  * transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the
  * streaming endpoint. Measured on a DJI Osmo Pocket 3 (2ca3:0023) after the
@@ -1287,30 +1445,6 @@ gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self) {
 
   GST_INFO_OBJECT(self, "USB port reset issued on a silent-but-present device%s",
                   rc == LIBUSB_ERROR_NOT_FOUND ? " (re-enumerated)" : "");
-
-  // A port reset re-enumerates the device, and the reopen must not race that.
-  // MEASURED: reopening ~1 s after the reset reliably succeeds — uvc_open() and
-  // uvc_start_streaming() both return OK — and then delivers no frames at all,
-  // which is indistinguishable from the wedge we just cleared. The device needs
-  // a few seconds before its streaming endpoint is live again, so wait here
-  // rather than burning the recovery on a reopen that cannot work.
-  // Interruptible on the same cond unlock() broadcasts, so a state change to
-  // NULL/PAUSED still tears down promptly instead of blocking for the settle.
-  if (gst_libuvc_reset_device_hook == NULL) {
-    gint64 deadline = g_get_monotonic_time()
-        + (gint64) RESET_SETTLE_MS * G_TIME_SPAN_MILLISECOND;
-    g_mutex_lock(&self->reconnect_lock);
-    while (!g_atomic_int_get(&self->flushing)) {
-      if (!g_cond_wait_until(&self->reconnect_cond, &self->reconnect_lock,
-                             deadline)) {
-        break;
-      }
-    }
-    g_mutex_unlock(&self->reconnect_lock);
-    if (g_atomic_int_get(&self->flushing)) {
-      return FALSE;
-    }
-  }
   return TRUE;
 }
 
@@ -1330,17 +1464,89 @@ gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self) {
  * single libusb_close(). Never reintroduce a bare libusb_close()/interface
  * release before uvc_close() — the Task 4 spike proved that double-closes the
  * libusb handle. */
-static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
-                                                      gint max_retries) {
-  GstLibuvcDeviceSelector selector = {0};
-  const gchar *parse_err = NULL;
-  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
-    GST_ERROR_OBJECT(self, "Reconnect: invalid index \"%s\": %s",
-                     self->index ? self->index : "(null)", parse_err);
+/* One reopen: resolve the selector, open, re-run the negotiated geometry,
+ * re-arm the stream state and restart streaming. Shared verbatim by the
+ * reconnect ladder (resolve_deadline 0, one shot per backoff interval) and by
+ * the wedge recovery (resolve_deadline = its budget, so the resolve step polls
+ * for re-enumeration). Returns TRUE only once uvc_start_streaming() succeeded -
+ * which is NOT by itself proof the device is delivering; see
+ * gst_libuvc_h264_src_await_first_frame().
+ *
+ * `deadline` (0 = none) bounds the WHOLE call, not just the resolve: libuvc's
+ * open and format negotiation are synchronous USB control transfers with their
+ * own timeouts, and on a device that is still re-enumerating they can each block
+ * for seconds. Checking between every step caps the overrun at one such call
+ * instead of letting a full reopen sequence run minutes past its budget. */
+static gboolean gst_libuvc_h264_src_reopen_once(
+    GstLibuvcH264Src *self, const GstLibuvcDeviceSelector *selector,
+    gint64 deadline) {
+  uvc_device_t *selected = NULL;
+  if (!gst_libuvc_h264_src_resolve_device(self, selector, deadline,
+                                          &selected, NULL, NULL)) {
     return FALSE;
   }
 
-  // Native teardown of the dead handle: uvc_close() owns the single libusb_close().
+  if (deadline != 0 && g_get_monotonic_time() >= deadline) {
+    uvc_unref_device(selected);
+    return FALSE;
+  }
+
+  if (uvc_open(selected, &self->uvc_devh) < 0) {
+    self->uvc_devh = NULL;
+    uvc_unref_device(selected);
+    return FALSE;
+  }
+  self->uvc_dev = selected;
+
+  if ((deadline != 0 && g_get_monotonic_time() >= deadline)
+      || uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+          self->frame_format, self->negotiated_width, self->negotiated_height,
+          self->negotiated_framerate) < 0) {
+    uvc_close(self->uvc_devh);
+    self->uvc_devh = NULL;
+    uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
+    return FALSE;
+  }
+
+  // Re-apply the opt-in max-payload override idempotently (Task 12). A post-replug
+  // link that came back as USB2 or a device that now refuses the value falls back
+  // to the device-negotiated payload here rather than failing the reopen.
+  gst_libuvc_h264_src_apply_max_payload(self, self->negotiated_width,
+                                        self->negotiated_height,
+                                        self->negotiated_framerate);
+
+  // Re-arm the stream state BEFORE the feeder spawns so frame_callback sees the
+  // reset (pthread_create in uvc_start_streaming is the happens-before edge):
+  // re-latch the PTS baseline and re-engage the IDR gate after the gap.
+  self->had_idr = FALSE;
+  self->send_sps_pps = FALSE;
+  self->base_time = G_MAXUINT64;
+  self->prev_pts = G_MAXUINT64;
+
+  // The reopened handle starts at the library default, so the opt-in
+  // transfer-buffers count must be re-armed here like max-payload (Task 11).
+  gst_libuvc_h264_src_apply_transfer_buffers(self);
+
+  if ((deadline != 0 && g_get_monotonic_time() >= deadline)
+      || uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback,
+                             self, 0) < 0) {
+    uvc_close(self->uvc_devh);
+    self->uvc_devh = NULL;
+    uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
+    return FALSE;
+  }
+
+  self->streaming = TRUE;
+  return TRUE;
+}
+
+/* Tear a live handle down with the spike's verified NATIVE sequence:
+ * uvc_stop_streaming() -> uvc_close() -> uvc_unref_device(), where uvc_close()
+ * owns the single libusb_close(). Never put force_usb_release() before
+ * uvc_close() - the Task 4 spike proved that double-closes the libusb handle. */
+static void gst_libuvc_h264_src_teardown_handle(GstLibuvcH264Src *self) {
   if (self->uvc_devh) {
     uvc_stop_streaming(self->uvc_devh);
     self->streaming = FALSE;
@@ -1351,15 +1557,31 @@ static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
     uvc_unref_device(self->uvc_dev);
     self->uvc_dev = NULL;
   }
+}
 
-  // Drop anything left in the queue so a resumed stream never forwards a frame
-  // captured before the disconnect (offset/PTS would be inconsistent).
+/* Drop everything queued before a reopen so a resumed stream never forwards a
+ * frame captured before the break (offset/PTS would be inconsistent). */
+static void gst_libuvc_h264_src_drain_queue(GstLibuvcH264Src *self) {
   gpointer stale;
   while ((stale = g_async_queue_try_pop(self->frame_queue)) != NULL) {
     if (stale != FLUSH_SENTINEL) {
       gst_buffer_unref(stale);
     }
   }
+}
+
+static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
+                                                      gint max_retries) {
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
+    GST_ERROR_OBJECT(self, "Reconnect: invalid index \"%s\": %s",
+                     self->index ? self->index : "(null)", parse_err);
+    return FALSE;
+  }
+
+  gst_libuvc_h264_src_teardown_handle(self);
+  gst_libuvc_h264_src_drain_queue(self);
 
   guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
   for (int attempt = 0; attempt < max_retries; attempt++) {
@@ -1368,21 +1590,9 @@ static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
       wait_us = gst_libuvc_reconnect_backoff_hook(self, attempt, backoff_s);
     }
 
-    // Interruptible backoff: park in g_cond_wait_until() so unlock() (which sets
-    // flushing and broadcasts reconnect_cond) wakes us at once on a NULL/PAUSED
+    // Interruptible backoff, so unlock() wakes us at once on a NULL/PAUSED
     // transition instead of blocking for the full (up to 16 s) backoff window.
-    if (wait_us > 0) {
-      gint64 deadline = g_get_monotonic_time() + wait_us;
-      g_mutex_lock(&self->reconnect_lock);
-      while (!g_atomic_int_get(&self->flushing)) {
-        if (!g_cond_wait_until(&self->reconnect_cond, &self->reconnect_lock,
-                               deadline)) {
-          break;
-        }
-      }
-      g_mutex_unlock(&self->reconnect_lock);
-    }
-    if (g_atomic_int_get(&self->flushing)) {
+    if (!gst_libuvc_h264_src_interruptible_wait(self, wait_us)) {
       return FALSE;
     }
 
@@ -1390,76 +1600,10 @@ static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
                      attempt + 1, max_retries, backoff_s);
     backoff_s *= 2;
 
-    uvc_device_t **dev_list = NULL;
-    if (uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL) < 0 ||
-        dev_list == NULL) {
+    if (!gst_libuvc_h264_src_reopen_once(self, &selector, 0)) {
       continue;
     }
 
-    uvc_device_t *selected = NULL;
-    for (int i = 0; dev_list[i] != NULL; i++) {
-      if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
-        selected = dev_list[i];
-        break;
-      }
-    }
-    if (selected == NULL) {
-      uvc_free_device_list(dev_list, 1);
-      continue;
-    }
-
-    // Ref the chosen device before freeing the list (free unrefs every entry).
-    uvc_ref_device(selected);
-    uvc_free_device_list(dev_list, 1);
-
-    if (uvc_open(selected, &self->uvc_devh) < 0) {
-      self->uvc_devh = NULL;
-      uvc_unref_device(selected);
-      continue;
-    }
-    self->uvc_dev = selected;
-
-    if (uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
-            self->frame_format, self->negotiated_width, self->negotiated_height,
-             self->negotiated_framerate) < 0) {
-      uvc_close(self->uvc_devh);
-      self->uvc_devh = NULL;
-      uvc_unref_device(self->uvc_dev);
-      self->uvc_dev = NULL;
-      continue;
-    }
-
-    // Re-apply the opt-in max-payload override idempotently on the reconnect
-    // path (Task 12). A post-replug link that came back as USB2 or a device that
-    // now refuses the value falls back to the device-negotiated payload here
-    // rather than looping the reconnect into exhaustion.
-    gst_libuvc_h264_src_apply_max_payload(self, self->negotiated_width,
-                                          self->negotiated_height,
-                                          self->negotiated_framerate);
-
-    // Re-arm the stream state BEFORE the feeder spawns so frame_callback sees the
-    // reset (pthread_create in uvc_start_streaming is the happens-before edge):
-    // re-latch the PTS baseline and re-engage the IDR gate after the gap.
-    self->had_idr = FALSE;
-    self->send_sps_pps = FALSE;
-    self->base_time = G_MAXUINT64;
-    self->prev_pts = G_MAXUINT64;
-
-    // Re-apply the opt-in transfer-buffers override on the reopened handle right
-    // before restarting the stream (Task 11): the reopened handle starts at the
-    // library default, so the count must be re-armed here like max-payload.
-    gst_libuvc_h264_src_apply_transfer_buffers(self);
-
-    if (uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback,
-                            self, 0) < 0) {
-      uvc_close(self->uvc_devh);
-      self->uvc_devh = NULL;
-      uvc_unref_device(self->uvc_dev);
-      self->uvc_dev = NULL;
-      continue;
-    }
-
-    self->streaming = TRUE;
     GST_INFO_OBJECT(self, "Reconnect succeeded on attempt %d", attempt + 1);
     return TRUE;
   }
@@ -1471,6 +1615,160 @@ static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
 
 gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   return gst_libuvc_h264_src_reconnect_bounded(self, RECONNECT_MAX_RETRIES);
+}
+
+/* EMPIRICAL readiness. libuvc offers no way to ask whether a streaming endpoint
+ * is live, and a successful uvc_start_streaming() provably lies about it: a
+ * reopen issued too soon after a port reset returns OK from both uvc_open() and
+ * uvc_start_streaming() and then delivers nothing, which is indistinguishable
+ * from the wedge the reset was meant to clear. A DELIVERED FRAME is the only
+ * trustworthy signal, so wait for one - and hand it back to create() via
+ * push_front rather than dropping it, so proving recovery costs no video. */
+static gboolean gst_libuvc_h264_src_await_first_frame(GstLibuvcH264Src *self,
+                                                      gint64 wait_us) {
+  gint64 deadline = g_get_monotonic_time() + wait_us;
+
+  for (;;) {
+    gint64 remaining = deadline - g_get_monotonic_time();
+    if (remaining <= 0) {
+      return FALSE;
+    }
+
+    gpointer item = g_async_queue_timeout_pop(self->frame_queue, remaining);
+    if (item == NULL) {
+      return FALSE;
+    }
+    if (g_atomic_int_get(&self->flushing)) {
+      if (item != FLUSH_SENTINEL) {
+        gst_buffer_unref(item);
+      }
+      return FALSE;
+    }
+    if (item == FLUSH_SENTINEL) {
+      continue;
+    }
+
+    g_async_queue_push_front(self->frame_queue, item);
+    return TRUE;
+  }
+}
+
+/* Recover a WEDGED device: still enumerated, still answering every control
+ * transfer, delivering nothing. ONE USB port reset per silence episode (the
+ * one-shot the caller arms), then a READINESS-DRIVEN return to streaming.
+ *
+ * The reset is the only part with a fixed shape. Everything after it is
+ * measured against the device rather than against a clock: poll until it
+ * re-enumerates, reopen, restart, and then require an ACTUAL frame. If the
+ * reopen came too early - clean start, no video - tear it down and try again
+ * while the budget lasts. The recovery therefore ends the moment frames are
+ * really flowing, which on a fast device is far sooner than any fixed settle
+ * would have allowed, and on a slow one is still correct.
+ *
+ * `reset-settle-max-ms` bounds THIS loop - the polling, the reopen retries and
+ * the frame wait - so an unrecoverable device costs a bounded number of attempts
+ * and then fails through to the usual disconnect error. It does NOT bound the
+ * teardown between attempts: uvc_stop_streaming() joins the callback thread and
+ * uvc_close() talks to a device that may have just been reset away, both
+ * synchronously and with no way to interrupt them. MEASURED: 21880 ms and
+ * 21893 ms total against an 8000 ms budget, on two independent runs. Making that
+ * real needs a non-blocking teardown, which is a separate change.
+ *
+ * The port reset itself is never repeated here: retries are reopens only, so
+ * the one-shot guarantee the caller relies on is preserved exactly. */
+static gboolean gst_libuvc_h264_src_recover_wedged_device(
+    GstLibuvcH264Src *self) {
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
+    GST_ERROR_OBJECT(self, "Wedge recovery: invalid index \"%s\": %s",
+                     self->index ? self->index : "(null)", parse_err);
+    return FALSE;
+  }
+
+  if (!gst_libuvc_h264_src_reset_silent_device(self)) {
+    return FALSE;
+  }
+
+  guint budget_ms;
+  GST_OBJECT_LOCK(self);
+  budget_ms = self->reset_settle_max_ms;
+  GST_OBJECT_UNLOCK(self);
+
+  gint64 started = g_get_monotonic_time();
+  gint64 deadline = started + (gint64) budget_ms * G_TIME_SPAN_MILLISECOND;
+
+  // The reset invalidated the open handle; drop it before re-enumerating.
+  gst_libuvc_h264_src_teardown_handle(self);
+  gst_libuvc_h264_src_drain_queue(self);
+
+  // ...and the libuvc context with it. MEASURED on hardware: after a real port
+  // reset the device re-enumerates, and the context that was open ACROSS that
+  // reset can no longer open it - a freshly started process was streaming again
+  // 14.4 s in while this element, still holding its original context, could not
+  // reopen the device at all inside a 30 s budget. Re-initialising is what makes
+  // the recovery equivalent to the fresh process that demonstrably works. If the
+  // re-init fails there is nothing left to enumerate with, so give up here.
+  uvc_exit(self->uvc_ctx);
+  self->uvc_ctx = NULL;
+  if (uvc_init(&self->uvc_ctx, NULL) < 0) {
+    self->uvc_ctx = NULL;
+    GST_WARNING_OBJECT(self, "Wedge recovery: could not re-init libuvc");
+    return FALSE;
+  }
+
+  gint attempt = 0;
+  guint retry_ms = RESET_POLL_INITIAL_MS;
+  while (!g_atomic_int_get(&self->flushing)
+         && g_get_monotonic_time() < deadline) {
+    if (!gst_libuvc_h264_src_reopen_once(self, &selector, deadline)) {
+      // MEASURED on hardware: the first reopen after a real port reset routinely
+      // fails - the device is listed again but still refuses uvc_open() or the
+      // format negotiation while it finishes coming back. Inside the budget that
+      // is a device in transit, NOT a verdict, so back off and try again. Ending
+      // the recovery here would make the budget meaningless: it once gave up
+      // after 6.9 s of a 30 s budget on a single failed reopen.
+      GST_DEBUG_OBJECT(self,
+          "Wedge recovery: device not reopenable yet; retrying in %u ms",
+          retry_ms);
+      if (!gst_libuvc_h264_src_interruptible_wait(self,
+              (gint64) retry_ms * G_TIME_SPAN_MILLISECOND)) {
+        break;
+      }
+      retry_ms = MIN(retry_ms * 2, (guint) RESET_POLL_MAX_MS);
+      continue;
+    }
+    attempt++;
+
+    gint64 remaining = deadline - g_get_monotonic_time();
+    gint64 proof_us = MIN(remaining, (gint64) TIMEOUT_DURATION);
+    if (proof_us > 0
+        && gst_libuvc_h264_src_await_first_frame(self, proof_us)) {
+      GST_INFO_OBJECT(self,
+          "Wedge recovery: frames advancing again %" G_GINT64_FORMAT
+          " ms after the port reset (reopen attempt %d)",
+          (g_get_monotonic_time() - started) / G_TIME_SPAN_MILLISECOND,
+          attempt);
+      return TRUE;
+    }
+
+    // Started clean and delivered nothing, so the device is not back yet. Tear
+    // the handle down and try again rather than trusting the successful start.
+    GST_DEBUG_OBJECT(self,
+        "Wedge recovery: reopen attempt %d started but delivered no frame",
+        attempt);
+    gst_libuvc_h264_src_teardown_handle(self);
+    gst_libuvc_h264_src_drain_queue(self);
+  }
+
+  GST_WARNING_OBJECT(self,
+      "Wedge recovery gave up after %" G_GINT64_FORMAT " ms (budget %u ms, "
+      "%d reopen attempt(s)); the device never delivered a frame. An overrun "
+      "past the budget is one synchronous libuvc call that was already in "
+      "flight when the budget expired",
+      (g_get_monotonic_time() - started) / G_TIME_SPAN_MILLISECOND, budget_ms,
+      attempt);
+  return FALSE;
 }
 
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
@@ -1560,12 +1858,12 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
         // on the bus — and a reset is the only thing that recovers it. A
         // genuinely absent device fails the reset, so this costs an unplugged
         // device nothing and cannot mask a real disconnect. Deliberately ONE
-        // reopen, not the opt-in path's full retry ladder: `reconnect` stays the
-        // property that buys the ladder.
+        // NOT the opt-in path's retry ladder: `reconnect` stays the property
+        // that buys 1/2/4/8/16 s. The recovery below is bounded by TIME
+        // (`reset-settle-max-ms`) and ends on delivered frames, not attempts.
         self->reset_recovery_used = TRUE;
         self->frames_since_reset = 0;
-        if (gst_libuvc_h264_src_reset_silent_device(self) &&
-            gst_libuvc_h264_src_reconnect_bounded(self, 1)) {
+        if (gst_libuvc_h264_src_recover_wedged_device(self)) {
           GST_INFO_OBJECT(self, "Recovered a wedged device via USB port reset");
           self->consecutive_timeouts = 0;
           continue;
@@ -1593,9 +1891,14 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
     // (without this the recovery would fire at most once per session) but a
     // device that emits one frame and re-wedges cannot reset the port forever.
     self->consecutive_timeouts = 0;
-    if (self->reset_recovery_used
-        && ++self->frames_since_reset >= RESET_RECOVERY_REARM_FRAMES) {
-      self->reset_recovery_used = FALSE;
+    if (self->reset_recovery_used) {
+      guint rearm_frames;
+      GST_OBJECT_LOCK(self);
+      rearm_frames = self->reset_rearm_frames;
+      GST_OBJECT_UNLOCK(self);
+      if (++self->frames_since_reset >= rearm_frames) {
+        self->reset_recovery_used = FALSE;
+      }
     }
     *buf = item;
     return GST_FLOW_OK;

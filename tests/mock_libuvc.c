@@ -107,6 +107,7 @@ static uint16_t g_geom_height = 1080;
 static uint32_t g_geom_interval = 333333;
 
 static int g_frames_delivered = 0;
+static int g_uvc_init_count = 0;
 static int g_device_lists_outstanding = 0; /* uvc_find_devices() not yet freed */
 static int g_uvc_open_count = 0;  /* successful uvc_open() calls */
 static int g_uvc_close_count = 0; /* uvc_close() calls on a live handle */
@@ -179,6 +180,8 @@ static void apply_env_overrides_locked(void) {
       g_frame_mode = MOCK_UVC_FRAME_DISCONNECT;
     else if (strcmp(s, "nonidr_lead") == 0)
       g_frame_mode = MOCK_UVC_FRAME_NONIDR_LEAD;
+    else if (strcmp(s, "silent") == 0)
+      g_frame_mode = MOCK_UVC_FRAME_SILENT;
     else
       g_frame_mode = MOCK_UVC_FRAME_VALID;
   }
@@ -202,6 +205,7 @@ void mock_uvc_reset(void) {
   g_geom_height = 1080;
   g_geom_interval = 333333;
   g_frames_delivered = 0;
+  g_uvc_init_count = 0;
   g_uvc_open_count = 0;
   g_uvc_close_count = 0;
   g_uvc_open_attempts = 0;
@@ -227,6 +231,13 @@ void mock_uvc_reset(void) {
   g_opened_device_index = -1;
   apply_env_overrides_locked();
   pthread_mutex_unlock(&g_lock);
+}
+
+int mock_uvc_init_count(void) {
+  pthread_mutex_lock(&g_lock);
+  int n = g_uvc_init_count;
+  pthread_mutex_unlock(&g_lock);
+  return n;
 }
 
 void mock_uvc_set_device_count(int count) {
@@ -543,6 +554,11 @@ static void *feeder_main(void *arg) {
     int delivered = g_frames_delivered;
     pthread_mutex_unlock(&g_lock);
 
+    /* SILENT: the stream started successfully and the endpoint never delivers. */
+    if (mode == MOCK_UVC_FRAME_SILENT) {
+      break;
+    }
+
     /* DISCONNECT: deliver up to the silence point, then go quiet (no NULL). */
     if (mode == MOCK_UVC_FRAME_DISCONNECT &&
         delivered >= (max_frames > 0 ? max_frames : 1)) {
@@ -603,6 +619,9 @@ static uvc_device_t *mock_new_device(uvc_context_t *ctx, int index) {
 }
 
 uvc_error_t uvc_init(uvc_context_t **ctx, struct libusb_context *usb_ctx) {
+  pthread_mutex_lock(&g_lock);
+  g_uvc_init_count++;
+  pthread_mutex_unlock(&g_lock);
   (void)usb_ctx;
   pthread_mutex_lock(&g_lock);
   apply_env_overrides_locked();

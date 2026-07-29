@@ -67,6 +67,8 @@ gstlibuvch264src/
 │   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
 │   ├── test_transfer_buffers.c # transfer-buffers property: sentinel/clamp/reconnect re-arm, fork-only gated
 │   ├── test_quirks.c        # vid:pid quirk lookup: empty table, match, QUIRK_DOUBLE_PROBE
+│   ├── board/               # MANUAL, hardware-only; never registered with ctest
+│   │   └── wedge-recovery.sh# Gated-SIGKILL wedge + real-libusb_reset_device recovery timing
 │   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
 │   ├── tsan.suppressions    # TSan suppressions for third-party + baselined GMutex blind spots
 │   └── tsan_pts.suppressions# TSan suppressions for PTS/clock GMutex (permanent blind spot)
@@ -168,6 +170,16 @@ USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`). `0` (the d
 
 USB transfer buffer count hint: the number of USB transfer buffers `libuvc` submits per stream. `0` (the default, and the sentinel) leaves the library's default count unchanged — no device write at all. A nonzero value is clamped to `[2, 100]` and applied via the CeraLive fork's `uvc_set_transfer_buffers()` right before streaming starts, in both the initial `start()` and on every reconnect re-arm (the fork API rejects the call mid-stream, so it must precede `uvc_start_streaming()`). Read-back reports the effective (clamped) value once applied; before that it reports the requested value. Requires the CeraLive libuvc fork (backs fork item A2, `libuvch264src/docs/notes/camera-compat.md` §3); on upstream libuvc (`LIBUVC_USE_FORK=OFF`) a nonzero request is a no-op with one warning, and the property itself is otherwise harmless to set on either build.
 
+### `reset-settle-max-ms` (uint, range 0..120000, default `8000`)
+
+Budget, in milliseconds, for the element's **own** readiness loop after a port reset — re-enumeration polling, the reopen retries, and the wait for the first real frame. It is a budget, not a delay: the recovery returns the instant frames are actually flowing, so a device that comes back quickly is not made to wait. When it is spent the element stops starting new attempts and falls through to the usual `RESOURCE/READ` disconnect error. Also bounds the re-enumeration poll on a `start()` that had to force-clean a previous session.
+
+**It does not bound the total.** `uvc_stop_streaming()` and `uvc_close()` are synchronous and libuvc exposes no interruption seam, so on a device that is still re-enumerating the teardown between attempts can push the total well past this value — measured **21880 ms and 21893 ms against an 8000 ms budget** on two independent hardware runs. Size it for the fast path; the worst-case tail is teardown-bound, not policy-bound. See DISCONNECT / RECONNECT BEHAVIOR.
+
+### `reset-rearm-frames` (uint, range 1..100000, default `30`)
+
+Frames the device must deliver after a recovery before the one-shot port reset re-arms for a LATER wedge. The default is ~1 s at 30 fps. Re-arming on the first frame back would let a device that emits one frame and immediately re-wedges reset the port in an endless loop.
+
 ### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
 
 Drives all three PTZ axes in one emission. Each axis is applied only when the device reports it. Returns `TRUE` if at least one supported axis was driven and every attempted set succeeded.
@@ -188,13 +200,16 @@ Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_T
 
 ## DISCONNECT / RECONNECT BEHAVIOR
 
-**Wedged-device recovery (always on, one-shot per silence episode).** Sustained silence has TWO causes that are indistinguishable from inside `create()`: the device was unplugged, or it is still fully present but **wedged** — enumerated, answering every control transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the streaming endpoint. Measured on a DJI Osmo Pocket 3 (`2ca3:0023`) after the holding process died without `uvc_close()`; reproduced identically through libuvc AND through the kernel `uvcvideo` driver, which is what proves it is device state and not an element bug. **A close/reopen does not clear it — only a USB port reset does.** So before claiming a disconnect (which is factually wrong for a device still on the bus), `create()` calls `gst_libuvc_h264_src_reset_silent_device()`: `libusb_reset_device()` on the live handle, a `RESET_SETTLE_MS` (4 s) interruptible settle window, then ONE reopen. Notes:
+**Wedged-device recovery (always on, one-shot per silence episode).** Sustained silence has TWO causes that are indistinguishable from inside `create()`: the device was unplugged, or it is still fully present but **wedged** — enumerated, answering every control transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the streaming endpoint. Measured on a DJI Osmo Pocket 3 (`2ca3:0023`) after the holding process died without `uvc_close()`; reproduced identically through libuvc AND through the kernel `uvcvideo` driver, which is what proves it is device state and not an element bug. **A close/reopen does not clear it — only a USB port reset does.** So before claiming a disconnect (which is factually wrong for a device still on the bus), `create()` runs `gst_libuvc_h264_src_recover_wedged_device()`: ONE `libusb_reset_device()` on the live handle, then a **readiness-driven** return to streaming — poll `uvc_find_devices()` on a micro-backoff until the device re-enumerates, reopen, restart, and require an **actual delivered frame**. Notes:
 
 - `LIBUSB_ERROR_NOT_FOUND` counts as **success** — libusb returns it when the reset re-enumerated the device, which is the outcome we want. Any other non-zero status means the port reset did not happen, so the device really is unreachable and the disconnect error surfaces as before.
-- The settle window is load-bearing and measured: reopening ~1 s after the reset returns OK from both `uvc_open()` and `uvc_start_streaming()` and then delivers zero frames — indistinguishable from the wedge just cleared.
-- It is **one reopen, not the `reconnect` ladder**. `reconnect` remains the property that buys the 1/2/4/8/16 s retry schedule; when `reconnect=true` that path runs instead and is unchanged.
-- The one-shot re-arms only after the device has PROVEN it recovered (`RESET_RECOVERY_REARM_FRAMES` = 30 frames, ~1 s at 30 fps). Re-arming on the first frame back lets a device that emits one frame and re-wedges reset the port forever.
-- Cost to a genuinely absent device: nothing — the reset fails and the error surfaces. Cost to the error latency with `reconnect=false`: the disconnect error is now reported later (measured ~14 s vs ~5 s) because the reset, settle and reopen run first.
+- **A successful `uvc_start_streaming()` is not proof of recovery.** A reopen issued too soon after the reset returns OK from both `uvc_open()` and `uvc_start_streaming()` and then delivers zero frames — indistinguishable from the wedge just cleared. libuvc exposes no readiness API, so a **delivered frame is the readiness signal**; the recovery waits for one and, if the reopen came too early, tears it down and tries again. The proving frame is pushed back to the queue front, so it is never dropped.
+- **No device-measured timing constant is encoded anywhere.** The recovery ends the moment frames actually flow, so a device that comes back in 200 ms costs 200 ms. `reset-settle-max-ms` (default 8000) budgets the element's own readiness loop, not the synchronous libuvc teardown between attempts (see the property docs — measured worst case ~22 s against an 8 s budget). The re-enumeration poll backs off 25 → 200 ms and is interruptible, so a NULL/PAUSED transition never waits it out.
+- **The libuvc context is re-created on the recovery path.** MEASURED: after a real port reset the device re-enumerates, and a context held open across that reset can no longer open it — a freshly started process streamed again 14.4 s in while the element, on its original context, could not reopen at all inside a 30 s budget. `uvc_exit()` + `uvc_init()` is what makes the recovery equivalent to the fresh process that demonstrably works; it took the measured recovery from *never* to **288 ms**.
+- It is **still one port reset per silence episode, not the `reconnect` ladder**. Retries inside the budget are reopens only — the reset itself never repeats. `reconnect` remains the property that buys the 1/2/4/8/16 s retry schedule; when `reconnect=true` that path runs instead and is unchanged.
+- The one-shot re-arms only after the device has PROVEN it recovered (`reset-rearm-frames`, default 30 — ~1 s at 30 fps). Re-arming on the first frame back lets a device that emits one frame and re-wedges reset the port forever.
+- Cost to a genuinely absent device: nothing — the reset fails and the error surfaces immediately, without spending the budget.
+- Real-hardware coverage: `tests/board/wedge-recovery.sh` (manual, board-only, never registered with ctest) induces a real wedge with a gated SIGKILL and measures reset-to-advancing-frames against the bound.
 
 **Disconnect detection (always on):** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently — in callback mode it does **not** invoke the callback with a NULL frame, it simply goes quiet (Task 4 spike). `create()` therefore infers a disconnect from sustained silence: it counts consecutive `g_async_queue_timeout_pop` timeouts (each `TIMEOUT_DURATION` = 1 s), and after `DISCONNECT_TIMEOUT_COUNT` (5) in a row — i.e. ~5 s with no frame — it treats the device as gone. The counter resets on every real frame and in `start()`, so an isolated gap never trips it. On a confirmed disconnect with `reconnect=false` (the default), it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and returns `GST_FLOW_ERROR`; downstream (cerastream) handles the error.
 
@@ -299,10 +314,13 @@ The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in fo
 - Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
 - The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk lookup (`test_quirks`: empty-table default, a matching entry, `QUIRK_DOUBLE_PROBE` behavior) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
 
+**Hardware-only, run by hand (NOT in ctest):** `tests/board/wedge-recovery.sh` induces a real wedge on a board — a gated SIGKILL of a holder that is provably streaming, matching the kill discipline the wedge investigation used — then measures reset-to-advancing-frames through the REAL `libusb_reset_device()` path and asserts it against `reset-settle-max-ms`, with a second USB port as a negative control. It is deliberately absent from `tests/CMakeLists.txt` so it can never run in CI, and skips (exit 77) unless `CERALIVE_BOARD_TEST=1`.
+
 **The suite does NOT prove (requires real hardware — out of scope here):**
 - Actual USB enumeration, `uvc_open()`/streaming against a physical DJI/UVC camera, real bandwidth at a given `max-payload`, or real PTZ motion on a device.
 - The V4L2 `VIDIOC_TRY_FMT` probe result for a real `/dev/videoN` (the test only asserts the probe is non-fatal when the node is absent).
 - Mid-stream physical replug/reconnect timing (the backoff schedule is asserted via a test hook, not a real unplug).
+- Real reset-to-advancing-frames timing. The mock pins the readiness POLICY (poll, reopen, require a frame, honour the bound) via the `MOCK_UVC_FRAME_SILENT` mode and the reset/poll hooks; the actual recovery duration on hardware comes only from `tests/board/wedge-recovery.sh`.
 
 When adding tests, keep them inside the mock-coverable boundary above — assert software behavior the mock can deterministically drive, never a hardware outcome the mock cannot model. Real-hardware validation tracks separately (see `cerastream/docs/notes/hardware-validation.md` for the device-class profiles).
 
@@ -338,7 +356,10 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT link against system libuvc if it exists; the pinned fork/upstream copy is intentional for version pinning.
 - Do NOT modify `scripts/build-libuvc.sh` SHA constants without updating both `FORK_SHA` and `UPSTREAM_SHA` together — they are the single source of truth for the dependency.
 - Do NOT hardcode `aarch64-linux-gnu` in build paths — use `$(gcc -print-multiarch)`.
-- Do NOT delete the `RESET_SETTLE_MS` wait in `gst_libuvc_h264_src_reset_silent_device()` — it looks like a gratuitous sleep and is not. A reopen issued too soon after a port reset succeeds and then delivers zero frames, which is exactly the bug the reset exists to fix.
+- Do NOT reintroduce a fixed, device-measured settle constant between the port reset and the reopen. It was measured on one DJI Osmo Pocket 3 and shipped as `RESET_SETTLE_MS` (4 s); it both over-waited on fast devices and burned the single reopen on slow ones. The replacement polls re-enumeration and requires a delivered frame, bounded by `reset-settle-max-ms`.
+- Do NOT treat a successful `uvc_start_streaming()` as proof the device recovered — it returns OK on a still-wedged device. Only a delivered frame proves it.
+- Do NOT present `reset-settle-max-ms` as a hard upper bound on recovery time. It bounds the element's own retry loop only; the synchronous libuvc teardown between attempts is uninterruptible and has been measured pushing the total to ~22 s against an 8 s budget.
+- Do NOT drop the `uvc_exit()`/`uvc_init()` on the recovery path — a libuvc context held across a port reset cannot reopen the re-enumerated device, and without the refresh the recovery never completes.
 - Do NOT treat `LIBUSB_ERROR_NOT_FOUND` from `libusb_reset_device()` as a failure — it means the reset re-enumerated the device, which is success.
 - Do NOT re-arm the port-reset one-shot on the first frame after a recovery; a device that emits one frame and re-wedges would then reset the port in an endless loop.
 - Do NOT give the reset-recovery path the full `reconnect` retry ladder — the exhaustion tests assert an exact reopen-attempt count, and `reconnect` is the property that buys the ladder.

@@ -75,6 +75,14 @@ struct _GstLibuvcH264Src {
    * reports. Both are guarded by GST_OBJECT_LOCK, mirroring max_payload. */
   guint transfer_buffers;
   guint transfer_buffers_effective;
+  /* Bounds of the readiness-based wedged-device recovery (Task 14).
+   * reset_settle_max_ms (PROP_RESET_SETTLE_MAX_MS) caps the whole
+   * reset-to-advancing-frames attempt; reset_rearm_frames
+   * (PROP_RESET_REARM_FRAMES) is the delivered-frame proof the one-shot needs
+   * before it re-arms. Both are guarded by GST_OBJECT_LOCK, mirroring
+   * max_payload: the app thread writes them, the streaming thread reads them. */
+  guint reset_settle_max_ms;
+  guint reset_rearm_frames;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;
@@ -135,6 +143,18 @@ gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self);
  * default) calls libusb_reset_device() on the live handle. */
 typedef gint (*GstLibuvcResetDeviceHook)(GstLibuvcH264Src *self);
 void gst_libuvc_h264_src_set_reset_device_hook(GstLibuvcResetDeviceHook hook);
+
+/* Test seam for the post-reset readiness poll, mirroring the backoff hook. It
+ * is invoked once per re-enumeration poll interval with the attempt index and
+ * the nominal micro-backoff milliseconds, and returns the microseconds to
+ * actually wait; returning 0 collapses the wall-clock wait so a test never
+ * sleeps out the settle budget. A NULL hook (production default) waits the
+ * nominal interval. It also lets a test record the interval sequence and change
+ * what the device does mid-poll, which is the only way to prove the poll - and
+ * not a fixed sleep - is what ends the wait. */
+typedef gint64 (*GstLibuvcResetPollHook)(GstLibuvcH264Src *self, gint attempt,
+                                         guint interval_ms);
+void gst_libuvc_h264_src_set_reset_poll_hook(GstLibuvcResetPollHook hook);
 
 gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self);
 

@@ -1246,6 +1246,13 @@ set(_reconnect_cases
   "wedged_device_reset_recovers:test_wedged_device_reset_recovers"
   "wedged_device_reset_is_one_shot:test_wedged_device_reset_is_one_shot"
   "absent_device_reset_fails_through:test_absent_device_reset_fails_through"
+  "reset_policy_property_defaults:test_reset_policy_property_defaults"
+  "reset_readiness_polls_reenumeration:test_reset_readiness_polls_reenumeration"
+  "reset_readiness_bounded_by_property:test_reset_readiness_bounded_by_property"
+  "reset_requires_frame_delivery:test_reset_requires_frame_delivery"
+  "reset_survives_transient_reopen_failure:test_reset_survives_transient_reopen_failure"
+  "reset_refreshes_libuvc_context:test_reset_refreshes_libuvc_context"
+  "reset_rearm_frames_property:test_reset_rearm_frames_property"
 )
 # start() may spawn the control thread, so keep these off the shared socket
 # resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
