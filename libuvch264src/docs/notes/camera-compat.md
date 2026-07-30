@@ -115,12 +115,27 @@ See AGENTS.md DISCONNECT / RECONNECT BEHAVIOR for the exact detection window
 
 ### Step 5: check for a vid:pid quirk match
 
-The element carries a `QUIRK_DOUBLE_PROBE` quirk seam (`libuvch264src/src/quirks.{c,h}`)
-for cameras that need `uvc_get_stream_ctrl_format_size()` called twice before
-the negotiated format sticks (libuvc upstream issue #242). The production
-quirk table ships **empty**: no device is quirked by default. If you find a
-camera that needs this workaround, that's a signal to add a table entry, not
-something the field-triage steps above can toggle at the command line today.
+The element carries a vid:pid quirk table (`libuvch264src/src/quirks.{c,h}`) with
+two flags:
+
+- `QUIRK_DOUBLE_PROBE` — for cameras that need
+  `uvc_get_stream_ctrl_format_size()` called twice before the negotiated format
+  sticks (libuvc upstream issue #242). No device is keyed to it today.
+- `QUIRK_MAX_PIXEL_RATE` — for cameras that advertise frame intervals they
+  cannot deliver. The row carries the highest `width x height x fps` PROVEN to
+  stream, and negotiation drops every advertised rate above it.
+
+The table currently holds **one** row: the DJI Osmo Pocket 3 (`2ca3:0023`),
+capped at `1920x1080x30` = 62 208 000 px/s. Its H.264 descriptor advertises
+3840x2160 at 60/50/48 fps, and those three rates negotiate cleanly and then
+deliver **zero** frames — the element's 5 s silence watchdog then reports a
+disconnect that never happened. Because `negotiate()` prefers the largest area at
+the highest fps, the phantom 4K@60 was selected by construction. See
+`quirks.c` for the full evidence and for how to raise the cap.
+
+If you find another camera that needs either workaround, that's a signal to add a
+table entry — not something the field-triage steps above can toggle at the
+command line today.
 
 ---
 
@@ -147,7 +162,7 @@ state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
 | A11 | upstream PR #224 | skip-equivalent | already in `2f32812` (pre-dates this hardening wave) | "Only detach an actually-active kernel driver" is already covered by the fork's `libusb_set_auto_detach_kernel_driver` call plus `uvc_claim_if`'s tolerance of the no-active-driver error codes. |
 | A12 | pupil-labs `92d2f82` + `74e7a96` (clock half only) | adapt + pick | `9874f4c` | Preserves `dwClockFrequency` from the VideoControl header for `bcdUVC` 0x0110 and 0x0150 (previously only 0x0100/0x010a set it). Plumbing only; per the SCR-ABSENT verdict in `scr-investigation.md`, this value is never surfaced on frames, so it has no PTS behavior impact. |
 | A13 | saki4510t `2596242` | skip-equivalent | none (confirmed no-op) | The libuvc-portion of this commit is comment-only for ref/unref (already correct in the fork) plus an Android-JNI-only function absent from this codebase entirely. Nothing to land. |
-| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Implemented as the `QUIRK_DOUBLE_PROBE` vid:pid quirk seam in `libuvch264src/src/quirks.{c,h}`, wired into `negotiate()`. The production quirk table ships empty; no device is quirked by default. |
+| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Implemented as the `QUIRK_DOUBLE_PROBE` vid:pid quirk seam in `libuvch264src/src/quirks.{c,h}`, wired into `negotiate()`. No device is keyed to `QUIRK_DOUBLE_PROBE`; the table's one row uses `QUIRK_MAX_PIXEL_RATE` instead (§2 Step 5). |
 
 **Plugin-side commits that consume the fork's hardening:**
 

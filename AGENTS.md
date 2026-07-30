@@ -34,7 +34,7 @@ gstlibuvch264src/
 │   │   ├── spspps_path.h               # Pure path-builder (no GObject dep, unit-testable)
 │   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
 │   │   ├── uvc_device.{c,h}            # USB teardown helper + V4L2 capability probe
-│   │   └── quirks.{c,h}                 # vid:pid quirk seam (table + lookup + logging); ships empty
+│   │   └── quirks.{c,h}                 # vid:pid quirk table: DOUBLE_PROBE + MAX_PIXEL_RATE; one row (Osmo Pocket 3)
 │   ├── docs/notes/
 │   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
 │   │   ├── bmaxpayload-analysis.md     # max-payload bandwidth tuning analysis
@@ -66,7 +66,7 @@ gstlibuvch264src/
 │   ├── test_cve_2026_1991.c # CVE-2026-1991 regression: null-deref guard in scan-streaming path
 │   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
 │   ├── test_transfer_buffers.c # transfer-buffers property: sentinel/clamp/reconnect re-arm, fork-only gated
-│   ├── test_quirks.c        # vid:pid quirk lookup: empty table, match, QUIRK_DOUBLE_PROBE
+│   ├── test_quirks.c        # vid:pid quirk lookup/limits, QUIRK_DOUBLE_PROBE, Osmo pixel-rate cap
 │   ├── board/               # MANUAL, hardware-only; never registered with ctest
 │   │   └── wedge-recovery.sh# Gated-SIGKILL wedge + real-libusb_reset_device recovery timing
 │   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
@@ -312,7 +312,7 @@ The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in fo
 - The pure logic that does NOT depend on a real device: the Annex-B NAL parser and its count/overflow bounds (`test_nal_parse` — including the `overflow` truncation-warning and `count_bound` suites), the SPS/PPS path builder, cache-key snapshot, and the cache file-open NULL/missing-file path (`test_cache`, `test_live_source` `spspps_key_snapshot`/`cache_open_null_path`).
 - Concurrency/teardown invariants observable in-process under sanitizers: the PTS/clock lock (`test_pts_thread_safety` TSan), the SPS/PPS-bounds clamp and cache index race (ASan/TSan), USB single-`libusb_close` teardown (`test_usb_teardown`), and the CVE-2026-1991 null-guard against the vendored libuvc.
 - Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
-- The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk lookup (`test_quirks`: empty-table default, a matching entry, `QUIRK_DOUBLE_PROBE` behavior) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
+- The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk table (`test_quirks`: pure lookup/limits resolution, `QUIRK_DOUBLE_PROBE` probe count, the shipped Osmo `QUIRK_MAX_PIXEL_RATE` cap, and a red/green pair driving `negotiate()` against the Osmo's real advertised H.264 ladder — one case pins that an UNquirked device still picks the top mode 3840x2160@60, the other that the quirked Osmo lands on 1920x1080@30) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
 
 **Hardware-only, run by hand (NOT in ctest):** `tests/board/wedge-recovery.sh` induces a real wedge on a board — a gated SIGKILL of a holder that is provably streaming, matching the kill discipline the wedge investigation used — then measures reset-to-advancing-frames through the REAL `libusb_reset_device()` path and asserts it against `reset-settle-max-ms`, with a second USB port as a negative control. It is deliberately absent from `tests/CMakeLists.txt` so it can never run in CI, and skips (exit 77) unless `CERALIVE_BOARD_TEST=1`.
 
@@ -366,4 +366,7 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
 - Do NOT enable `control-socket` by default or fall back to a world-accessible path when `XDG_RUNTIME_DIR` is unset — the socket must be opt-in and per-instance.
 - Do NOT set PTZ properties outside the param-spec range in tests — GObject emits a range warning that gst-check turns into a longjmp, skipping teardown and hanging the process.
+- Do NOT raise a `QUIRK_MAX_PIXEL_RATE` cap on the strength of a descriptor, a datasheet, or a successful `uvc_get_stream_ctrl_format_size()`. For the DJI Osmo Pocket 3 all three say 4K@60 works and it delivers zero frames. Only frames that actually ADVANCE on real hardware justify a higher cap; the cap is deliberately parked at the last CONFIRMED-GOOD rate, not the last known-bad one, because a cap set too low only costs resolution while a cap set too high costs the whole stream.
+- Do NOT "fix" the `quirks_ladder_no_quirk_picks_4k60` test because it asserts the buggy 3840x2160@60 outcome. That is deliberate: it pins the untouched max-area-then-max-fps behavior that every camera WITHOUT a quirk row still gets, and it is the control half of the pair whose other half proves the Osmo cap works.
+- Do NOT special-case a device inside `gst_libuvc_h264_negotiate()` (`if (vid == ... && w == 3840 ...)`). The quirk table exists so device knowledge stays data-driven — one row, no branching in the selection loop.
 - This plugin is **not** in the device image REPOS list by default — don't assume it's always present on device.

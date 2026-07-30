@@ -100,6 +100,12 @@ typedef enum {
    * negotiate() at resolution/framerate extremes (1 fps, 120 fps, 320x240, 4K)
    * and assert the caps and frame_interval math overflow-/SIGFPE-free. */
   MOCK_UVC_FORMAT_CUSTOM_GEOMETRY,
+  /* The DJI Osmo Pocket 3's REAL H.264 ladder, transcribed from a byte-verified
+   * USB descriptor dump of 2ca3:0023 (five VS_FRAME_FRAME_BASED children, each
+   * with its true dwFrameInterval list). 3840x2160 is the only one advertising
+   * 60/50/48 fps, and those three rates deliver ZERO frames on the hardware -
+   * which is what makes this the fixture for the max-pixel-rate quirk. */
+  MOCK_UVC_FORMAT_OSMO_LADDER,
 } mock_uvc_format_mode_t;
 
 /* Restore every mock knob to its default (1 device, H264, valid frames,

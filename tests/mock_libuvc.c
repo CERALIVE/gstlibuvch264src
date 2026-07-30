@@ -77,6 +77,11 @@ struct uvc_device_handle {
   uvc_format_desc_t extra_fmt[2];
   uvc_frame_desc_t extra_frame[2];
 
+  /* MOCK_UVC_FORMAT_OSMO_LADDER: five chained frame descriptors, each with its
+   * own NULL-terminated interval list (widest is 6 rates + terminator). */
+  uvc_frame_desc_t ladder_frame[5];
+  uint32_t ladder_intervals[5][7];
+
   /* Feeder thread state. */
   pthread_t feeder;
   pthread_mutex_t lock; /* guards running */
@@ -849,6 +854,43 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
   }
   h->fmt_desc.frame_descs = &h->frame_desc;
   h->fmt_desc.next = NULL;
+
+  if (format_mode == MOCK_UVC_FORMAT_OSMO_LADDER) {
+    /* Transcribed from the byte-verified 2ca3:0023 descriptor dump: bFrameIndex
+     * 1..5 in the device's own order, with the exact dwFrameInterval values. The
+     * 100ns intervals map to 60/50/48/30/25/24 fps. */
+    static const struct {
+      uint16_t w, h;
+      uint32_t intervals[7];
+    } ladder[5] = {
+      { 1280,  720, { 333333, 400000, 0 } },
+      { 1920, 1080, { 333333, 400000, 416666, 0 } },
+      {  720, 1280, { 333333, 400000, 0 } },
+      { 1080, 1920, { 333333, 400000, 416666, 0 } },
+      { 3840, 2160, { 166666, 200000, 208333, 333333, 400000, 416666, 0 } },
+    };
+
+    memset(h->ladder_frame, 0, sizeof(h->ladder_frame));
+    for (int i = 0; i < 5; i++) {
+      memcpy(h->ladder_intervals[i], ladder[i].intervals,
+             sizeof(ladder[i].intervals));
+      h->ladder_frame[i].bDescriptorSubtype = UVC_VS_FRAME_FRAME_BASED;
+      h->ladder_frame[i].bFrameIndex = (uint8_t) (i + 1);
+      h->ladder_frame[i].wWidth = ladder[i].w;
+      h->ladder_frame[i].wHeight = ladder[i].h;
+      h->ladder_frame[i].intervals = h->ladder_intervals[i];
+      h->ladder_frame[i].dwMinFrameInterval = ladder[i].intervals[0];
+      h->ladder_frame[i].next = (i + 1 < 5) ? &h->ladder_frame[i + 1] : NULL;
+
+      uint32_t max_interval = 0;
+      for (int k = 0; ladder[i].intervals[k] != 0; k++) {
+        max_interval = ladder[i].intervals[k];
+      }
+      h->ladder_frame[i].dwMaxFrameInterval = max_interval;
+    }
+
+    h->fmt_desc.frame_descs = &h->ladder_frame[0];
+  }
 
   if (format_mode == MOCK_UVC_FORMAT_MULTI_NO_CODEC) {
     /* Chain two more non-codec formats after the MJPG head, each with a distinct
