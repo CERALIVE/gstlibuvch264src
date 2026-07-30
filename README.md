@@ -339,6 +339,7 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `transfer-buffers` | uint | `0` | USB transfer buffer count hint; `0` = library default (no device write); nonzero clamped to `[2, 100]`, applied right before streaming starts (CeraLive fork only; no-op with a warning on upstream libuvc) |
 | `reset-settle-max-ms` | uint | `8000` | Budget (ms) for the element's own readiness loop after a port reset: re-enumeration polling + reopen retries + wait for the first real frame. A budget, not a delay. Does **not** bound the synchronous libuvc teardown, which can push the total past it |
 | `reset-rearm-frames` | uint | `30` | Frames the device must deliver after a recovery before the one-shot port reset re-arms for a later wedge |
+| `auto-port-reset` | bool | `true` | Issue the silence-triggered USB port reset; set `false` to skip `USBDEVFS_RESET` and use normal disconnect handling |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 
