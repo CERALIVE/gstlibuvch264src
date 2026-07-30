@@ -929,13 +929,19 @@ target_compile_definitions(test_quirks PRIVATE LIBUVCH264SRC_TESTING)
 set(_quirks_cases
   "quirks_lookup_hit:test_quirks_lookup_hit"
   "quirks_lookup_miss:test_quirks_lookup_miss"
-  "quirks_production_table_empty:test_quirks_production_table_empty"
+  "quirks_production_table_untouched:test_quirks_production_table_unrelated_devices_untouched"
   "quirks_double_probe:test_quirks_double_probe"
   "quirks_empty_table_single_probe:test_quirks_empty_table_single_probe"
+  "quirks_osmo_row_caps_phantom_rates:test_quirks_osmo_row_caps_phantom_rates"
+  "quirks_max_fps_ceiling:test_quirks_max_fps_ceiling"
+  "quirks_limits_pure_lookup:test_quirks_limits_pure_lookup"
+  "quirks_ladder_no_quirk_picks_4k60:test_quirks_ladder_without_quirk_picks_phantom_4k60"
+  "quirks_ladder_osmo_avoids_phantom:test_quirks_ladder_with_osmo_quirk_avoids_phantom"
+  "quirks_osmo_row_double_probes:test_quirks_osmo_row_double_probes_and_still_caps"
 )
-# The double-probe/empty-table cases enter PLAYING -> start(), which may spawn
-# the control thread, so keep them off the shared control-socket resource like
-# the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+# The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
+# which may spawn the control thread, so keep them off the shared control-socket
+# resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
 add_gstcheck_multicase_test(test_quirks "quirks"
   "${STATIC_SUITE_SANITIZER}" "${_quirks_cases}")
 

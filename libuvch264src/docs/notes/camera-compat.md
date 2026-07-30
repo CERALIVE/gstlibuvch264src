@@ -115,12 +115,84 @@ See AGENTS.md DISCONNECT / RECONNECT BEHAVIOR for the exact detection window
 
 ### Step 5: check for a vid:pid quirk match
 
-The element carries a `QUIRK_DOUBLE_PROBE` quirk seam (`libuvch264src/src/quirks.{c,h}`)
-for cameras that need `uvc_get_stream_ctrl_format_size()` called twice before
-the negotiated format sticks (libuvc upstream issue #242). The production
-quirk table ships **empty**: no device is quirked by default. If you find a
-camera that needs this workaround, that's a signal to add a table entry, not
-something the field-triage steps above can toggle at the command line today.
+The element carries a vid:pid quirk table (`libuvch264src/src/quirks.{c,h}`) with
+two flags:
+
+- `QUIRK_DOUBLE_PROBE` — for cameras that need
+  `uvc_get_stream_ctrl_format_size()` called twice before the negotiated format
+  sticks (libuvc upstream issue #242).
+- `QUIRK_MAX_PIXEL_RATE` — for cameras that advertise frame intervals they
+  cannot deliver. The row carries the highest `width x height x fps` PROVEN to
+  stream, and negotiation drops every advertised rate above it.
+
+The table currently holds **one** row: the DJI Osmo Pocket 3 (`2ca3:0023`), which
+sets **both** flags, capped at `3840x2160x30` = 248 832 000 px/s.
+
+**Why it needs the double probe (the "camera is not detected" symptom).**
+`uvc_probe_stream_ctrl()` SET_CURs the control it wants, GET_CURs it back, and
+rejects the mode if the readback disagrees. The Osmo answers that first GET_CUR
+from the mode it PREVIOUSLY committed, so a negotiation asking for a mode LARGER
+than the currently committed one fails with `Unable to get stream control:
+Invalid mode` about 170 ms into `start()`. Measured on hardware
+(`192.168.78.131`, 2026-07-30), one probe versus two:
+
+| requested transition | 1 probe | 2 probes |
+|---|---|---|
+| `1280x720@30` → `1920x1080@30` | 3/3 **FAIL** | 3/3 pass |
+| `1920x1080@30` → `3840x2160@60` | 20/20 **FAIL** | 4/4 pass |
+| same mode again, or a smaller one | pass | pass |
+
+Deterministic and direction-specific — 23/23 on a mode increase, never
+otherwise. The `720p → 1080p` row matters most: the element's own shipping mode
+is affected, so this is not a 4K-only concern. It presents as intermittent in the
+field only because whether it fires depends on what mode the device last
+committed.
+
+**Why it also carries a pixel-rate cap.** Its H.264 descriptor advertises
+3840x2160 at 60/50/48 fps, and `negotiate()` prefers the largest area at the
+highest fps, so 4K@60 was selected by construction. Those rates were originally
+recorded negotiating cleanly and then delivering **zero** frames, with the 5 s
+silence watchdog reporting a disconnect that never happened.
+
+> **The zero-frame premise did NOT reproduce on 2026-07-30.** On libuvc `4868e57`
+> the unquirked binary negotiated 4K@60 and delivered real, sustained 4K —
+> 600 access units in 10.6 s (~56 fps) twice over, with `h264parse` reading
+> `3840x2160`, `high` profile, level `5.2` straight out of the SPS.
+
+**4K@30 is settled: the cap was raised, and the capture came first.** The cap now
+sits at `3840x2160x30` = 248 832 000 px/s, measured through this element on board
+`192.168.78.131` on 2026-07-30 with the plugin `.so` deployed alone (the board's
+libuvc untouched at `4868e57`, so the cap was the only variable). Two runs of
+`num-buffers=300 ! video/x-h264,width=3840,height=2160,framerate=30/1`:
+
+| run | access units | duration | `h264parse` caps from the SPS | errors |
+|---|---|---|---|---|
+| 1 | clean EOS, exit 0 | 10.71 s | `3840x2160`, `high`, level `5.2` | 0 |
+| 2 | **300/300** (counted at an `identity` probe) | 10.79 s | `3840x2160`, `high`, level `5.2`, `4:2:0` | 0 |
+
+No `RESOURCE/READ`, no silence-watchdog disconnect on either run. Both logged
+`max pixel rate 248832000` and `quirk: dropped 3 non-deliverable rate(s) at
+3840x2160` — 60/50/48 stayed excluded while the capped rate streamed. The value
+is 4K@30 *exactly* rather than the whole 4K@60 descriptor range, which is what
+makes the capture conclusive: `negotiate()` prefers max area then max fps, so
+3840x2160@30 is the surviving top mode **by construction** and the runs cannot
+have silently measured something else.
+
+> **The caveat below still stands for every FUTURE raise, including 4K@60.** The
+> original zero-frame observation was real and was never explained (one candidate:
+> the same stale-readback defect `QUIRK_DOUBLE_PROBE` exists for can leave a
+> bound-but-silent stream when the readback happens to compare equal), so
+> 4K@60/50/48 remain capped out. Raising the cap further is the one-number change
+> described in `quirks.c` — do not make it on the strength of a descriptor, a
+> datasheet, a successful `uvc_get_stream_ctrl_format_size()`, or this note alone.
+> It takes advancing frames on real hardware: a bounded access-unit count,
+> SPS-verified geometry, reproduced.
+
+See `quirks.c` for the full evidence and for how to raise the cap.
+
+If you find another camera that needs either workaround, that's a signal to add a
+table entry — not something the field-triage steps above can toggle at the
+command line today.
 
 ---
 
@@ -147,7 +219,7 @@ state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
 | A11 | upstream PR #224 | skip-equivalent | already in `2f32812` (pre-dates this hardening wave) | "Only detach an actually-active kernel driver" is already covered by the fork's `libusb_set_auto_detach_kernel_driver` call plus `uvc_claim_if`'s tolerance of the no-active-driver error codes. |
 | A12 | pupil-labs `92d2f82` + `74e7a96` (clock half only) | adapt + pick | `9874f4c` | Preserves `dwClockFrequency` from the VideoControl header for `bcdUVC` 0x0110 and 0x0150 (previously only 0x0100/0x010a set it). Plumbing only; per the SCR-ABSENT verdict in `scr-investigation.md`, this value is never surfaced on frames, so it has no PTS behavior impact. |
 | A13 | saki4510t `2596242` | skip-equivalent | none (confirmed no-op) | The libuvc-portion of this commit is comment-only for ref/unref (already correct in the fork) plus an Android-JNI-only function absent from this codebase entirely. Nothing to land. |
-| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Implemented as the `QUIRK_DOUBLE_PROBE` vid:pid quirk seam in `libuvch264src/src/quirks.{c,h}`, wired into `negotiate()`. The production quirk table ships empty; no device is quirked by default. |
+| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Implemented as the `QUIRK_DOUBLE_PROBE` vid:pid quirk seam in `libuvch264src/src/quirks.{c,h}`, wired into `negotiate()`. The DJI Osmo Pocket 3 row sets it alongside `QUIRK_MAX_PIXEL_RATE` — board-measured 23/23 `Invalid mode` failures on a mode increase with a single probe, 0 with two (§2 Step 5). |
 
 **Plugin-side commits that consume the fork's hardening:**
 
