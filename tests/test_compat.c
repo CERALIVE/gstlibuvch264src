@@ -356,6 +356,29 @@ GST_START_TEST (test_compat_api_surface)
 
 GST_END_TEST;
 
+GST_START_TEST (test_compat_auto_port_reset_property)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL, "could not instantiate '%s'", ELEMENT_NAME);
+
+  GParamSpec *pspec = g_object_class_find_property (
+      G_OBJECT_GET_CLASS (element), "auto-port-reset");
+  fail_unless (pspec != NULL, "expected 'auto-port-reset' property is missing");
+  fail_unless (pspec->value_type == G_TYPE_BOOLEAN,
+      "'auto-port-reset' should be a boolean");
+
+  gboolean enabled = FALSE;
+  g_object_get (element, "auto-port-reset", &enabled, NULL);
+  fail_unless (enabled, "default 'auto-port-reset' must remain TRUE");
+
+  g_object_set (element, "auto-port-reset", FALSE, NULL);
+  g_object_get (element, "auto-port-reset", &enabled, NULL);
+  fail_if (enabled, "'auto-port-reset' FALSE must read back as FALSE");
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 /* ---------------------------------------------------------------------------
  * GROUP 2 test - caps contract
  * ------------------------------------------------------------------------- */
@@ -489,6 +512,7 @@ compat_suite (void)
   tcase_add_test (tc, test_compat_api_surface);
   tcase_add_test (tc, test_compat_caps_contract);
   tcase_add_test (tc, test_compat_transfer_buffers_property);
+  tcase_add_test (tc, test_compat_auto_port_reset_property);
   tcase_add_test (tc, test_compat_pipeline_parse_h264);
   tcase_add_test (tc, test_compat_pipeline_parse_h265);
 

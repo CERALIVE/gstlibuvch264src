@@ -1278,6 +1278,7 @@ set(_reconnect_cases
   "reconnect_backoff_interrupt:test_reconnect_backoff_interrupt"
   "wedged_device_reset_recovers:test_wedged_device_reset_recovers"
   "wedged_device_reset_is_one_shot:test_wedged_device_reset_is_one_shot"
+  "wedged_device_auto_port_reset_disabled:test_wedged_device_auto_port_reset_disabled"
   "absent_device_reset_fails_through:test_absent_device_reset_fails_through"
   "reset_policy_property_defaults:test_reset_policy_property_defaults"
   "reset_readiness_polls_reenumeration:test_reset_readiness_polls_reenumeration"
@@ -1739,6 +1740,7 @@ set(_compat_cases
   "compat_api_surface:test_compat_api_surface"
   "compat_caps_contract:test_compat_caps_contract"
   "compat_transfer_buffers_property:test_compat_transfer_buffers_property"
+  "compat_auto_port_reset_property:test_compat_auto_port_reset_property"
   "compat_pipeline_parse_h264:test_compat_pipeline_parse_h264"
   "compat_pipeline_parse_h265:test_compat_pipeline_parse_h265"
 )
