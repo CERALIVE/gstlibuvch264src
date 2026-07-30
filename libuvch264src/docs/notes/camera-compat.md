@@ -126,7 +126,7 @@ two flags:
   stream, and negotiation drops every advertised rate above it.
 
 The table currently holds **one** row: the DJI Osmo Pocket 3 (`2ca3:0023`), which
-sets **both** flags, capped at `1920x1080x30` = 62 208 000 px/s.
+sets **both** flags, capped at `3840x2160x30` = 248 832 000 px/s.
 
 **Why it needs the double probe (the "camera is not detected" symptom).**
 `uvc_probe_stream_ctrl()` SET_CURs the control it wants, GET_CURs it back, and
@@ -157,14 +157,36 @@ silence watchdog reporting a disconnect that never happened.
 > **The zero-frame premise did NOT reproduce on 2026-07-30.** On libuvc `4868e57`
 > the unquirked binary negotiated 4K@60 and delivered real, sustained 4K —
 > 600 access units in 10.6 s (~56 fps) twice over, with `h264parse` reading
-> `3840x2160`, `high` profile, level `5.2` straight out of the SPS. So the cap's
-> stated justification is not currently observable, and the cap costs the
-> operator 4K. It is deliberately left in place pending an owner decision,
-> because the original zero-frame observation was real and was never explained
-> (one candidate: the same stale-readback defect can also leave a bound-but-silent
-> stream when the readback happens to compare equal). Raising it is the one-number
-> change described in `quirks.c`; do not make it on the strength of this note
-> alone.
+> `3840x2160`, `high` profile, level `5.2` straight out of the SPS.
+
+**4K@30 is settled: the cap was raised, and the capture came first.** The cap now
+sits at `3840x2160x30` = 248 832 000 px/s, measured through this element on board
+`192.168.78.131` on 2026-07-30 with the plugin `.so` deployed alone (the board's
+libuvc untouched at `4868e57`, so the cap was the only variable). Two runs of
+`num-buffers=300 ! video/x-h264,width=3840,height=2160,framerate=30/1`:
+
+| run | access units | duration | `h264parse` caps from the SPS | errors |
+|---|---|---|---|---|
+| 1 | clean EOS, exit 0 | 10.71 s | `3840x2160`, `high`, level `5.2` | 0 |
+| 2 | **300/300** (counted at an `identity` probe) | 10.79 s | `3840x2160`, `high`, level `5.2`, `4:2:0` | 0 |
+
+No `RESOURCE/READ`, no silence-watchdog disconnect on either run. Both logged
+`max pixel rate 248832000` and `quirk: dropped 3 non-deliverable rate(s) at
+3840x2160` — 60/50/48 stayed excluded while the capped rate streamed. The value
+is 4K@30 *exactly* rather than the whole 4K@60 descriptor range, which is what
+makes the capture conclusive: `negotiate()` prefers max area then max fps, so
+3840x2160@30 is the surviving top mode **by construction** and the runs cannot
+have silently measured something else.
+
+> **The caveat below still stands for every FUTURE raise, including 4K@60.** The
+> original zero-frame observation was real and was never explained (one candidate:
+> the same stale-readback defect `QUIRK_DOUBLE_PROBE` exists for can leave a
+> bound-but-silent stream when the readback happens to compare equal), so
+> 4K@60/50/48 remain capped out. Raising the cap further is the one-number change
+> described in `quirks.c` — do not make it on the strength of a descriptor, a
+> datasheet, a successful `uvc_get_stream_ctrl_format_size()`, or this note alone.
+> It takes advancing frames on real hardware: a bounded access-unit count,
+> SPS-verified geometry, reproduced.
 
 See `quirks.c` for the full evidence and for how to raise the cap.
 

@@ -85,17 +85,45 @@ guint uvc_quirk_max_fps(const uvc_quirk_limits_t *limits,
  * the corroboration is that its MJPEG descriptor, for the same 3840x2160, lists
  * only 30/25/24 - the 60/50/48 claim exists on the H.264 descriptor alone.
  *
- * The cap is set to 1920x1080x30 = 62 208 000 px/s, the highest rate PROVEN on
- * hardware to stream (it is the mode the shipping device configuration runs).
- * 4K@30/48/50 are NOT proven either way: 4K@60 is measured dead, 1080p30 is
- * measured good, and everything between is untested, so the cap deliberately
- * sits at the last confirmed-good rate rather than at the last known-bad one.
- * The two failure directions are not symmetric - a cap set too low costs
- * resolution, a cap set too high costs the whole stream.
+ * The cap is 3840x2160x30 = 248 832 000 px/s, and it is CONFIRMED on hardware,
+ * not inferred from the descriptor. Board 192.168.78.131, 2026-07-30, plugin
+ * .so deployed alone so the board's libuvc stayed at 4868e57 and this cap was
+ * the only variable; two independent runs of
+ * `num-buffers=300 ! video/x-h264,width=3840,height=2160,framerate=30/1`:
  *
- * To raise it, measure the candidate mode on real hardware (frames must actually
- * ADVANCE - a successful uvc_start_streaming() proves nothing on this device)
- * and then change this ONE number: 3840x2160@30 would be 248 832 000.
+ *   run 1  clean EOS, exit 0, 10.71 s, h264parse read 3840x2160 / high / 5.2
+ *   run 2  exactly 300/300 access units counted at an identity probe, 10.79 s,
+ *          same SPS-derived 3840x2160 / high / level 5.2 / 4:2:0
+ *
+ * Zero errors, zero RESOURCE/READ, no silence-watchdog disconnect on either
+ * run. That is exactly the bar this table demands and nothing less: frames
+ * ADVANCED for the full ~10.7 s window, at a resolution read out of the SPS
+ * rather than the requested caps echoed back - a successful
+ * uvc_start_streaming() proves nothing on this device.
+ *
+ * The value is 4K@30 EXACTLY, not the full 4K@60 descriptor range, and that is
+ * what makes those runs conclusive rather than suggestive: negotiate() prefers
+ * max area then max fps, so at 248 832 000 the surviving top mode is
+ * 3840x2160@30 BY CONSTRUCTION and the capture cannot have silently measured
+ * 4K@60 instead. Both runs logged `max pixel rate 248832000` and `quirk:
+ * dropped 3 non-deliverable rate(s) at 3840x2160`, confirming 60/50/48 were
+ * still excluded while the measured rate streamed.
+ *
+ * 4K@60/50/48 stay excluded, and this row does not speak to them. An UNCAPPED
+ * build did deliver 600 access units at ~56 fps on the same date
+ * (camera-compat.md S2 Step 5), so the original zero-frame observation is not
+ * currently reproducible - but it was real and was never explained (one
+ * candidate: the same stale-readback defect QUIRK_DOUBLE_PROBE exists for can
+ * leave a bound-but-silent stream when the readback happens to compare equal).
+ * So the cap still sits at the last CONFIRMED-GOOD rate rather than the last
+ * known-bad one. The two failure directions are not symmetric - a cap set too
+ * low costs resolution, a cap set too high costs the whole stream.
+ *
+ * To raise it further, measure the candidate mode the same way - advancing
+ * frames, a bounded access-unit count, SPS-verified geometry, reproduced - and
+ * then change this ONE number: 3840x2160@60 would be 497 664 000. The literal
+ * in tests/test_quirks.c is a deliberate tripwire on this value and has to move
+ * with it.
  *
  * Only pid 0023 needs a row. The camera also enumerates as 2ca3:0020, but that
  * is its RNDIS + mass-storage "connect to computer" mode with no UVC interface
@@ -123,7 +151,7 @@ guint uvc_quirk_max_fps(const uvc_quirk_limits_t *limits,
  * shipping mode is affected, so this is not a 4K-only concern.
  * --------------------------------------------------------------------------- */
 static const uvc_quirk_entry_t g_uvc_quirk_table[] = {
-    { 0x2ca3, 0x0023, QUIRK_MAX_PIXEL_RATE | QUIRK_DOUBLE_PROBE, 62208000u },
+    { 0x2ca3, 0x0023, QUIRK_MAX_PIXEL_RATE | QUIRK_DOUBLE_PROBE, 248832000u },
 };
 
 #ifdef LIBUVCH264SRC_TESTING

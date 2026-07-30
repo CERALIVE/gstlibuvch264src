@@ -20,14 +20,14 @@
  *   quirks_empty_table_single_probe  with no matching quirk the count stays at
  *                                    exactly 1 (default byte-identical probe).
  *   quirks_osmo_row_caps_phantom_    the SHIPPED 2ca3:0023 row caps at
- *   rates                            1920x1080x30 and excludes 4K@60/50/48.
+ *   rates                            3840x2160x30 and excludes 4K@60/50/48.
  *   quirks_max_fps_ceiling           uvc_quirk_max_fps() per resolution, incl.
  *                                    the zero-dimension divide-by-zero guard.
  *   quirks_limits_pure_lookup        quirks_limits_in() over a test-local table,
  *                                    incl. a rate that is NOT armed by its flag.
  *   quirks_ladder_without_quirk_*    red/green pair over the Osmo's REAL H.264
  *   quirks_ladder_with_osmo_quirk_*  ladder: unquirked still picks 3840x2160@60,
- *                                    the quirked Osmo lands on 1920x1080@30.
+ *                                    the quirked Osmo lands on 3840x2160@30.
  */
 
 #include <gst/check/gstcheck.h>
@@ -43,10 +43,18 @@
 
 /* The DJI Osmo Pocket 3, which owns the one row in the SHIPPED quirk table. The
  * cap is asserted as an explicit literal rather than read back from the table, so
- * that silently changing the shipped number fails a test instead of passing. */
+ * that silently changing the shipped number fails a test instead of passing.
+ *
+ * The tripwire has already earned its keep: raising quirks.c from 62 208 000 to
+ * the board-proven 248 832 000 (4K@30) turned FOUR cases red on its own - this
+ * literal, the three max_fps ceilings, and both end-to-end ladder outcomes - so
+ * the shipped number could not move silently. Those expectations were re-POINTED
+ * at the new value, never relaxed: the exclusions below are still exact, the
+ * ladder cases still assert one exact mode, nothing is skipped. Any future move
+ * of this cap must move this literal with it, deliberately. */
 #define OSMO_VID 0x2ca3u
 #define OSMO_PID 0x0023u
-#define OSMO_MAX_PIXEL_RATE 62208000u
+#define OSMO_MAX_PIXEL_RATE 248832000u
 
 static gint g_buffers_seen;
 
@@ -229,6 +237,10 @@ GST_START_TEST (test_quirks_osmo_row_caps_phantom_rates)
   fail_if (uvc_quirk_mode_selectable (&limits, 3840, 2160, 48),
       "3840x2160@48 must be excluded");
 
+  /* The board-proven mode the cap is set to permit (300/300 AUs, 2026-07-30). */
+  fail_unless (uvc_quirk_mode_selectable (&limits, 3840, 2160, 30),
+      "3840x2160@30 is the confirmed-good ceiling and MUST be selectable here");
+
   /* Every rate at or below the confirmed-good ceiling stays selectable. */
   fail_unless (uvc_quirk_mode_selectable (&limits, 1920, 1080, 30),
       "1920x1080@30 is the confirmed-good mode and MUST remain selectable");
@@ -249,14 +261,14 @@ GST_START_TEST (test_quirks_max_fps_ceiling)
 
   /* The continuous-frame-interval branch of negotiate() clamps a whole fps RANGE
    * rather than filtering a list, so it needs the ceiling as a number. */
-  fail_unless (uvc_quirk_max_fps (&limits, 1920, 1080) == 30,
-      "1080p ceiling must be exactly 30 fps, got %u",
+  fail_unless (uvc_quirk_max_fps (&limits, 1920, 1080) == 120,
+      "1080p ceiling must be 248832000/2073600 = 120 fps, got %u",
       uvc_quirk_max_fps (&limits, 1920, 1080));
-  fail_unless (uvc_quirk_max_fps (&limits, 1280, 720) == 67,
-      "720p ceiling must be 62208000/921600 = 67 fps, got %u",
+  fail_unless (uvc_quirk_max_fps (&limits, 1280, 720) == 270,
+      "720p ceiling must be 248832000/921600 = 270 fps, got %u",
       uvc_quirk_max_fps (&limits, 1280, 720));
-  fail_unless (uvc_quirk_max_fps (&limits, 3840, 2160) == 7,
-      "4K ceiling must be 62208000/8294400 = 7 fps, got %u",
+  fail_unless (uvc_quirk_max_fps (&limits, 3840, 2160) == 30,
+      "4K ceiling must be 248832000/8294400 = exactly 30 fps, got %u",
       uvc_quirk_max_fps (&limits, 3840, 2160));
 
   /* A zero dimension must not divide by zero. */
@@ -423,8 +435,8 @@ GST_START_TEST (test_quirks_ladder_without_quirk_picks_phantom_4k60)
 GST_END_TEST;
 
 /* The Osmo needs the double probe too, and BOTH quirks have to survive being ORed
- * into one row: the cap must still land the mode on 1920x1080@30 while the probe
- * runs twice.
+ * into one row: the cap must still land the mode it allows (3840x2160@30) while
+ * the probe runs twice.
  *
  * Measured on hardware (192.168.78.131, 2026-07-30): with a SINGLE probe, the
  * first negotiation after the device was committed to a SMALLER mode fails
@@ -456,17 +468,20 @@ GST_START_TEST (test_quirks_osmo_row_double_probes_and_still_caps)
   fail_unless (mock_uvc_format_size_call_count () == 2,
       "the shipped Osmo row must probe TWICE; got %d",
       mock_uvc_format_size_call_count ());
-  fail_unless (w == 1920 && h == 1080 && fps_n == 30 && fps_d == 1,
-      "the cap must still land on 1920x1080@30 with the double probe armed; "
+  fail_unless (w == 3840 && h == 2160 && fps_n == 30 && fps_d == 1,
+      "the cap must still land on 3840x2160@30 with the double probe armed; "
       "got %dx%d@%d/%d", w, h, fps_n, fps_d);
 }
 
 GST_END_TEST;
 
-/* THE FIX. Same ladder, but the device now identifies as the Osmo, so the shipped
+/* THE FIX. Same ladder, but the device now identifies as the Osmo, so the
  * QUIRK_MAX_PIXEL_RATE row applies: every rate above the cap is dropped BEFORE the
- * preference runs, so 4K cannot win at any of its rates and negotiation settles on
- * the confirmed-good 1920x1080@30. */
+ * preference runs. At the shipped 4K@30 cap that leaves 3840x2160@30 as the top
+ * surviving rate, which is also why the hardware capture behind this value is
+ * conclusive: negotiate() prefers max area then max fps and 4K@60/50/48 are
+ * dropped, so 4K@30 wins BY CONSTRUCTION even under permissive caps - the board
+ * run could not have measured some other mode. */
 GST_START_TEST (test_quirks_ladder_with_osmo_quirk_avoids_phantom)
 {
   mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
@@ -480,12 +495,12 @@ GST_START_TEST (test_quirks_ladder_with_osmo_quirk_avoids_phantom)
 
   fail_unless (got, "the quirked device must still negotiate and stream");
 
-  fail_if (w == 3840 || h == 2160,
-      "the quirk must keep negotiation off 4K entirely (every 4K rate exceeds "
-      "the cap); got %dx%d@%d/%d", w, h, fps_n, fps_d);
-  fail_unless (w == 1920 && h == 1080 && fps_n == 30 && fps_d == 1,
-      "the quirk must land on the confirmed-good 1920x1080@30; got %dx%d@%d/%d",
-      w, h, fps_n, fps_d);
+  fail_if (fps_n > 30 && fps_d == 1,
+      "the quirk must keep negotiation off the phantom 4K@60/50/48 rates; "
+      "got %dx%d@%d/%d", w, h, fps_n, fps_d);
+  fail_unless (w == 3840 && h == 2160 && fps_n == 30 && fps_d == 1,
+      "the cap must land on the confirmed-good 3840x2160@30; "
+      "got %dx%d@%d/%d", w, h, fps_n, fps_d);
 
   /* The published caps matter as much as the chosen mode: a phantom rate left in
    * the framerate list would still be offered downstream as a valid option. */
