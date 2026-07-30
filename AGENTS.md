@@ -59,6 +59,7 @@ gstlibuvch264src/
 │   ├── test_live_source.c   # LATENCY query, buffer OFFSET, SPS/PPS write-on-change
 │   ├── test_sps_bounds.c    # SPS/PPS/VPS NAL copy bounds (heap overflow guard)
 │   ├── test_nal_parse.c     # NAL parser: multi-slice, 3+4-byte start codes, size_t bounds
+│   ├── test_au_alignment.c  # alignment=au contract: one buffer per access unit (AUD + AUD-less)
 │   ├── test_cache.c         # SPS/PPS cache path safety + resolution key
 │   ├── test_error_map.c     # uvc_error_t → GST_ELEMENT_ERROR mapping
 │   ├── test_v4l2_probe.c    # V4L2 VIDIOC_TRY_FMT probe (non-fatal)
@@ -98,6 +99,7 @@ gstlibuvch264src/
 |------|----------|
 | Plugin element logic | `libuvch264src/src/gstlibuvch264src.c` |
 | NAL parsing / PTS / frame callback | `libuvch264src/src/frame_pipeline.c` |
+| Access-unit aggregation (`alignment=au`) | `libuvch264src/src/frame_pipeline.c` → `split_access_units()` |
 | PTZ probe/set + control socket | `libuvch264src/src/ptz_control.c` |
 | USB teardown + V4L2 probe | `libuvch264src/src/uvc_device.c` |
 | Wedged-device USB port-reset recovery | `libuvch264src/src/gstlibuvch264src.c` → `gst_libuvc_h264_src_reset_silent_device()` |
@@ -219,6 +221,29 @@ Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_T
 
 ---
 
+## OUTPUT BUFFER CONTRACT (`alignment=au`)
+
+Both pad templates advertise `alignment=(string)au`, so **every `GstBuffer` the element pushes is exactly one access unit** — one displayed picture, however many NAL units the device split it into. Downstream (`h264parse`, `v4l2slh264dec`/`mppvideodec`, the muxers) trusts that claim to find frame boundaries; the element must therefore honour it rather than merely assert it.
+
+`frame_callback()` parses one libuvc delivery into NAL units, partitions those units into access units (`split_access_units()`), and emits ONE buffer per access unit. Boundary detection, in priority order:
+
+- **AUD present** — an Access Unit Delimiter (H.264 `nal_unit_type` 9, H.265 `AUD_NUT` 35, both mapped to `UNIT_AUD`) *is* by definition the first NAL of its access unit, so it is an exact boundary. No heuristic involved.
+- **AUD absent** — the standard fallback: a slice NAL that opens a new picture ends the access unit that already holds one. "Opens a new picture" is read from the first bit of the slice payload — H.264's `first_mb_in_slice` is `ue(v)`, whose value 0 is the single bit `1`, and H.265's `first_slice_segment_in_pic_flag` is a raw `u(1)` — so a set top bit on the first payload byte means first-slice. Emulation prevention cannot disturb that byte (a `0x03` is only inserted after two `0x00` bytes, and the preceding NAL header is non-zero for every slice).
+- Any non-VCL run (SEI, parameter sets) immediately preceding a new picture's first slice belongs to the **following** access unit, so the cut is placed at the head of that run.
+- A device that emits neither an AUD nor a decodable first-slice bit never splits: the whole delivery becomes one access unit. That is the same grouping a single-picture delivery gets, and it is never a mid-picture cut.
+
+**Behaviour that did NOT change:**
+
+- Single-slice 1080p — the overwhelmingly common case — is byte-identical to the old per-NAL path: its access unit is one slice, so the one emitted buffer holds exactly the delivered bytes. Pinned by the `au_single_slice_characterization` ctest case, which was written and proven green BEFORE the aggregation landed.
+- Parameter sets are still consumed from the wire and re-prepended from the cache. They are written immediately **before** the access unit's first IDR slice, never at the head of the buffer, so an AUD stays the very first NAL of its access unit.
+- The pre-first-IDR gate, the SPS/PPS/VPS bounds clamp, and the write-on-change cache policy are unchanged.
+
+**PTS convention.** An aggregated access unit carries the arrival running-time of the delivery it came from — identically the PTS its **first** slice would have been stamped with under the per-NAL path, since every NAL of one delivery shares a single arrival instant. `GST_BUFFER_OFFSET` is now an access-unit counter rather than a NAL counter; for the single-slice case the sequence is unchanged. The `prev_pts` monotonic clamp no longer fires for slices of one picture (they are aggregated); it still covers a delivery that carried more than one access unit, whose AUs share an arrival `ts`.
+
+Regression-guarded by `tests/test_au_alignment.c` (`au_single_slice_characterization`, `au_multi_slice_aud`, `au_aud_less_fallback`).
+
+---
+
 ## V4L2 CAPABILITY PROBE
 
 At `start()`, after `uvc_open()` succeeds, the element issues one `VIDIOC_TRY_FMT` ioctl against `/dev/video<N>` (where N is the device ordinal). This is a cheap, non-destructive probe — it does not change any device state. The result is logged via `GST_INFO_OBJECT`:
@@ -312,12 +337,14 @@ The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in fo
 - The pure logic that does NOT depend on a real device: the Annex-B NAL parser and its count/overflow bounds (`test_nal_parse` — including the `overflow` truncation-warning and `count_bound` suites), the SPS/PPS path builder, cache-key snapshot, and the cache file-open NULL/missing-file path (`test_cache`, `test_live_source` `spspps_key_snapshot`/`cache_open_null_path`).
 - Concurrency/teardown invariants observable in-process under sanitizers: the PTS/clock lock (`test_pts_thread_safety` TSan), the SPS/PPS-bounds clamp and cache index race (ASan/TSan), USB single-`libusb_close` teardown (`test_usb_teardown`), and the CVE-2026-1991 null-guard against the vendored libuvc.
 - Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
+- The `alignment=au` output-buffer contract (`test_au_alignment`): a multi-slice picture aggregates into ONE buffer both with and without an AUD in the bitstream, a second picture in the same delivery starts a new buffer, and single-slice 1080p stays byte-identical to the pre-aggregation path.
 - The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk table (`test_quirks`: pure lookup/limits resolution, `QUIRK_DOUBLE_PROBE` probe count, the shipped Osmo `QUIRK_MAX_PIXEL_RATE` cap, and a red/green pair driving `negotiate()` against the Osmo's real advertised H.264 ladder — one case pins that an UNquirked device still picks the top mode 3840x2160@60, the other that the quirked Osmo lands on its capped ceiling 3840x2160@30 — plus `quirks_osmo_row_double_probes`, which pins that the shipped Osmo row probes TWICE and the cap still lands the same mode) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
 
 **Hardware-only, run by hand (NOT in ctest):** `tests/board/wedge-recovery.sh` induces a real wedge on a board — a gated SIGKILL of a holder that is provably streaming, matching the kill discipline the wedge investigation used — then measures reset-to-advancing-frames through the REAL `libusb_reset_device()` path and asserts it against `reset-settle-max-ms`, with a second USB port as a negative control. It is deliberately absent from `tests/CMakeLists.txt` so it can never run in CI, and skips (exit 77) unless `CERALIVE_BOARD_TEST=1`.
 
 **The suite does NOT prove (requires real hardware — out of scope here):**
 - Actual USB enumeration, `uvc_open()`/streaming against a physical DJI/UVC camera, real bandwidth at a given `max-payload`, or real PTZ motion on a device.
+- Whether a given camera actually emits multi-slice pictures or Access Unit Delimiters. The AU-alignment cases prove the element's grouping POLICY against crafted bitstreams; which shape a real DJI/UVC device puts on the wire at 1080p30 vs 2160p30 comes only from a board capture.
 - The V4L2 `VIDIOC_TRY_FMT` probe result for a real `/dev/videoN` (the test only asserts the probe is non-fatal when the node is absent).
 - Mid-stream physical replug/reconnect timing (the backoff schedule is asserted via a test hook, not a real unplug).
 - Real reset-to-advancing-frames timing. The mock pins the readiness POLICY (poll, reopen, require a frame, honour the bound) via the `MOCK_UVC_FRAME_SILENT` mode and the reset/poll hooks; the actual recovery duration on hardware comes only from `tests/board/wedge-recovery.sh`.
@@ -364,6 +391,9 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT re-arm the port-reset one-shot on the first frame after a recovery; a device that emits one frame and re-wedges would then reset the port in an endless loop.
 - Do NOT give the reset-recovery path the full `reconnect` retry ladder — the exhaustion tests assert an exact reopen-attempt count, and `reconnect` is the property that buys the ladder.
 - Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
+- Do NOT push one `GstBuffer` per NAL unit. The pad templates advertise `alignment=au`; the element must emit one buffer per ACCESS UNIT. Splitting a multi-slice picture across buffers that each claim to be a whole access unit mis-frames every downstream consumer that trusts the caps.
+- Do NOT "fix" the `alignment=au` mismatch by weakening the caps to `alignment=nal`. Downstream reads the contract; the contract is correct and the emitter was not.
+- Do NOT write the cached parameter sets at the head of an aggregated access-unit buffer. They go immediately before the AU's first IDR slice, so an AUD — which must be the very first NAL of its access unit — keeps its position.
 - Do NOT enable `control-socket` by default or fall back to a world-accessible path when `XDG_RUNTIME_DIR` is unset — the socket must be opt-in and per-instance.
 - Do NOT set PTZ properties outside the param-spec range in tests — GObject emits a range warning that gst-check turns into a longjmp, skipping teardown and hanging the process.
 - Do NOT raise a `QUIRK_MAX_PIXEL_RATE` cap on the strength of a descriptor, a datasheet, or a successful `uvc_get_stream_ctrl_format_size()`. Only frames that actually ADVANCE on real hardware justify a higher cap; the cap is deliberately parked at the last CONFIRMED-GOOD rate, not the last known-bad one, because a cap set too low only costs resolution while a cap set too high costs the whole stream. (The Osmo Pocket 3 row is now capped at `3840x2160x30` = `248832000u` — raised from `62208000u` only after 4K@30 was captured through this element on 2026-07-30: 300/300 access units in ~10.8 s, SPS-verified `3840x2160`/`high`/`5.2`, zero errors, reproduced twice on board `192.168.78.131`. That is the bar. 4K@60/50/48 stay capped out — an uncapped build did stream 4K@60 that day, but the original zero-frame observation was never explained; see `camera-compat.md` §2 Step 5.)

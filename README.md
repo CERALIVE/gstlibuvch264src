@@ -305,6 +305,19 @@ On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP 
 
 ---
 
+### Buffer alignment
+
+The element's caps advertise `alignment=au`, and it delivers on that: every buffer it
+pushes is exactly one access unit — one displayed picture — no matter how many NAL
+units the camera split that picture into. Multi-slice encoding (common at 2160p) is
+therefore handled transparently; `h264parse`, `h265parse`, and the hardware decoders
+in the pipelines above see whole frames, not fragments.
+
+A picture's slices are grouped by its Access Unit Delimiter when the camera emits one,
+and by first-slice-of-picture detection when it does not. Nothing to configure.
+
+---
+
 ### A/V-sync note
 
 This element stamps PTS as pipeline running-time. Residual A/V drift with a Bluetooth microphone is a downstream concern — the BT clock runs independently of the pipeline clock. Add `audioresample` in the audio branch to absorb BT clock drift, or clock-slave the audio source to the pipeline master clock.

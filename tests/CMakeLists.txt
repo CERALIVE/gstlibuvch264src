@@ -1049,6 +1049,33 @@ add_gstcheck_multicase_test(test_live_source "live-source"
   "${STATIC_SUITE_SANITIZER}" "${_live_source_cases}")
 
 # -----------------------------------------------------------------------------
+# Access-unit alignment tests (Task 15).
+#
+# Same single-executable, statically-registered shape as test_pts_monotonic so
+# the case can call frame_callback() directly and read the buffers it queued.
+# The pad template advertises alignment=au, so each pushed GstBuffer must be one
+# whole access unit.
+#   au_single_slice_characterization  control case: single-slice 1080p still
+#                                     emits one buffer holding exactly the
+#                                     delivered bytes.
+#   au_multi_slice_aud                an AUD-led multi-slice picture aggregates
+#                                     into ONE buffer.
+#   au_aud_less_fallback              same guarantee with no AUD, via
+#                                     first-slice-of-new-picture detection.
+# -----------------------------------------------------------------------------
+add_static_gstcheck_exe(test_au_alignment)
+
+set(_au_alignment_cases
+  "au_single_slice_characterization:test_au_single_slice_characterization"
+  "au_multi_slice_aud:test_au_multi_slice_aud"
+  "au_aud_less_fallback:test_au_aud_less_fallback"
+)
+# The cases never call start(), so nothing binds the shared control socket and
+# they can run concurrently under `ctest -j`.
+add_gstcheck_multicase_test(test_au_alignment "au-alignment"
+  "${STATIC_SUITE_SANITIZER}" "${_au_alignment_cases}" NO_RESOURCE_LOCK)
+
+# -----------------------------------------------------------------------------
 # NAL parser unit tests (Task 15). Pure C against the real parser in
 # frame_pipeline.c: no UVC device, no GStreamer runtime, no mock feeder. The TU
 # is linked whole, so frame_callback()'s only element-internal references (the
