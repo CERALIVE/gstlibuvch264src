@@ -422,6 +422,47 @@ GST_START_TEST (test_quirks_ladder_without_quirk_picks_phantom_4k60)
 
 GST_END_TEST;
 
+/* The Osmo needs the double probe too, and BOTH quirks have to survive being ORed
+ * into one row: the cap must still land the mode on 1920x1080@30 while the probe
+ * runs twice.
+ *
+ * Measured on hardware (192.168.78.131, 2026-07-30): with a SINGLE probe, the
+ * first negotiation after the device was committed to a SMALLER mode fails
+ * `Unable to get stream control: Invalid mode` 23 times out of 23 - including
+ * 720p30 -> 1920x1080@30, i.e. the element's own shipping mode. libuvc compares
+ * the requested control against the device's GET_CUR readback
+ * (_uvc_stream_params_negotiated, stream.c) and the Osmo answers the first probe
+ * from the previously committed mode. Two probes: 7 of 7 pass. */
+GST_START_TEST (test_quirks_osmo_row_double_probes_and_still_caps)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
+  mock_uvc_set_device_descriptor (0, OSMO_VID, OSMO_PID, NULL, 0, 0);
+
+  uvc_quirk_limits_t limits;
+  uvc_quirks_limits (OSMO_VID, OSMO_PID, &limits);
+  fail_unless (limits.flags & QUIRK_DOUBLE_PROBE,
+      "the shipped %04x:%04x row must set QUIRK_DOUBLE_PROBE", OSMO_VID,
+      OSMO_PID);
+  fail_unless (limits.flags & QUIRK_MAX_PIXEL_RATE,
+      "the double probe must not displace the pixel-rate cap");
+
+  GstElement *pipeline = build_pipeline ();
+  gint w = 0, h = 0, fps_n = 0, fps_d = 0;
+  gboolean got = play_and_get_negotiated (pipeline, &w, &h, &fps_n, &fps_d);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "the Osmo must negotiate and stream");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "the shipped Osmo row must probe TWICE; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (w == 1920 && h == 1080 && fps_n == 30 && fps_d == 1,
+      "the cap must still land on 1920x1080@30 with the double probe armed; "
+      "got %dx%d@%d/%d", w, h, fps_n, fps_d);
+}
+
+GST_END_TEST;
+
 /* THE FIX. Same ladder, but the device now identifies as the Osmo, so the shipped
  * QUIRK_MAX_PIXEL_RATE row applies: every rate above the cap is dropped BEFORE the
  * preference runs, so 4K cannot win at any of its rates and negotiation settles on
@@ -474,6 +515,7 @@ quirks_suite (void)
   tcase_add_test (tc, test_quirks_limits_pure_lookup);
   tcase_add_test (tc, test_quirks_ladder_without_quirk_picks_phantom_4k60);
   tcase_add_test (tc, test_quirks_ladder_with_osmo_quirk_avoids_phantom);
+  tcase_add_test (tc, test_quirks_osmo_row_double_probes_and_still_caps);
 
   return s;
 }

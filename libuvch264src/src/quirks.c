@@ -100,9 +100,30 @@ guint uvc_quirk_max_fps(const uvc_quirk_limits_t *limits,
  * Only pid 0023 needs a row. The camera also enumerates as 2ca3:0020, but that
  * is its RNDIS + mass-storage "connect to computer" mode with no UVC interface
  * at all, so it never reaches negotiation.
+ *
+ * It also needs QUIRK_DOUBLE_PROBE, for a SEPARATE defect that the pixel-rate
+ * cap does not address. libuvc's uvc_probe_stream_ctrl() SET_CURs the control it
+ * wants, GET_CURs it back, and rejects the mode when the readback disagrees
+ * (_uvc_stream_params_negotiated, libuvc src/stream.c). The Osmo answers that
+ * first GET_CUR out of the mode it had PREVIOUSLY committed, so any negotiation
+ * that asks for a LARGER mode than the one currently committed is rejected with
+ * UVC_ERROR_INVALID_MODE - surfacing as "Unable to get stream control: Invalid
+ * mode" ~170 ms into start(), which reads to an operator as the camera not being
+ * detected.
+ *
+ * Measured on hardware (192.168.78.131, 2026-07-30), one probe vs two, same
+ * binary otherwise:
+ *
+ *   1280x720@30  -> 1920x1080@30   1 probe: 3/3 FAIL    2 probes: 3/3 pass
+ *   1920x1080@30 -> 3840x2160@60   1 probe: 20/20 FAIL  2 probes: 4/4 pass
+ *   same mode again, or SMALLER    1 probe: pass        (readback already agrees)
+ *
+ * The failure is deterministic and direction-specific, not flaky: 23/23 on a
+ * mode increase, 0 otherwise. Note the 720p->1080p row - the element's own
+ * shipping mode is affected, so this is not a 4K-only concern.
  * --------------------------------------------------------------------------- */
 static const uvc_quirk_entry_t g_uvc_quirk_table[] = {
-    { 0x2ca3, 0x0023, QUIRK_MAX_PIXEL_RATE, 62208000u },
+    { 0x2ca3, 0x0023, QUIRK_MAX_PIXEL_RATE | QUIRK_DOUBLE_PROBE, 62208000u },
 };
 
 #ifdef LIBUVCH264SRC_TESTING

@@ -937,6 +937,7 @@ set(_quirks_cases
   "quirks_limits_pure_lookup:test_quirks_limits_pure_lookup"
   "quirks_ladder_no_quirk_picks_4k60:test_quirks_ladder_without_quirk_picks_phantom_4k60"
   "quirks_ladder_osmo_avoids_phantom:test_quirks_ladder_with_osmo_quirk_avoids_phantom"
+  "quirks_osmo_row_double_probes:test_quirks_osmo_row_double_probes_and_still_caps"
 )
 # The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
 # which may spawn the control thread, so keep them off the shared control-socket
