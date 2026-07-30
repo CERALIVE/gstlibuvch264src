@@ -292,7 +292,8 @@ typedef struct
 } WedgeResult;
 
 static void
-run_wedge_scenario (gint hook_status, gboolean replug_heals, WedgeResult * out)
+run_wedge_scenario (gint hook_status, gboolean replug_heals,
+                    gboolean auto_port_reset, WedgeResult * out)
 {
   load_core_elements ();
   register_element ();
@@ -308,6 +309,8 @@ run_wedge_scenario (gint hook_status, gboolean replug_heals, WedgeResult * out)
   GstElement *src = NULL;
   GstElement *pipeline = build_pipeline (&src);
   /* reconnect stays FALSE: the recovery under test must not need the opt-in. */
+  if (!auto_port_reset)
+    g_object_set (src, "auto-port-reset", FALSE, NULL);
 
   fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
       != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
@@ -357,7 +360,7 @@ run_wedge_scenario (gint hook_status, gboolean replug_heals, WedgeResult * out)
 GST_START_TEST (test_wedged_device_reset_recovers)
 {
   WedgeResult res;
-  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , TRUE, &res);
+  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , TRUE, TRUE, &res);
 
   fail_unless (res.reset_calls == 1,
       "a silent source must trigger exactly one port reset with reconnect off, "
@@ -380,7 +383,7 @@ GST_START_TEST (test_wedged_device_reset_is_one_shot)
   /* The reset succeeds but the device stays silent, so no frame ever re-arms the
    * one-shot. The element must give up and report the disconnect rather than
    * resetting the port in a loop. */
-  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , FALSE, &res);
+  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , FALSE, TRUE, &res);
 
   fail_unless (res.reset_calls == 1,
       "the port reset must fire at most once per silence episode, got %d",
@@ -398,7 +401,7 @@ GST_START_TEST (test_absent_device_reset_fails_through)
   /* LIBUSB_ERROR_NO_DEVICE: the device really is gone, so the port reset cannot
    * happen. This is the negative control — the recovery must not swallow, delay
    * past its single attempt, or otherwise mask a genuine unplug. */
-  run_wedge_scenario (LIBUSB_ERROR_NO_DEVICE, FALSE, &res);
+  run_wedge_scenario (LIBUSB_ERROR_NO_DEVICE, FALSE, TRUE, &res);
 
   fail_unless (res.reset_calls == 1,
       "expected exactly one reset attempt, got %d", res.reset_calls);
@@ -407,6 +410,22 @@ GST_START_TEST (test_absent_device_reset_fails_through)
       res.open_count);
   fail_unless (res.errored,
       "a genuinely absent device must still surface the disconnect error");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_wedged_device_auto_port_reset_disabled)
+{
+  WedgeResult res;
+  /* The opt-out must skip the reset entirely and use the existing disconnect
+   * error path. The default path above intentionally remains unset/TRUE. */
+  run_wedge_scenario (0 /* LIBUSB_SUCCESS */ , FALSE, FALSE, &res);
+
+  fail_unless (res.reset_calls == 0,
+      "auto-port-reset=false must not issue a port reset, got %d calls",
+      res.reset_calls);
+  fail_unless (res.errored,
+      "auto-port-reset=false must fall through to the disconnect error");
 }
 
 GST_END_TEST;
@@ -1353,6 +1372,11 @@ reconnect_suite (void)
   tcase_set_timeout (tc_absent, 60);
   tcase_add_test (tc_absent, test_absent_device_reset_fails_through);
   suite_add_tcase (s, tc_absent);
+
+  TCase *tc_opt_out = tcase_create ("wedged_device_auto_port_reset_disabled");
+  tcase_set_timeout (tc_opt_out, 30);
+  tcase_add_test (tc_opt_out, test_wedged_device_auto_port_reset_disabled);
+  suite_add_tcase (s, tc_opt_out);
 
   TCase *tc_props = tcase_create ("reset_policy_property_defaults");
   tcase_set_timeout (tc_props, 30);
