@@ -33,6 +33,7 @@ enum {
   PROP_TRANSFER_BUFFERS,
   PROP_RESET_SETTLE_MAX_MS,
   PROP_RESET_REARM_FRAMES,
+  PROP_AUTO_PORT_RESET,
   PROP_LAST
 };
 
@@ -289,8 +290,17 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                       "that emits one frame and immediately re-wedges reset "
                       "the port forever.",
                       RESET_REARM_FRAMES_MIN, RESET_REARM_FRAMES_MAX,
-                      RESET_REARM_FRAMES_DEFAULT,
-                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+                       RESET_REARM_FRAMES_DEFAULT,
+                       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Safety opt-out for the otherwise always-on wedge recovery. Default TRUE
+   * preserves the shipped behavior; FALSE falls through to the normal
+   * disconnect/error path without issuing a USB port reset. */
+  g_object_class_install_property(gobject_class, PROP_AUTO_PORT_RESET,
+    g_param_spec_boolean("auto-port-reset", "Automatic USB port reset",
+                         "Issue one USB port reset when a present device goes "
+                         "silent; disable to use normal disconnect handling",
+                         TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
@@ -335,6 +345,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->transfer_buffers_effective = 0;
   self->reset_settle_max_ms = RESET_SETTLE_MAX_MS_DEFAULT;
   self->reset_rearm_frames = RESET_REARM_FRAMES_DEFAULT;
+  self->auto_port_reset = TRUE;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -846,6 +857,11 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       self->reset_rearm_frames = g_value_get_uint(value);
       GST_OBJECT_UNLOCK(self);
       break;
+    case PROP_AUTO_PORT_RESET:
+      GST_OBJECT_LOCK(self);
+      self->auto_port_reset = g_value_get_boolean(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -902,6 +918,11 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
     case PROP_RESET_REARM_FRAMES:
       GST_OBJECT_LOCK(self);
       g_value_set_uint(value, self->reset_rearm_frames);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_AUTO_PORT_RESET:
+      GST_OBJECT_LOCK(self);
+      g_value_set_boolean(value, self->auto_port_reset);
       GST_OBJECT_UNLOCK(self);
       break;
     default:
@@ -1468,6 +1489,8 @@ void gst_libuvc_h264_src_set_reset_poll_hook(GstLibuvcResetPollHook hook) {
 gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self) {
   gint rc;
 
+  GST_INFO_OBJECT(self, "About to issue USB port reset for silent-but-present device");
+
   if (gst_libuvc_reset_device_hook != NULL) {
     rc = gst_libuvc_reset_device_hook(self);
   } else {
@@ -1894,6 +1917,15 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
           continue;
         }
       } else if (!self->reset_recovery_used) {
+        gboolean auto_port_reset;
+        GST_OBJECT_LOCK(self);
+        auto_port_reset = self->auto_port_reset;
+        GST_OBJECT_UNLOCK(self);
+        if (!auto_port_reset) {
+          GST_INFO_OBJECT(self,
+                          "Automatic USB port reset disabled; using normal "
+                          "disconnect handling");
+        } else {
         // Sustained silence has TWO indistinguishable causes from here: the
         // device was unplugged, or it is still present but WEDGED (see
         // gst_libuvc_h264_src_reset_silent_device). With reconnect off we still
@@ -1911,6 +1943,7 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
           GST_INFO_OBJECT(self, "Recovered a wedged device via USB port reset");
           self->consecutive_timeouts = 0;
           continue;
+        }
         }
       }
 

@@ -83,6 +83,7 @@ struct _GstLibuvcH264Src {
    * max_payload: the app thread writes them, the streaming thread reads them. */
   guint reset_settle_max_ms;
   guint reset_rearm_frames;
+  gboolean auto_port_reset;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;
