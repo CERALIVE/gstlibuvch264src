@@ -196,3 +196,122 @@ guint32 uvc_quirks_lookup(guint16 vid, guint16 pid) {
     uvc_quirks_limits(vid, pid, &limits);
     return limits.flags;
 }
+
+/* The integer rate a caps fraction represents, rounded UP. A non-integral rate
+ * (30000/1001) is judged by the rate it can peak at rather than by a truncation
+ * that would let it slip under the cap. */
+static guint quirks_fraction_fps(const GValue *fraction) {
+    gint num = gst_value_get_fraction_numerator(fraction);
+    gint den = gst_value_get_fraction_denominator(fraction);
+
+    if (num <= 0 || den <= 0) {
+        return 0;
+    }
+    return (guint)(((gint64)num + den - 1) / den);
+}
+
+/* Filter ONE mode's framerate field in place. FALSE means the mode has no
+ * deliverable rate left and the caller must drop the structure. */
+static gboolean quirks_filter_structure(const uvc_quirk_limits_t *limits,
+                                        GstStructure *structure) {
+    gint width = 0, height = 0;
+    if (!gst_structure_get_int(structure, "width", &width)
+        || !gst_structure_get_int(structure, "height", &height)) {
+        /* No geometry means no pixel rate to judge it by, so it passes through
+         * untouched rather than being guessed at. */
+        return TRUE;
+    }
+
+    const GValue *rates = gst_structure_get_value(structure, "framerate");
+    if (rates == NULL) {
+        return TRUE;
+    }
+
+    if (GST_VALUE_HOLDS_FRACTION_RANGE(rates)) {
+        /* A continuous-frame-interval descriptor advertises a whole RANGE, so
+         * the cap clamps its top instead of removing entries. */
+        guint cap = uvc_quirk_max_fps(limits, (guint)width, (guint)height);
+        const GValue *min = gst_value_get_fraction_range_min(rates);
+        const GValue *max = gst_value_get_fraction_range_max(rates);
+
+        if (cap == G_MAXUINT || quirks_fraction_fps(max) <= cap) {
+            return TRUE;
+        }
+
+        gint min_num = gst_value_get_fraction_numerator(min);
+        gint min_den = gst_value_get_fraction_denominator(min);
+        if (min_den <= 0 || quirks_fraction_fps(min) > cap) {
+            GST_INFO("quirk: %dx%d dropped, its whole interval range exceeds "
+                     "the cap", width, height);
+            return FALSE;
+        }
+
+        gst_structure_set(structure, "framerate", GST_TYPE_FRACTION_RANGE,
+                          min_num, min_den, (gint)cap, 1, NULL);
+        return TRUE;
+    }
+
+    if (GST_VALUE_HOLDS_FRACTION(rates)) {
+        return uvc_quirk_mode_selectable(limits, (guint)width, (guint)height,
+                                         quirks_fraction_fps(rates));
+    }
+
+    if (!GST_VALUE_HOLDS_LIST(rates)) {
+        return TRUE;
+    }
+
+    GValue kept = G_VALUE_INIT;
+    g_value_init(&kept, GST_TYPE_LIST);
+
+    guint excluded = 0;
+    for (guint i = 0; i < gst_value_list_get_size(rates); i++) {
+        const GValue *rate = gst_value_list_get_value(rates, i);
+
+        if (!uvc_quirk_mode_selectable(limits, (guint)width, (guint)height,
+                                       quirks_fraction_fps(rate))) {
+            excluded++;
+            continue;
+        }
+        gst_value_list_append_value(&kept, rate);
+    }
+
+    if (excluded > 0) {
+        GST_INFO("quirk: dropped %u non-deliverable rate(s) at %dx%d",
+                 excluded, width, height);
+    }
+
+    if (gst_value_list_get_size(&kept) == 0) {
+        /* Every advertised rate is above the cap, so the whole mode is
+         * unusable; an empty framerate list would otherwise fixate to nothing. */
+        g_value_unset(&kept);
+        return FALSE;
+    }
+
+    gst_structure_set_value(structure, "framerate", &kept);
+    g_value_unset(&kept);
+    return TRUE;
+}
+
+GstCaps *uvc_quirks_filter_caps(const uvc_quirk_limits_t *limits,
+                                const GstCaps *advertised) {
+    g_return_val_if_fail(advertised != NULL, NULL);
+
+    GstCaps *deliverable = gst_caps_copy(advertised);
+
+    if (limits == NULL || limits->max_pixel_rate == 0) {
+        /* No cap is armed, so every advertised mode is deliverable. Every camera
+         * without a quirk row must keep getting its ladder back unchanged. */
+        return deliverable;
+    }
+
+    guint i = 0;
+    while (i < gst_caps_get_size(deliverable)) {
+        if (quirks_filter_structure(limits,
+                                    gst_caps_get_structure(deliverable, i))) {
+            i++;
+        } else {
+            gst_caps_remove_structure(deliverable, i);
+        }
+    }
+    return deliverable;
+}

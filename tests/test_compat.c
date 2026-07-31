@@ -379,6 +379,57 @@ GST_START_TEST (test_compat_auto_port_reset_property)
 
 GST_END_TEST;
 
+/* The capability-publication contract cerastream binds to AT RUNTIME, by name,
+ * against the installed plugin. A rename or signature change here does not break
+ * any build in this repo - it breaks device enumeration in another one, silently
+ * - so the names, types and arity are pinned on the real factory-made element. */
+GST_START_TEST (test_compat_deliverable_caps_api)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL, "could not instantiate '%s'", ELEMENT_NAME);
+
+  GParamSpec *pspec = g_object_class_find_property (
+      G_OBJECT_GET_CLASS (element), "deliverable-caps");
+  fail_unless (pspec != NULL, "expected 'deliverable-caps' property is missing");
+  fail_unless (pspec->value_type == GST_TYPE_CAPS,
+      "'deliverable-caps' should be GstCaps");
+  fail_if (pspec->flags & G_PARAM_WRITABLE,
+      "'deliverable-caps' must stay read-only: it reports what the device can "
+      "deliver, it does not configure it");
+
+  /* Nothing negotiated yet, so there is no ladder to report. NULL is the honest
+   * answer and is what a consumer must treat as "unknown", never as "no modes". */
+  GstCaps *caps = NULL;
+  g_object_get (element, "deliverable-caps", &caps, NULL);
+  fail_unless (caps == NULL,
+      "'deliverable-caps' must be NULL before a device is negotiated");
+
+  guint signal_id = g_signal_lookup ("filter-deliverable-caps",
+      G_OBJECT_TYPE (element));
+  fail_unless (signal_id != 0,
+      "expected 'filter-deliverable-caps' action signal is missing");
+
+  GSignalQuery query;
+  g_signal_query (signal_id, &query);
+  fail_unless (query.return_type == GST_TYPE_CAPS,
+      "'filter-deliverable-caps' must return GstCaps");
+  fail_unless (query.n_params == 3,
+      "'filter-deliverable-caps' takes (caps, vendor-id, product-id); got %u "
+      "parameter(s)", query.n_params);
+  fail_unless (query.param_types[0] == GST_TYPE_CAPS,
+      "parameter 1 must be the advertised GstCaps");
+  fail_unless (query.param_types[1] == G_TYPE_UINT
+      && query.param_types[2] == G_TYPE_UINT,
+      "parameters 2 and 3 must be the USB vendor and product ids");
+  fail_unless (query.signal_flags & G_SIGNAL_ACTION,
+      "'filter-deliverable-caps' must be an ACTION signal so a consumer can "
+      "emit it directly");
+
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 /* ---------------------------------------------------------------------------
  * GROUP 2 test - caps contract
  * ------------------------------------------------------------------------- */
@@ -513,6 +564,7 @@ compat_suite (void)
   tcase_add_test (tc, test_compat_caps_contract);
   tcase_add_test (tc, test_compat_transfer_buffers_property);
   tcase_add_test (tc, test_compat_auto_port_reset_property);
+  tcase_add_test (tc, test_compat_deliverable_caps_api);
   tcase_add_test (tc, test_compat_pipeline_parse_h264);
   tcase_add_test (tc, test_compat_pipeline_parse_h265);
 

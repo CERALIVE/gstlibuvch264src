@@ -28,6 +28,10 @@ struct _GstLibuvcH264Src {
   /* The framerate negotiate() resolved, kept so the opt-in reconnect path can
    * re-run uvc_get_stream_ctrl_format_size() with the original geometry. */
   gint negotiated_framerate;
+  /* The post-quirk mode ladder negotiate() last selected from, published
+   * read-only as "deliverable-caps". Guarded by the GST_OBJECT lock because a
+   * consumer reads it from a different thread than negotiate() writes it. */
+  GstCaps *deliverable_caps;
   GAsyncQueue *frame_queue;
   gboolean streaming;
   gint flushing; /* atomic: set by unlock(), checked by create() to bail out */

@@ -938,6 +938,10 @@ set(_quirks_cases
   "quirks_ladder_no_quirk_picks_4k60:test_quirks_ladder_without_quirk_picks_phantom_4k60"
   "quirks_ladder_osmo_avoids_phantom:test_quirks_ladder_with_osmo_quirk_avoids_phantom"
   "quirks_osmo_row_double_probes:test_quirks_osmo_row_double_probes_and_still_caps"
+  "quirks_deliverable_caps_excludes_phantom:test_quirks_deliverable_caps_excludes_the_phantom_rates"
+  "quirks_deliverable_caps_unquirked_intact:test_quirks_deliverable_caps_unquirked_keeps_every_rate"
+  "quirks_filter_signal_agrees:test_quirks_filter_signal_agrees_with_the_open_device_ladder"
+  "quirks_filter_signal_unquirked_noop:test_quirks_filter_signal_leaves_an_unquirked_device_untouched"
 )
 # The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
 # which may spawn the control thread, so keep them off the shared control-socket
@@ -1741,6 +1745,7 @@ set(_compat_cases
   "compat_caps_contract:test_compat_caps_contract"
   "compat_transfer_buffers_property:test_compat_transfer_buffers_property"
   "compat_auto_port_reset_property:test_compat_auto_port_reset_property"
+  "compat_deliverable_caps_api:test_compat_deliverable_caps_api"
   "compat_pipeline_parse_h264:test_compat_pipeline_parse_h264"
   "compat_pipeline_parse_h265:test_compat_pipeline_parse_h265"
 )

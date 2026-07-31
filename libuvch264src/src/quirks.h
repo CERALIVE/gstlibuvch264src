@@ -25,6 +25,7 @@
  */
 
 #include <glib.h>
+#include <gst/gst.h>
 
 G_BEGIN_DECLS
 
@@ -94,6 +95,21 @@ gboolean uvc_quirk_mode_selectable(const uvc_quirk_limits_t *limits,
  * be clamped rather than a discrete list filtered. */
 guint uvc_quirk_max_fps(const uvc_quirk_limits_t *limits,
                         guint width, guint height);
+
+/* The deliverable subset of an ADVERTISED caps set: every framerate `limits`
+ * rules out is removed, a continuous framerate RANGE is clamped to the ceiling,
+ * and a mode left with no usable rate is dropped entirely. Returns a new GstCaps
+ * (transfer full); limits that arm no cap yield an unchanged copy.
+ *
+ * This is the ONE place the exclusion is implemented. negotiate() runs each
+ * advertised descriptor through it before selecting a mode, and the element's
+ * "deliverable-caps" property and "filter-deliverable-caps" action signal
+ * publish the output of this same function - so the modes an operator is OFFERED
+ * and the modes negotiation will ACCEPT cannot drift apart. Re-deriving the
+ * exclusion anywhere else (in the engine, in the UI) would recreate exactly the
+ * split this function exists to close. */
+GstCaps *uvc_quirks_filter_caps(const uvc_quirk_limits_t *limits,
+                                const GstCaps *advertised);
 
 #ifdef LIBUVCH264SRC_TESTING
 /* Test-only seam (A14): override the table the production lookups consult so a
