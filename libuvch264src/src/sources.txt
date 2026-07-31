@@ -5,3 +5,4 @@ ptz_control.c
 spspps_cache.c
 gstlibuvch264src_error.c
 quirks.c
+usb_port_recovery.c

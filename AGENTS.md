@@ -33,8 +33,9 @@ gstlibuvch264src/
 │   │   ├── spspps_cache.{c,h}          # SPS/PPS/VPS disk cache (path safety, resolution key)
 │   │   ├── spspps_path.h               # Pure path-builder (no GObject dep, unit-testable)
 │   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
-│   │   ├── uvc_device.{c,h}            # USB teardown helper + V4L2 capability probe
-│   │   └── quirks.{c,h}                 # vid:pid quirk table: DOUBLE_PROBE + MAX_PIXEL_RATE; one row (Osmo Pocket 3, sets both)
+│   │   ├── uvc_device.{c,h}      # USB teardown helper + V4L2 capability probe
+│   │   ├── quirks.{c,h}                 # vid:pid quirk table: DOUBLE_PROBE + MAX_PIXEL_RATE; one row (Osmo Pocket 3, sets both)
+│   │   └── usb_port_recovery.{c,h}      # deep USB recovery: device `authorized` / port `disable` rung (no GObject, no libuvc, sysfs-root parameterized)
 │   ├── docs/notes/
 │   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
 │   │   ├── bmaxpayload-analysis.md     # max-payload bandwidth tuning analysis
@@ -68,6 +69,7 @@ gstlibuvch264src/
 │   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
 │   ├── test_transfer_buffers.c # transfer-buffers property: sentinel/clamp/reconnect re-arm, fork-only gated
 │   ├── test_quirks.c        # vid:pid quirk lookup/limits, QUIRK_DOUBLE_PROBE, Osmo pixel-rate cap + double probe
+│   ├── test_usb_port_recovery.c # deep-recovery helper against a synthetic sysfs tree: rung selection + leaf-target vetoes
 │   ├── board/               # MANUAL, hardware-only; never registered with ctest
 │   │   └── wedge-recovery.sh# Gated-SIGKILL wedge + real-libusb_reset_device recovery timing
 │   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
@@ -103,6 +105,7 @@ gstlibuvch264src/
 | PTZ probe/set + control socket | `libuvch264src/src/ptz_control.c` |
 | USB teardown + V4L2 probe | `libuvch264src/src/uvc_device.c` |
 | Wedged-device USB port-reset recovery | `libuvch264src/src/gstlibuvch264src.c` → `gst_libuvc_h264_src_reset_silent_device()` |
+| Deep USB recovery rung (post-reset `error -71`) | `libuvch264src/src/usb_port_recovery.c`; ladder position in `gstlibuvch264src.c` → `gst_libuvc_h264_src_deep_recovery()` |
 | SPS/PPS cache | `libuvch264src/src/spspps_cache.c` |
 | Error mapping helper | `libuvch264src/src/gstlibuvch264src_error.c` |
 | vid:pid quirk seam (table + lookup) | `libuvch264src/src/quirks.c` |
@@ -186,6 +189,27 @@ Frames the device must deliver after a recovery before the one-shot port reset r
 
 Controls the silence-triggered wedge-recovery port reset. The default remains `true` and preserves the always-on recovery behavior. Set it to `false` for a device or scenario where issuing `USBDEVFS_RESET` risks stranding the camera; sustained silence then skips the reset and falls through to the normal `RESOURCE/READ` disconnect error path.
 
+### `deep-port-recovery` (boolean, default `false`)
+
+Opt-in escalation for the case the port reset cannot fix: a reset the device never comes back from. The kernel retries enumeration `PORT_INIT_TRIES` times, each failing `error -71` (`EPROTO`), then logs `unable to enumerate USB device` and stops — and at that point the device object is gone, so there is nothing left for another `libusb_reset_device()` to reset.
+
+When `true`, the element escalates **once per silence episode**, and only after the port reset AND every reopen inside `reset-settle-max-ms` have already failed:
+
+1. **Device-level `authorized` 0→1**, if the device object survived and still reports the vid:pid captured before the reset. A logical deauthorise + re-probe of exactly one device; the port's power state is untouched.
+2. **Port-level `disable` 1→0** (1 s hold), if the device object is gone. Clears `PORT_POWER` and the latched `C_CONNECTION`/`C_ENABLE` bits so the hub sees a genuine connect-change.
+
+Then one further settle pass — polling, reopen, and a **delivered frame** — before falling through to the usual `RESOURCE/READ` disconnect error. This means an enabled rung can roughly **double** the worst-case recovery time, which is a second reason it is opt-in.
+
+**Why it defaults to `false`.** On board `192.168.78.131` the rung is proven to **fire** and proven **not to recover**: the port cycle drives xHCI `PORTSC` from `Powered Connected Enabled` to `Powered-off Not-connected Disabled Link:Disabled` and back with `Change: CSC`, the kernel re-runs enumeration from scratch with a fresh address — and the device still failed `error -71`, 3/3 cycles at a 10 s hold. Turning it on by default would spend a second budget and root-only sysfs writes on every wedge with no evidence behind it. Flipping the default requires a separate commit with a real ×3 recovery. See `.omo/evidence/device-platform-wave4/task-11-board-proof.md`.
+
+**Bounds and safety.**
+
+- **It is a port STATE cycle, not a proven VBUS removal.** `PORTSC` reports `Powered-off`, but the same root hub advertises `wHubCharacteristic 0x000a` = *"No power switching"* and the board's Type-C 5 V rail is a separate GPIO regulator. Nothing here establishes that VBUS physically dropped; the logs say "logical re-probe" for that reason.
+- **Never touches a hub carrying another device.** No sysfs attribute reports a hub's power-switching mode, and ganged hubs are real on this hardware (the board's Terminus `1a40:0101` reports `Ganged power switching`), so a port whose hub has any other enumerated child is refused outright.
+- **Never touches a device that is not ours.** Bus addresses are recycled; the vid:pid captured before the reset is re-checked, and a mismatch at either the device path or the port's current occupant is refused.
+- **Needs privilege.** USB sysfs attributes are root-writable only. Embedded in a root service (cerastream's unit has no `User=`) the writes land; run as a normal user they return `denied` and are logged as such rather than silently doing nothing.
+- The target is resolved from sysfs **while the device is still open** — after a failed re-enumeration there is no device directory left to resolve a port from.
+
 ### `deliverable-caps` (GstCaps, read-only)
 
 The post-quirk mode ladder `negotiate()` actually selects from — what this element will **accept**, not what the device **advertises**. `NULL` until a device has been negotiated; a consumer must read `NULL` as *unknown*, never as *no modes*.
@@ -230,6 +254,7 @@ Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_T
 - The one-shot re-arms only after the device has PROVEN it recovered (`reset-rearm-frames`, default 30 — ~1 s at 30 fps). Re-arming on the first frame back lets a device that emits one frame and re-wedges reset the port forever.
 - Cost to a genuinely absent device: nothing — the reset fails and the error surfaces immediately, without spending the budget.
 - Real-hardware coverage: `tests/board/wedge-recovery.sh` (manual, board-only, never registered with ctest) induces a real wedge with a gated SIGKILL and measures reset-to-advancing-frames against the bound.
+- **When the reset itself does not take**, the opt-in `deep-port-recovery` rung escalates once more (see its property docs). It is default-off, sits strictly below the reset in the ladder, and is skipped entirely whenever the reset already recovered the device.
 
 **Disconnect detection (always on):** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently — in callback mode it does **not** invoke the callback with a NULL frame, it simply goes quiet (Task 4 spike). `create()` therefore infers a disconnect from sustained silence: it counts consecutive `g_async_queue_timeout_pop` timeouts (each `TIMEOUT_DURATION` = 1 s), and after `DISCONNECT_TIMEOUT_COUNT` (5) in a row — i.e. ~5 s with no frame — it treats the device as gone. The counter resets on every real frame and in `start()`, so an isolated gap never trips it. On a confirmed disconnect with `reconnect=false` (the default), it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and returns `GST_FLOW_ERROR`; downstream (cerastream) handles the error.
 
@@ -407,6 +432,11 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT drop the `uvc_exit()`/`uvc_init()` on the recovery path — a libuvc context held across a port reset cannot reopen the re-enumerated device, and without the refresh the recovery never completes.
 - Do NOT treat `LIBUSB_ERROR_NOT_FOUND` from `libusb_reset_device()` as a failure — it means the reset re-enumerated the device, which is success.
 - Do NOT re-arm the port-reset one-shot on the first frame after a recovery; a device that emits one frame and re-wedges would then reset the port in an endless loop.
+- Do NOT write `authorized` on a `usbN-portM` directory or `disable` on a device directory. They live on different objects and neither exists on the other — measured 14/14 ports and 12/12 devices on the board. A device that failed enumeration has **no device directory at all**, which is exactly why the port path must be captured before the reset.
+- Do NOT describe the `deep-port-recovery` port cycle as a power cycle in logs, docs or commit messages. `PORTSC` reaching `Powered-off` is not proof the board's VBUS rail dropped, and the root hub in question advertises "No power switching" while still honouring the write. Only a hub control-transfer round-trip that proves per-port switching would justify the stronger claim, and this element does not make one.
+- Do NOT run the deep rung on a port whose hub carries another device, and do NOT replace the sibling-port check with a hub-descriptor capability read. Ganged hubs exist on this hardware, and the descriptor is demonstrably unreliable here (the xHCI root hub reports "No power switching" yet its `PORTSC` power bit does toggle).
+- Do NOT enable `deep-port-recovery` by default on the strength of the rung firing. It fired cleanly 3/3 on real hardware and recovered nothing; the default flips only on a board-proven ×3 recovery.
+- Do NOT reach the deep rung before the reset, or when the reset already recovered the device. The ordering is pinned by `test_reconnect.c`'s `deep_recovery_*` cases and is the whole point of the rung being an escalation.
 - Do NOT give the reset-recovery path the full `reconnect` retry ladder — the exhaustion tests assert an exact reopen-attempt count, and `reconnect` is the property that buys the ladder.
 - Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
 - Do NOT push one `GstBuffer` per NAL unit. The pad templates advertise `alignment=au`; the element must emit one buffer per ACCESS UNIT. Splitting a multi-slice picture across buffers that each claim to be a whole access unit mis-frames every downstream consumer that trusts the caps.

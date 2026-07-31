@@ -6,6 +6,7 @@
 #include <gst/base/gstpushsrc.h>
 #include <libuvc/libuvc.h>
 #include "gstlibuvch264src.h"
+#include "usb_port_recovery.h"
 
 G_BEGIN_DECLS
 
@@ -88,6 +89,20 @@ struct _GstLibuvcH264Src {
   guint reset_settle_max_ms;
   guint reset_rearm_frames;
   gboolean auto_port_reset;
+  /* Opt-in escalation BELOW the port reset (Task 11). A port reset can leave a
+   * device that never re-enumerates - `error -71` four times, then `unable to
+   * enumerate USB device` - at which point the reset rung has nothing left to
+   * reset. deep_port_recovery (PROP_DEEP_PORT_RECOVERY, guarded by
+   * GST_OBJECT_LOCK like the bounds above) opts into one sysfs escalation after
+   * the reset-and-reopen cycle has already failed; deep_recovery_used is its
+   * one-shot, re-armed on the same delivered-frame proof as the reset's.
+   *
+   * recovery_target is resolved from sysfs while the device is still OPEN,
+   * because after a failed re-enumeration there is no device directory left to
+   * resolve a port from. It is owned here and cleared in stop(). */
+  gboolean deep_port_recovery;
+  gboolean deep_recovery_used;
+  UsbRecoveryTarget recovery_target;
   GstClock *clock;
   GstClockTime base_time;
   GstClockTime prev_pts;
@@ -162,6 +177,15 @@ typedef gint64 (*GstLibuvcResetPollHook)(GstLibuvcH264Src *self, gint attempt,
 void gst_libuvc_h264_src_set_reset_poll_hook(GstLibuvcResetPollHook hook);
 
 gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self);
+
+/* Test seam for the deep-recovery rung, mirroring the reset hook. The real rung
+ * writes root-only USB sysfs attributes, which a test host neither has nor
+ * should have; the hook reports the outcome the element must act on and lets a
+ * test assert WHEN in the ladder the rung fired. A NULL hook (production
+ * default) resolves the captured target and performs the real writes. */
+typedef UsbDeepRecoveryOutcome (*GstLibuvcDeepRecoveryHook)(
+    GstLibuvcH264Src *self);
+void gst_libuvc_h264_src_set_deep_recovery_hook(GstLibuvcDeepRecoveryHook hook);
 
 G_END_DECLS
 

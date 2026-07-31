@@ -226,6 +226,37 @@ gst-launch-1.0 libuvch264src index=0 reset-settle-max-ms=15000 \
   ! queue ! h264parse ! fakesink
 ```
 
+### Deep port recovery (opt-in, default off)
+
+A port reset can leave a device that never comes back: the kernel retries
+enumeration, each attempt fails with `error -71`, and it gives up with
+`unable to enumerate USB device`. There is no device left to reset a second
+time — only the port.
+
+`deep-port-recovery=true` adds one escalation for exactly that case, after the
+reset and all of its reopens have already failed. If the device object survived
+it does a device-level `authorized` re-probe; if it did not, it cycles the
+port's `disable` attribute so the hub sees a fresh connect-change. Either way it
+then requires a real delivered frame before calling the device recovered, and
+otherwise falls through to the usual `RESOURCE/READ` error.
+
+It writes USB sysfs, so it needs to run as root — embedded in a root service it
+works, and as a normal user it logs that it was denied instead of pretending.
+It refuses to act on a port whose hub carries any other device, and on a device
+whose vid:pid no longer matches the one it recorded before the reset.
+
+**This is a logical port-state cycle, not a proven VBUS power removal.** It is
+off by default because on the reference board it demonstrably fires — the port
+really does drop to `Powered-off` and re-enumerate from scratch — and the
+`error -71` device still did not come back, 3 out of 3 attempts. Turn it on only
+where it has been shown to help.
+
+```
+gst-launch-1.0 libuvch264src index=0 deep-port-recovery=true \
+  ! video/x-h264,width=1920,height=1080,framerate=30/1 \
+  ! queue ! h264parse ! fakesink
+```
+
 ### Reconnect on Disconnect
 
 Set `reconnect=true` to enable in-element auto-reconnect when the device is unplugged
@@ -340,6 +371,7 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `reset-settle-max-ms` | uint | `8000` | Budget (ms) for the element's own readiness loop after a port reset: re-enumeration polling + reopen retries + wait for the first real frame. A budget, not a delay. Does **not** bound the synchronous libuvc teardown, which can push the total past it |
 | `reset-rearm-frames` | uint | `30` | Frames the device must deliver after a recovery before the one-shot port reset re-arms for a later wedge |
 | `auto-port-reset` | bool | `true` | Issue the silence-triggered USB port reset; set `false` to skip `USBDEVFS_RESET` and use normal disconnect handling |
+| `deep-port-recovery` | bool | `false` | Escalate once more when the port reset AND its reopens have both failed: a device-level `authorized` re-probe, or a port-level `disable` cycle if the device no longer enumerates. Needs root; never runs on a hub carrying another device. Off by default — proven to fire on hardware, not proven to recover |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
 
