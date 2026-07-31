@@ -379,6 +379,32 @@ GST_START_TEST (test_compat_auto_port_reset_property)
 
 GST_END_TEST;
 
+GST_START_TEST (test_compat_deep_port_recovery_property)
+{
+  GstElement *element = gst_element_factory_make (ELEMENT_NAME, NULL);
+  fail_unless (element != NULL, "could not instantiate '%s'", ELEMENT_NAME);
+
+  GParamSpec *pspec = g_object_class_find_property (
+      G_OBJECT_GET_CLASS (element), "deep-port-recovery");
+  fail_unless (pspec != NULL,
+      "expected 'deep-port-recovery' property is missing");
+  fail_unless (pspec->value_type == G_TYPE_BOOLEAN,
+      "'deep-port-recovery' should be a boolean");
+
+  gboolean enabled = TRUE;
+  g_object_get (element, "deep-port-recovery", &enabled, NULL);
+  fail_if (enabled,
+      "default 'deep-port-recovery' must remain FALSE until a board proves the "
+      "escalation RECOVERS a device, not merely that it fires");
+
+  g_object_set (element, "deep-port-recovery", TRUE, NULL);
+  g_object_get (element, "deep-port-recovery", &enabled, NULL);
+  fail_unless (enabled, "'deep-port-recovery' TRUE must read back as TRUE");
+  gst_object_unref (element);
+}
+
+GST_END_TEST;
+
 /* The capability-publication contract cerastream binds to AT RUNTIME, by name,
  * against the installed plugin. A rename or signature change here does not break
  * any build in this repo - it breaks device enumeration in another one, silently
@@ -564,6 +590,7 @@ compat_suite (void)
   tcase_add_test (tc, test_compat_caps_contract);
   tcase_add_test (tc, test_compat_transfer_buffers_property);
   tcase_add_test (tc, test_compat_auto_port_reset_property);
+  tcase_add_test (tc, test_compat_deep_port_recovery_property);
   tcase_add_test (tc, test_compat_deliverable_caps_api);
   tcase_add_test (tc, test_compat_pipeline_parse_h264);
   tcase_add_test (tc, test_compat_pipeline_parse_h265);

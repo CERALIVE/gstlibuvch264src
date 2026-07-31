@@ -34,6 +34,7 @@ enum {
   PROP_RESET_SETTLE_MAX_MS,
   PROP_RESET_REARM_FRAMES,
   PROP_AUTO_PORT_RESET,
+  PROP_DEEP_PORT_RECOVERY,
   PROP_DELIVERABLE_CAPS,
   PROP_LAST
 };
@@ -67,6 +68,13 @@ enum {
 #define RESET_POLL_INITIAL_MS 25
 #define RESET_POLL_MAX_MS 200
 #define RECONNECT_BACKOFF_INITIAL_S 1
+/* How long the deep rung holds a port disabled between its two writes. The
+ * kernel's own inter-retry cycle only holds power off for 2 * bPwrOn2PwrGood
+ * (40 ms on the measured board) and demonstrably does not clear this state, so
+ * a longer hold is the only variable worth changing; a second is far past every
+ * hub's power-good window and still small next to the settle budget it is
+ * charged against. Not device-derived - no camera's timing is encoded here. */
+#define DEEP_RECOVERY_PORT_HOLD_MS 1000
 
 /* Opt-in USB payload override (Task 12, gated on bmaxpayload-analysis.md §5).
  * MAX_PAYLOAD_DEFAULT is the sentinel: 0 = "use the device-negotiated value",
@@ -306,6 +314,24 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                          "silent; disable to use normal disconnect handling",
                          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* Default FALSE, and it stays FALSE until a board proves it RECOVERS - not
+   * merely that it fires. On the measured board the port cycle demonstrably
+   * regenerates a connect-change (PORTSC drops to Powered-off/Not-connected and
+   * comes back with C_CONNECTION set, and the kernel re-runs enumeration with a
+   * fresh address) yet the device still failed `error -71` on 3/3 attempts.
+   * Shipping it on by default would spend seconds of a recovery budget on an
+   * escalation with no evidence behind it, and would write root-only sysfs on
+   * every wedge. See task-11-board-proof.md. */
+  g_object_class_install_property(gobject_class, PROP_DEEP_PORT_RECOVERY,
+    g_param_spec_boolean("deep-port-recovery", "Deep port recovery",
+                         "After a port reset AND its reopen retries have both "
+                         "failed, escalate once to a USB sysfs re-probe: "
+                         "device-level `authorized` while the device object "
+                         "survives, else a port-level `disable` cycle. Needs "
+                         "privilege to write USB sysfs and never runs on a hub "
+                         "carrying another device",
+                         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* The mode ladder negotiate() actually selects from, i.e. what this element
    * will ACCEPT - not what the device advertises. NULL until a device has been
    * negotiated. Read it to publish honest options to an operator instead of the
@@ -368,6 +394,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->consecutive_timeouts = 0;
   self->reset_recovery_used = FALSE;
   self->frames_since_reset = 0;
+  self->deep_port_recovery = FALSE;
+  self->deep_recovery_used = FALSE;
   self->reconnect_enabled = FALSE;
   self->max_payload = MAX_PAYLOAD_DEFAULT;
   self->max_payload_effective = 0;
@@ -376,6 +404,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->reset_settle_max_ms = RESET_SETTLE_MAX_MS_DEFAULT;
   self->reset_rearm_frames = RESET_REARM_FRAMES_DEFAULT;
   self->auto_port_reset = TRUE;
+  memset(&self->recovery_target, 0, sizeof self->recovery_target);
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -901,6 +930,11 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
       self->auto_port_reset = g_value_get_boolean(value);
       GST_OBJECT_UNLOCK(self);
       break;
+    case PROP_DEEP_PORT_RECOVERY:
+      GST_OBJECT_LOCK(self);
+      self->deep_port_recovery = g_value_get_boolean(value);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -962,6 +996,11 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
     case PROP_AUTO_PORT_RESET:
       GST_OBJECT_LOCK(self);
       g_value_set_boolean(value, self->auto_port_reset);
+      GST_OBJECT_UNLOCK(self);
+      break;
+    case PROP_DEEP_PORT_RECOVERY:
+      GST_OBJECT_LOCK(self);
+      g_value_set_boolean(value, self->deep_port_recovery);
       GST_OBJECT_UNLOCK(self);
       break;
     case PROP_DELIVERABLE_CAPS:
@@ -1299,6 +1338,8 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   self->consecutive_timeouts = 0;
   self->reset_recovery_used = FALSE;
   self->frames_since_reset = 0;
+  self->deep_recovery_used = FALSE;
+  usb_recovery_target_clear(&self->recovery_target);
 
   // Resolve the device selector up-front, before touching libuvc, so a
   // malformed index fails loudly here instead of silently selecting device 0.
@@ -1425,6 +1466,8 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
 
   // Close the listening fd and unlink the per-instance socket path.
   gst_libuvc_h264_src_control_socket_unbind(self);
+
+  usb_recovery_target_clear(&self->recovery_target);
 
   // Stop streaming. uvc_stop_streaming() is synchronous: it clears running,
   // broadcasts cb_cond, and pthread_join()s the callback thread before it
@@ -1784,6 +1827,75 @@ static gboolean gst_libuvc_h264_src_await_first_frame(GstLibuvcH264Src *self,
   }
 }
 
+static gboolean gst_libuvc_h264_src_settle_until_frame(
+    GstLibuvcH264Src *self, const GstLibuvcDeviceSelector *selector,
+    gint64 deadline, gint64 started, gint *attempt);
+
+static GstLibuvcDeepRecoveryHook gst_libuvc_deep_recovery_hook = NULL;
+
+void gst_libuvc_h264_src_set_deep_recovery_hook(
+    GstLibuvcDeepRecoveryHook hook) {
+  gst_libuvc_deep_recovery_hook = hook;
+}
+
+/* Resolve the sysfs paths of the device this element currently holds. Called
+ * while the handle is still LIVE, because the state this exists to escalate out
+ * of - a reset the device never came back from - destroys the device directory
+ * the port would otherwise be resolved through. */
+static void gst_libuvc_h264_src_capture_recovery_target(
+    GstLibuvcH264Src *self) {
+  usb_recovery_target_clear(&self->recovery_target);
+  if (self->uvc_dev == NULL) {
+    return;
+  }
+
+  guint8 bus = uvc_get_bus_number(self->uvc_dev);
+  guint8 address = uvc_get_device_address(self->uvc_dev);
+  if (!usb_recovery_target_capture("/sys", bus, address,
+                                   &self->recovery_target)) {
+    GST_DEBUG_OBJECT(self,
+        "Deep recovery: no sysfs target for bus %u address %u; the escalation "
+        "will report no-target if it is ever reached", bus, address);
+  }
+}
+
+/* The rung BELOW the port reset, reached only once both the reset AND every
+ * reopen inside the budget have failed. Opt-in, one shot per silence episode,
+ * and it never decides for itself that it recovered anything: the caller still
+ * has to see a delivered frame. */
+static gboolean gst_libuvc_h264_src_deep_recovery(GstLibuvcH264Src *self) {
+  gboolean enabled;
+  GST_OBJECT_LOCK(self);
+  enabled = self->deep_port_recovery;
+  GST_OBJECT_UNLOCK(self);
+
+  if (!enabled || self->deep_recovery_used) {
+    return FALSE;
+  }
+  self->deep_recovery_used = TRUE;
+
+  UsbDeepRecoveryOutcome outcome;
+  if (gst_libuvc_deep_recovery_hook != NULL) {
+    outcome = gst_libuvc_deep_recovery_hook(self);
+  } else {
+    outcome = usb_deep_recovery_run(&self->recovery_target,
+                                   DEEP_RECOVERY_PORT_HOLD_MS);
+  }
+
+  gboolean acted = outcome == USB_DEEP_RECOVERY_DEVICE_REPROBED
+      || outcome == USB_DEEP_RECOVERY_PORT_CYCLED;
+  if (acted) {
+    GST_WARNING_OBJECT(self,
+        "Deep recovery: %s. This is a LOGICAL re-probe of the USB port state, "
+        "not a proven VBUS power removal",
+        usb_deep_recovery_outcome_name(outcome));
+  } else {
+    GST_WARNING_OBJECT(self, "Deep recovery did not run: %s",
+                       usb_deep_recovery_outcome_name(outcome));
+  }
+  return acted;
+}
+
 /* Recover a WEDGED device: still enumerated, still answering every control
  * transfer, delivering nothing. ONE USB port reset per silence episode (the
  * one-shot the caller arms), then a READINESS-DRIVEN return to streaming.
@@ -1817,6 +1929,8 @@ static gboolean gst_libuvc_h264_src_recover_wedged_device(
     return FALSE;
   }
 
+  gst_libuvc_h264_src_capture_recovery_target(self);
+
   if (!gst_libuvc_h264_src_reset_silent_device(self)) {
     return FALSE;
   }
@@ -1849,10 +1963,61 @@ static gboolean gst_libuvc_h264_src_recover_wedged_device(
   }
 
   gint attempt = 0;
+  if (gst_libuvc_h264_src_settle_until_frame(self, &selector, deadline, started,
+                                             &attempt)) {
+    return TRUE;
+  }
+
+  // Everything above - one port reset, then every reopen the budget allowed -
+  // has failed. `deep-port-recovery` opts into ONE further escalation from
+  // here, and only from here: it is the rung below a reset that did not take,
+  // never a substitute for one. A flush outranks it, and so does the one-shot.
+  if (!g_atomic_int_get(&self->flushing)
+      && gst_libuvc_h264_src_deep_recovery(self)) {
+    // Same reasoning as the post-reset re-init above: the escalation puts the
+    // device through another re-enumeration, so the context must not straddle
+    // it either.
+    uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
+    if (uvc_init(&self->uvc_ctx, NULL) < 0) {
+      self->uvc_ctx = NULL;
+      GST_WARNING_OBJECT(self,
+          "Deep recovery: could not re-init libuvc afterwards");
+      return FALSE;
+    }
+
+    // A second budget, deliberately: the first one is already spent, and an
+    // escalation with no time to prove itself would be theatre. It doubles the
+    // worst case, which is why the whole rung is opt-in.
+    gint64 second_deadline = g_get_monotonic_time()
+        + (gint64) budget_ms * G_TIME_SPAN_MILLISECOND;
+    if (gst_libuvc_h264_src_settle_until_frame(self, &selector, second_deadline,
+                                               started, &attempt)) {
+      return TRUE;
+    }
+  }
+
+  GST_WARNING_OBJECT(self,
+      "Wedge recovery gave up after %" G_GINT64_FORMAT " ms (budget %u ms, "
+      "%d reopen attempt(s)); the device never delivered a frame. An overrun "
+      "past the budget is one synchronous libuvc call that was already in "
+      "flight when the budget expired",
+      (g_get_monotonic_time() - started) / G_TIME_SPAN_MILLISECOND, budget_ms,
+      attempt);
+  return FALSE;
+}
+
+/* Poll re-enumeration, reopen, and require a DELIVERED frame, until `deadline`.
+ * Split out of the recovery so the post-escalation retry proves recovery by
+ * exactly the same standard as the first pass - a successful
+ * uvc_start_streaming() is not evidence, only a frame is. */
+static gboolean gst_libuvc_h264_src_settle_until_frame(
+    GstLibuvcH264Src *self, const GstLibuvcDeviceSelector *selector,
+    gint64 deadline, gint64 started, gint *attempt) {
   guint retry_ms = RESET_POLL_INITIAL_MS;
   while (!g_atomic_int_get(&self->flushing)
          && g_get_monotonic_time() < deadline) {
-    if (!gst_libuvc_h264_src_reopen_once(self, &selector, deadline)) {
+    if (!gst_libuvc_h264_src_reopen_once(self, selector, deadline)) {
       // MEASURED on hardware: the first reopen after a real port reset routinely
       // fails - the device is listed again but still refuses uvc_open() or the
       // format negotiation while it finishes coming back. Inside the budget that
@@ -1869,7 +2034,7 @@ static gboolean gst_libuvc_h264_src_recover_wedged_device(
       retry_ms = MIN(retry_ms * 2, (guint) RESET_POLL_MAX_MS);
       continue;
     }
-    attempt++;
+    (*attempt)++;
 
     gint64 remaining = deadline - g_get_monotonic_time();
     gint64 proof_us = MIN(remaining, (gint64) TIMEOUT_DURATION);
@@ -1879,7 +2044,7 @@ static gboolean gst_libuvc_h264_src_recover_wedged_device(
           "Wedge recovery: frames advancing again %" G_GINT64_FORMAT
           " ms after the port reset (reopen attempt %d)",
           (g_get_monotonic_time() - started) / G_TIME_SPAN_MILLISECOND,
-          attempt);
+          *attempt);
       return TRUE;
     }
 
@@ -1887,18 +2052,11 @@ static gboolean gst_libuvc_h264_src_recover_wedged_device(
     // the handle down and try again rather than trusting the successful start.
     GST_DEBUG_OBJECT(self,
         "Wedge recovery: reopen attempt %d started but delivered no frame",
-        attempt);
+        *attempt);
     gst_libuvc_h264_src_teardown_handle(self);
     gst_libuvc_h264_src_drain_queue(self);
   }
 
-  GST_WARNING_OBJECT(self,
-      "Wedge recovery gave up after %" G_GINT64_FORMAT " ms (budget %u ms, "
-      "%d reopen attempt(s)); the device never delivered a frame. An overrun "
-      "past the budget is one synchronous libuvc call that was already in "
-      "flight when the budget expired",
-      (g_get_monotonic_time() - started) / G_TIME_SPAN_MILLISECOND, budget_ms,
-      attempt);
   return FALSE;
 }
 

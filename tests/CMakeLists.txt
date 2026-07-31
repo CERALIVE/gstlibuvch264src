@@ -1023,6 +1023,45 @@ set_tests_properties(v4l2_probe_nonfatal PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
+# Deep USB recovery helper tests (Task 11).
+#
+# Compiles usb_port_recovery.c directly (no element TUs, no libuvc mock): the
+# helper is deliberately dependency-free so the rung can be reused from outside
+# this element, and its whole contract is expressible against a synthetic sysfs
+# tree. Every case builds that tree in a temp dir and drives the REAL writes, so
+# the device-vs-port attribute split and the leaf-target vetoes are asserted
+# rather than assumed. No RESOURCE_LOCK: nothing here binds the control socket.
+# -----------------------------------------------------------------------------
+add_executable(test_usb_port_recovery
+  test_usb_port_recovery.c
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src/usb_port_recovery.c
+)
+target_include_directories(test_usb_port_recovery PRIVATE
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(test_usb_port_recovery PRIVATE
+  PkgConfig::GST
+  PkgConfig::GST_BASE
+  PkgConfig::GST_CHECK
+)
+apply_sanitizer_flags(test_usb_port_recovery "${STATIC_SUITE_SANITIZER}")
+
+set(_usb_port_recovery_cases
+  "usb_recovery_capture:test_capture_resolves_device_and_port"
+  "usb_recovery_capture_foreign_address:test_capture_rejects_a_foreign_address"
+  "usb_recovery_capture_needs_port_link:test_capture_requires_the_port_link"
+  "usb_recovery_device_rung:test_surviving_device_takes_the_device_rung"
+  "usb_recovery_port_rung:test_vanished_device_takes_the_port_rung"
+  "usb_recovery_refuses_shared_hub:test_hub_with_another_device_is_refused"
+  "usb_recovery_refuses_foreign_device:test_foreign_device_on_the_port_is_refused"
+  "usb_recovery_no_target:test_missing_target_is_reported_not_guessed"
+  "usb_recovery_denied:test_unwritable_attribute_reports_denied"
+)
+add_gstcheck_multicase_test(test_usb_port_recovery "usb-port-recovery"
+  "${STATIC_SUITE_SANITIZER}" "${_usb_port_recovery_cases}" NO_RESOURCE_LOCK)
+
+# -----------------------------------------------------------------------------
 # Live-source polish tests (Task 19).
 #
 # Same single-executable, statically-registered shape as test_pts_monotonic so
@@ -1291,6 +1330,12 @@ set(_reconnect_cases
   "reset_survives_transient_reopen_failure:test_reset_survives_transient_reopen_failure"
   "reset_refreshes_libuvc_context:test_reset_refreshes_libuvc_context"
   "reset_rearm_frames_property:test_reset_rearm_frames_property"
+  "deep_recovery_defaults_off:test_deep_recovery_defaults_off"
+  "deep_recovery_disabled:test_deep_recovery_not_run_when_disabled"
+  "deep_recovery_order:test_deep_recovery_runs_after_the_reset_not_before"
+  "deep_recovery_skipped_on_reset_recovery:test_deep_recovery_skipped_when_the_reset_recovers"
+  "deep_recovery_retry_pass:test_deep_recovery_retries_once_and_can_recover"
+  "deep_recovery_refusal:test_deep_recovery_refusal_falls_through_honestly"
 )
 # start() may spawn the control thread, so keep these off the shared socket
 # resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
@@ -1745,6 +1790,7 @@ set(_compat_cases
   "compat_caps_contract:test_compat_caps_contract"
   "compat_transfer_buffers_property:test_compat_transfer_buffers_property"
   "compat_auto_port_reset_property:test_compat_auto_port_reset_property"
+  "compat_deep_port_recovery_property:test_compat_deep_port_recovery_property"
   "compat_deliverable_caps_api:test_compat_deliverable_caps_api"
   "compat_pipeline_parse_h264:test_compat_pipeline_parse_h264"
   "compat_pipeline_parse_h265:test_compat_pipeline_parse_h265"

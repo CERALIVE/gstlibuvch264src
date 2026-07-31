@@ -431,6 +431,268 @@ GST_START_TEST (test_wedged_device_auto_port_reset_disabled)
 GST_END_TEST;
 
 /* ------------------------------------------------------------------------- */
+/* Deep-recovery ladder ordering (Task 11)                                    */
+/*                                                                            */
+/* A port reset can leave a device that never re-enumerates. The rung below it */
+/* is opt-in, one-shot, and reachable ONLY once the reset AND every reopen in  */
+/* the budget have failed — these cases pin that position in the ladder, not   */
+/* the sysfs writes themselves (those are proven against a synthetic tree in   */
+/* test_usb_port_recovery.c, and against hardware in task-11-board-proof.md).  */
+/* ------------------------------------------------------------------------- */
+
+static gint ladder_seq;         /* atomic: hands out monotonic step numbers */
+static gint ladder_reset_step;  /* step at which the port reset fired, 0 = never */
+static gint ladder_deep_step;   /* step at which the deep rung fired, 0 = never */
+static gint ladder_reset_calls;
+static gint ladder_deep_calls;
+static gint ladder_deep_outcome;
+static gint ladder_heal_after_deep;
+static gint ladder_heal_after_reset;
+
+/* The reset lands and the device DOES come back on the bus — it just delivers
+ * nothing, which is the only shape in which the settle pass can genuinely
+ * exhaust and hand over to the escalation. `heal_after_reset` instead makes it
+ * stream, so the first pass succeeds and the escalation must stay unreached. */
+static gint
+ladder_reset_hook (GstLibuvcH264Src * self)
+{
+  (void) self;
+  if (g_atomic_int_add (&ladder_reset_calls, 1) == 0) {
+    if (g_atomic_int_get (&ladder_heal_after_reset)) {
+      mock_uvc_set_frame_mode (MOCK_UVC_FRAME_VALID);
+    } else {
+      mock_uvc_set_frame_mode (MOCK_UVC_FRAME_SILENT);
+    }
+    mock_uvc_set_max_frames (0);
+  }
+  g_atomic_int_set (&ladder_reset_step, g_atomic_int_add (&ladder_seq, 1) + 1);
+  return 0;                     /* LIBUSB_SUCCESS */
+}
+
+/* Collapse the re-enumeration micro-backoff so a case costs its budget, not its
+ * poll schedule. */
+static gint64
+ladder_poll_hook (GstLibuvcH264Src * self, gint attempt, guint interval_ms)
+{
+  (void) self;
+  (void) attempt;
+  (void) interval_ms;
+  return 0;
+}
+
+static UsbDeepRecoveryOutcome
+ladder_deep_hook (GstLibuvcH264Src * self)
+{
+  (void) self;
+  g_atomic_int_inc (&ladder_deep_calls);
+  g_atomic_int_set (&ladder_deep_step, g_atomic_int_add (&ladder_seq, 1) + 1);
+  if (g_atomic_int_get (&ladder_heal_after_deep)) {
+    mock_uvc_set_frame_mode (MOCK_UVC_FRAME_VALID);
+    mock_uvc_set_max_frames (0);
+  }
+  return (UsbDeepRecoveryOutcome) g_atomic_int_get (&ladder_deep_outcome);
+}
+
+typedef struct
+{
+  gint reset_calls;
+  gint deep_calls;
+  gint reset_step;
+  gint deep_step;
+  gint buffers_after;
+  gboolean errored;
+} LadderResult;
+
+/* Drive one silence episode with reconnect off. `heal_after_reset` makes the
+ * device stream again the moment the reset lands (so the first settle pass
+ * succeeds and the deep rung must never be reached); `heal_after_deep` does the
+ * same from inside the deep hook (so only the SECOND pass can succeed). */
+static void
+run_ladder_scenario (gboolean enable_deep, UsbDeepRecoveryOutcome outcome,
+    gboolean heal_after_reset, gboolean heal_after_deep, LadderResult * out)
+{
+  load_core_elements ();
+  register_element ();
+  mock_uvc_reset ();
+  mock_uvc_set_frame_mode (MOCK_UVC_FRAME_DISCONNECT);
+  mock_uvc_set_max_frames (1);
+
+  g_atomic_int_set (&buffers_seen, 0);
+  g_atomic_int_set (&ladder_seq, 0);
+  g_atomic_int_set (&ladder_reset_step, 0);
+  g_atomic_int_set (&ladder_deep_step, 0);
+  g_atomic_int_set (&ladder_reset_calls, 0);
+  g_atomic_int_set (&ladder_deep_calls, 0);
+  g_atomic_int_set (&ladder_deep_outcome, (gint) outcome);
+  g_atomic_int_set (&ladder_heal_after_deep, heal_after_deep);
+  g_atomic_int_set (&ladder_heal_after_reset, heal_after_reset);
+  gst_libuvc_h264_src_set_reset_device_hook (ladder_reset_hook);
+  gst_libuvc_h264_src_set_reset_poll_hook (ladder_poll_hook);
+  gst_libuvc_h264_src_set_deep_recovery_hook (ladder_deep_hook);
+
+  GstElement *src = NULL;
+  GstElement *pipeline = build_pipeline (&src);
+  /* A short budget so each settle pass exhausts quickly; the ordering under
+   * test is independent of how long either pass is given. */
+  g_object_set (src, "reset-settle-max-ms", 400, NULL);
+  if (enable_deep)
+    g_object_set (src, "deep-port-recovery", TRUE, NULL);
+
+  fail_unless (gst_element_set_state (pipeline, GST_STATE_PLAYING)
+      != GST_STATE_CHANGE_FAILURE, "could not set pipeline to PLAYING");
+
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (g_atomic_int_get (&buffers_seen) < 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (2 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  gint baseline = g_atomic_int_get (&buffers_seen);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gboolean errored = FALSE;
+  deadline = g_get_monotonic_time () + 40 * G_TIME_SPAN_SECOND;
+  while (g_get_monotonic_time () < deadline) {
+    GstMessage *msg =
+        gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg != NULL) {
+      errored = (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR);
+      gst_message_unref (msg);
+      break;
+    }
+    if ((heal_after_reset || heal_after_deep)
+        && g_atomic_int_get (&buffers_seen) >= baseline + 5) {
+      break;
+    }
+    g_usleep (20 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  out->reset_calls = g_atomic_int_get (&ladder_reset_calls);
+  out->deep_calls = g_atomic_int_get (&ladder_deep_calls);
+  out->reset_step = g_atomic_int_get (&ladder_reset_step);
+  out->deep_step = g_atomic_int_get (&ladder_deep_step);
+  out->buffers_after = g_atomic_int_get (&buffers_seen) - baseline;
+  out->errored = errored;
+  gst_object_unref (bus);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  gst_libuvc_h264_src_set_reset_device_hook (NULL);
+  gst_libuvc_h264_src_set_reset_poll_hook (NULL);
+  gst_libuvc_h264_src_set_deep_recovery_hook (NULL);
+}
+
+GST_START_TEST (test_deep_recovery_defaults_off)
+{
+  register_element ();
+  GstElement *src = gst_element_factory_make ("libuvch264src", NULL);
+  fail_unless (src != NULL, "could not create the element");
+
+  gboolean enabled = TRUE;
+  g_object_get (src, "deep-port-recovery", &enabled, NULL);
+  fail_if (enabled,
+      "deep-port-recovery must default to FALSE: the escalation is proven to "
+      "fire on hardware but NOT proven to recover a device stuck at -71");
+
+  gst_object_unref (src);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_deep_recovery_not_run_when_disabled)
+{
+  LadderResult res;
+  run_ladder_scenario (FALSE, USB_DEEP_RECOVERY_PORT_CYCLED, FALSE, FALSE,
+      &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the port reset must still fire exactly once, got %d", res.reset_calls);
+  fail_unless (res.deep_calls == 0,
+      "the default-off rung must never write USB sysfs, got %d calls",
+      res.deep_calls);
+  fail_unless (res.errored,
+      "an unrecovered wedge must still surface the disconnect error");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_deep_recovery_runs_after_the_reset_not_before)
+{
+  LadderResult res;
+  run_ladder_scenario (TRUE, USB_DEEP_RECOVERY_PORT_CYCLED, FALSE, FALSE, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "the reset rung must still fire exactly once, got %d", res.reset_calls);
+  fail_unless (res.deep_calls == 1,
+      "the deep rung must fire once when the reset and its reopens both fail, "
+      "got %d", res.deep_calls);
+  fail_unless (res.reset_step > 0 && res.deep_step > res.reset_step,
+      "the deep rung is an ESCALATION: it must run strictly after the port "
+      "reset (reset at step %d, deep at step %d)", res.reset_step,
+      res.deep_step);
+  fail_unless (res.errored,
+      "a device that stays silent through both rungs must still surface the "
+      "disconnect error");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_deep_recovery_skipped_when_the_reset_recovers)
+{
+  LadderResult res;
+  run_ladder_scenario (TRUE, USB_DEEP_RECOVERY_PORT_CYCLED, TRUE, FALSE, &res);
+
+  fail_unless (res.reset_calls == 1,
+      "expected exactly one port reset, got %d", res.reset_calls);
+  fail_unless (res.deep_calls == 0,
+      "a wedge the reset already cleared must never escalate, got %d calls",
+      res.deep_calls);
+  fail_if (res.errored,
+      "a recovered wedge must not surface as a disconnect error");
+  fail_unless (res.buffers_after >= 5,
+      "frames must resume after the reset, got %d new buffers",
+      res.buffers_after);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_deep_recovery_retries_once_and_can_recover)
+{
+  LadderResult res;
+  /* The device comes back only once the escalation has run, so a frame after
+   * this point can have arrived through nothing but the post-escalation pass. */
+  run_ladder_scenario (TRUE, USB_DEEP_RECOVERY_PORT_CYCLED, FALSE, TRUE, &res);
+
+  fail_unless (res.deep_calls == 1,
+      "the deep rung is a ONE-SHOT per silence episode, got %d calls",
+      res.deep_calls);
+  fail_if (res.errored,
+      "a device that returns after the escalation must not surface a "
+      "disconnect error");
+  fail_unless (res.buffers_after >= 5,
+      "the escalation must be followed by a real settle pass that proves "
+      "recovery with delivered frames, got %d new buffers", res.buffers_after);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_deep_recovery_refusal_falls_through_honestly)
+{
+  LadderResult res;
+  /* The rung declined to act (a hub carrying another device). The element must
+   * report the disconnect rather than spend a second budget on nothing. */
+  run_ladder_scenario (TRUE, USB_DEEP_RECOVERY_REFUSED_SHARED_HUB, FALSE, TRUE,
+      &res);
+
+  fail_unless (res.deep_calls == 1,
+      "the rung must be consulted exactly once, got %d", res.deep_calls);
+  fail_unless (res.errored,
+      "a refused escalation must fall through to the disconnect error, not "
+      "silently retry as though it had acted");
+}
+
+GST_END_TEST;
+
+/* ------------------------------------------------------------------------- */
 /* Readiness-based reset policy (Task 14)                                     */
 /*                                                                            */
 /* The recovery no longer waits a fixed, device-measured settle before its one */
@@ -1377,6 +1639,36 @@ reconnect_suite (void)
   tcase_set_timeout (tc_opt_out, 30);
   tcase_add_test (tc_opt_out, test_wedged_device_auto_port_reset_disabled);
   suite_add_tcase (s, tc_opt_out);
+
+  TCase *tc_deep_default = tcase_create ("deep_recovery_defaults_off");
+  tcase_set_timeout (tc_deep_default, 30);
+  tcase_add_test (tc_deep_default, test_deep_recovery_defaults_off);
+  suite_add_tcase (s, tc_deep_default);
+
+  TCase *tc_deep_off = tcase_create ("deep_recovery_not_run_when_disabled");
+  tcase_set_timeout (tc_deep_off, 90);
+  tcase_add_test (tc_deep_off, test_deep_recovery_not_run_when_disabled);
+  suite_add_tcase (s, tc_deep_off);
+
+  TCase *tc_deep_order = tcase_create ("deep_recovery_order");
+  tcase_set_timeout (tc_deep_order, 90);
+  tcase_add_test (tc_deep_order, test_deep_recovery_runs_after_the_reset_not_before);
+  suite_add_tcase (s, tc_deep_order);
+
+  TCase *tc_deep_skip = tcase_create ("deep_recovery_skipped_on_reset_recovery");
+  tcase_set_timeout (tc_deep_skip, 90);
+  tcase_add_test (tc_deep_skip, test_deep_recovery_skipped_when_the_reset_recovers);
+  suite_add_tcase (s, tc_deep_skip);
+
+  TCase *tc_deep_retry = tcase_create ("deep_recovery_retry_pass");
+  tcase_set_timeout (tc_deep_retry, 90);
+  tcase_add_test (tc_deep_retry, test_deep_recovery_retries_once_and_can_recover);
+  suite_add_tcase (s, tc_deep_retry);
+
+  TCase *tc_deep_refuse = tcase_create ("deep_recovery_refusal");
+  tcase_set_timeout (tc_deep_refuse, 90);
+  tcase_add_test (tc_deep_refuse, test_deep_recovery_refusal_falls_through_honestly);
+  suite_add_tcase (s, tc_deep_refuse);
 
   TCase *tc_props = tcase_create ("reset_policy_property_defaults");
   tcase_set_timeout (tc_props, 30);
