@@ -186,6 +186,20 @@ Frames the device must deliver after a recovery before the one-shot port reset r
 
 Controls the silence-triggered wedge-recovery port reset. The default remains `true` and preserves the always-on recovery behavior. Set it to `false` for a device or scenario where issuing `USBDEVFS_RESET` risks stranding the camera; sustained silence then skips the reset and falls through to the normal `RESOURCE/READ` disconnect error path.
 
+### `deliverable-caps` (GstCaps, read-only)
+
+The post-quirk mode ladder `negotiate()` actually selects from — what this element will **accept**, not what the device **advertises**. `NULL` until a device has been negotiated; a consumer must read `NULL` as *unknown*, never as *no modes*.
+
+For a camera with a `QUIRK_MAX_PIXEL_RATE` row these differ: the DJI Osmo Pocket 3 advertises `3840x2160@60/50/48` and this property omits all three, because negotiation refuses them.
+
+### Action signal: `filter-deliverable-caps(advertised, vendor-id, product-id)` → GstCaps
+
+The same exclusion applied to a **caller-supplied** ladder, with no device involved. Pure caps arithmetic — it does not open, probe, or touch any camera.
+
+This exists for consumers that enumerate devices. cerastream already holds the advertised ladder (from `GstDevice::caps()`, a v4l2 enumeration) and the USB ids, and must not open the camera to learn which modes are real — opening one through libuvc detaches `uvcvideo` and destroys `/dev/videoN` for seconds. It emits this on a throwaway element instance instead.
+
+Both surfaces and `negotiate()` route through the single `uvc_quirks_filter_caps()` in `quirks.c`, so the modes an operator is **offered** are by construction the modes negotiation will **accept**.
+
 ### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
 
 Drives all three PTZ axes in one emission. Each axis is applied only when the device reports it. Returns `TRUE` if at least one supported axis was driven and every attempted set succeeded.
@@ -404,4 +418,6 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT read an `Unable to get stream control: Invalid mode` failure as a caps-logic or descriptor problem before checking what mode the device last committed. libuvc rejects the mode when the device's SET_CUR/GET_CUR readback disagrees, and a camera that answers the first probe from its previously committed mode fails EVERY negotiation that asks for a larger mode — deterministically, though it looks intermittent in the field. That is what `QUIRK_DOUBLE_PROBE` is for; the Osmo Pocket 3 row sets it.
 - Do NOT "fix" the `quirks_ladder_no_quirk_picks_4k60` test because it asserts the buggy 3840x2160@60 outcome. That is deliberate: it pins the untouched max-area-then-max-fps behavior that every camera WITHOUT a quirk row still gets, and it is the control half of the pair whose other half proves the Osmo cap works.
 - Do NOT special-case a device inside `gst_libuvc_h264_negotiate()` (`if (vid == ... && w == 3840 ...)`). The quirk table exists so device knowledge stays data-driven — one row, no branching in the selection loop.
+- Do NOT re-derive the quirk exclusion outside `uvc_quirks_filter_caps()` — not in the engine, not in the UI, not in a second helper here. That split is precisely the shipped defect this function was added to close: the filtered ladder lived only inside `negotiate()`, so cerastream and CeraUI advertised `3840x2160@50` for a camera the element was guaranteed to refuse, and an operator picked it and lost a stream (board `192.168.78.131`, 2026-07-30 — twelve requests, twelve `Unable to negotiate common caps`). `negotiate()`, `deliverable-caps` and `filter-deliverable-caps` must all keep calling the one function.
+- Do NOT make `deliverable-caps` return an EMPTY caps when nothing is known. Empty means "this camera has no modes"; a consumer that trusts it will hide every option and strand the operator. `NULL` is the unknown answer, and `filter-deliverable-caps` on an unquirked vid:pid returns its input unchanged for the same reason — the filter may only ever REMOVE modes it has a positive verdict for.
 - This plugin is **not** in the device image REPOS list by default — don't assume it's always present on device.

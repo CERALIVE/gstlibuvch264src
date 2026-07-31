@@ -34,6 +34,7 @@ enum {
   PROP_RESET_SETTLE_MAX_MS,
   PROP_RESET_REARM_FRAMES,
   PROP_AUTO_PORT_RESET,
+  PROP_DELIVERABLE_CAPS,
   PROP_LAST
 };
 
@@ -136,6 +137,9 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 static void gst_libuvc_h264_src_finalize(GObject *object);
 static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
                                             gint pan, gint tilt, gint zoom);
+static GstCaps *gst_libuvc_h264_src_filter_deliverable_caps(GstLibuvcH264Src *self,
+                                            GstCaps *advertised,
+                                            guint vendor_id, guint product_id);
 static gboolean gst_libuvc_h264_src_negotiate_clean_payload(GstLibuvcH264Src *self,
                                             gint width, gint height, gint fps);
 static void gst_libuvc_h264_src_apply_max_payload(GstLibuvcH264Src *self,
@@ -302,6 +306,31 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                          "silent; disable to use normal disconnect handling",
                          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* The mode ladder negotiate() actually selects from, i.e. what this element
+   * will ACCEPT - not what the device advertises. NULL until a device has been
+   * negotiated. Read it to publish honest options to an operator instead of the
+   * raw descriptor ladder, which for a quirked camera contains modes
+   * negotiation is guaranteed to refuse. */
+  g_object_class_install_property(gobject_class, PROP_DELIVERABLE_CAPS,
+    g_param_spec_boxed("deliverable-caps", "Deliverable caps",
+                       "Post-quirk mode ladder negotiation selects from; "
+                       "NULL before a device is negotiated",
+                       GST_TYPE_CAPS,
+                       G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  /* The same filter, without a device.
+   *
+   * A consumer enumerating cameras already holds the advertised ladder (from
+   * v4l2) and the vid:pid, and must NOT open the camera to learn which of those
+   * modes are real - opening one through libuvc detaches uvcvideo and destroys
+   * /dev/videoN. This applies uvc_quirks_filter_caps() to a caller-supplied
+   * ladder, so the enumeration answer and the negotiation answer come from one
+   * implementation. Pure caps arithmetic: no device I/O. */
+  g_signal_new_class_handler("filter-deliverable-caps", G_TYPE_FROM_CLASS(klass),
+    G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+    G_CALLBACK(gst_libuvc_h264_src_filter_deliverable_caps), NULL, NULL, NULL,
+    GST_TYPE_CAPS, 3, GST_TYPE_CAPS, G_TYPE_UINT, G_TYPE_UINT);
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -331,6 +360,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->uvc_ctx = NULL;
   self->uvc_dev = NULL;
   self->uvc_devh = NULL;
+  self->deliverable_caps = NULL;
   self->clock = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
@@ -528,6 +558,37 @@ static void gst_libuvc_h264_src_log_format_inventory(GstLibuvcH264Src *self) {
     }
 }
 
+/* The highest discrete rate a mode offers, or -1 when it carries a continuous
+ * RANGE. The -1 is deliberate and load-bearing: the preference below compares it,
+ * and fixating "nearest" to -1/1 snaps a range to its LOWEST rate - the behavior
+ * continuous-frame-interval devices have always had here. */
+static gint gst_libuvc_h264_src_top_rate(const GstStructure *structure) {
+    const GValue *rates = gst_structure_get_value(structure, "framerate");
+    if (rates == NULL || !GST_VALUE_HOLDS_LIST(rates)) {
+        return -1;
+    }
+
+    gint top = -1;
+    for (guint i = 0; i < gst_value_list_get_size(rates); i++) {
+        const GValue *rate = gst_value_list_get_value(rates, i);
+        gint num = gst_value_get_fraction_numerator(rate);
+        gint den = gst_value_get_fraction_denominator(rate);
+
+        if (den > 0 && num / den > top) {
+            top = num / den;
+        }
+    }
+    return top;
+}
+
+static void gst_libuvc_h264_src_publish_ladder(GstLibuvcH264Src *self,
+                                               GstCaps *ladder) {
+    GST_OBJECT_LOCK(self);
+    gst_caps_replace(&self->deliverable_caps, ladder);
+    GST_OBJECT_UNLOCK(self);
+    gst_caps_unref(ladder);
+}
+
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
 
@@ -552,6 +613,11 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstCaps *best_caps = NULL;
     gboolean result = FALSE;
     gboolean found_codec_format = FALSE;
+
+    /* Every mode that survives the quirk filter, accumulated as it is selected
+     * from and published on "deliverable-caps". This is the list an enumerating
+     * consumer needs and could not see before. */
+    GstCaps *ladder = gst_caps_new_empty();
 
     // vid:pid quirk seam (A14), resolved BEFORE the selection loop because a quirk
     // can rule advertised-but-undeliverable modes OUT of the selection, not just
@@ -589,47 +655,16 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                               "height", G_TYPE_INT, frame_desc->wHeight,
                               NULL);
 
-            gint fps = -1;
             if (frame_desc->intervals) {
                 GValue framerates = G_VALUE_INIT;
                 g_value_init(&framerates, GST_TYPE_LIST);
 
-                guint excluded = 0;
                 for (const uint32_t *interval = frame_desc->intervals; *interval; interval++) {
-                    gint _fps = 1e7 / *interval;
-
-                    // A quirked device advertises rates it cannot deliver. Drop
-                    // them here, before they can win the preference below OR reach
-                    // the caps we publish downstream.
-                    if (!uvc_quirk_mode_selectable(&quirk_limits, frame_desc->wWidth,
-                                                   frame_desc->wHeight, (guint)_fps)) {
-                        excluded++;
-                        continue;
-                    }
-
-                    if (_fps > fps) {
-                        fps = _fps;
-                    }
-
                     GValue fps = G_VALUE_INIT;
                     g_value_init(&fps, GST_TYPE_FRACTION);
-                    gst_value_set_fraction(&fps, (gint)_fps, 1);
+                    gst_value_set_fraction(&fps, (gint)(1e7 / *interval), 1);
                     gst_value_list_append_value(&framerates, &fps);
                     g_value_unset(&fps);
-                }
-
-                if (excluded > 0) {
-                    GST_INFO_OBJECT(self,
-                        "quirk: dropped %u non-deliverable rate(s) at %ux%u",
-                        excluded, frame_desc->wWidth, frame_desc->wHeight);
-                }
-
-                if (fps < 0) {
-                    // Every rate this descriptor advertises is above the cap, so
-                    // the whole mode is unusable; an empty framerate list would
-                    // otherwise fixate to nothing.
-                    g_value_unset(&framerates);
-                    continue;
                 }
 
                 // gst_structure_set_value() copies the list, so the local GValue
@@ -649,25 +684,24 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                 gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
                 gint fps_max = 1e7 / frame_desc->dwMinFrameInterval;
 
-                // Same quirk cap as the discrete branch, applied to the top of the
-                // range instead of to a list. If even the slowest rate is over the
-                // cap the whole descriptor goes.
-                guint fps_cap = uvc_quirk_max_fps(&quirk_limits, frame_desc->wWidth,
-                                                  frame_desc->wHeight);
-                if ((guint)fps_max > fps_cap) {
-                    fps_max = (gint)fps_cap;
-                }
-                if (fps_max < fps_min) {
-                    GST_INFO_OBJECT(self,
-                        "quirk: %ux%u dropped, its whole interval range exceeds the cap",
-                        frame_desc->wWidth, frame_desc->wHeight);
-                    continue;
-                }
-
                 gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps_max, 1, NULL);
             }
 
-            if (gst_caps_can_intersect(caps, tmp_caps)) {
+            // A quirked device advertises rates it cannot deliver. The exclusion
+            // lives in ONE function, which the "deliverable-caps" property and the
+            // "filter-deliverable-caps" signal publish too, so the modes offered to
+            // an operator are by construction the modes this loop can accept.
+            GstCaps *deliverable = uvc_quirks_filter_caps(&quirk_limits, tmp_caps);
+            if (gst_caps_is_empty(deliverable)) {
+                gst_caps_unref(deliverable);
+                continue;
+            }
+            gst_caps_append(ladder, gst_caps_copy(deliverable));
+
+            gint fps = gst_libuvc_h264_src_top_rate(
+                gst_caps_get_structure(deliverable, 0));
+
+            if (gst_caps_can_intersect(caps, deliverable)) {
                 if (resolution > (width * height)
                     || (resolution == (width * height) && fps > framerate)) {
                     width = frame_desc->wWidth;
@@ -677,7 +711,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     if (best_caps) {
                         gst_caps_unref(best_caps);
                     }
-                    best_caps = gst_caps_intersect(caps, tmp_caps);
+                    best_caps = gst_caps_intersect(caps, deliverable);
                     GstStructure *s = gst_caps_get_structure(best_caps, 0);
                     gst_structure_fixate_field_nearest_fraction(s, "framerate", fps, 1);
 
@@ -686,6 +720,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     framerate = fr_num / fr_den;
                 }
             }
+            gst_caps_unref(deliverable);
 
         } // for frame_desc
 
@@ -760,6 +795,10 @@ out:
     // Single cleanup path: the working caps and the chosen caps are owned locals.
     // gst_base_src_set_caps() takes its own reference, so best_caps must be freed
     // here on success too, and both must be freed on every error path.
+    // The ladder is published on EVERY path, including the failures: a device
+    // that could not negotiate is exactly when a consumer needs to know which
+    // modes were on offer.
+    gst_libuvc_h264_src_publish_ladder(self, ladder);
     if (caps)
         gst_caps_unref(caps);
     if (best_caps)
@@ -925,10 +964,35 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       g_value_set_boolean(value, self->auto_port_reset);
       GST_OBJECT_UNLOCK(self);
       break;
+    case PROP_DELIVERABLE_CAPS:
+      GST_OBJECT_LOCK(self);
+      gst_value_set_caps(value, self->deliverable_caps);
+      GST_OBJECT_UNLOCK(self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
   }
+}
+
+/* "filter-deliverable-caps" action handler. Stateless: it reads the quirk table
+ * for the caller's vid:pid and runs the caller's ladder through the SAME filter
+ * negotiate() uses. `self` is only the emission target - no device is touched,
+ * so this is safe to call per enumeration on an element that was never started. */
+static GstCaps *gst_libuvc_h264_src_filter_deliverable_caps(GstLibuvcH264Src *self,
+                                                            GstCaps *advertised,
+                                                            guint vendor_id,
+                                                            guint product_id) {
+    g_return_val_if_fail(advertised != NULL, NULL);
+
+    uvc_quirk_limits_t limits = {0};
+    uvc_quirks_limits((guint16)vendor_id, (guint16)product_id, &limits);
+
+    GstCaps *deliverable = uvc_quirks_filter_caps(&limits, advertised);
+    GST_DEBUG_OBJECT(self,
+        "filter-deliverable-caps %04x:%04x: %" GST_PTR_FORMAT
+        " -> %" GST_PTR_FORMAT, vendor_id, product_id, advertised, deliverable);
+    return deliverable;
 }
 
 /* "set-ptz" action handler: apply pan, tilt and zoom in one call. Each axis is
@@ -1994,6 +2058,8 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
         g_free(self->index);
         self->index = NULL;
     }
+
+    gst_caps_replace(&self->deliverable_caps, NULL);
 
     // stop() above already unlinked the socket; free the owned path string.
     if (self->control_socket_path) {
