@@ -127,6 +127,20 @@ static int g_probe_call_count = 0;
 static int g_format_size_call_count = 0;
 static uint32_t g_last_started_payload = 0;
 
+/* Stale-readback probe model - PROVISIONAL, see mock_uvc_probe_mode_t in
+ * mock_libuvc.h for the measured evidence and why the asymmetry is reproduced
+ * directly instead of derived. g_committed_rate is the device's committed mode
+ * as a width x height x fps product; g_stale_pending_rate is the one mode whose
+ * first probe has already been rejected, so its immediate retry is let through.
+ * g_first_probe_error is a one-shot injection that fires ahead of the model, and
+ * g_last_format_size_result is pure observability. */
+static mock_uvc_probe_mode_t g_probe_mode = MOCK_UVC_PROBE_HEALTHY;
+static uint64_t g_committed_rate = 0;
+static uint64_t g_stale_pending_rate = 0;
+static bool g_stale_pending = false;
+static uvc_error_t g_first_probe_error = UVC_SUCCESS;
+static uvc_error_t g_last_format_size_result = UVC_SUCCESS;
+
 /* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). Records the
  * last count the element pushed, the number of setter calls, and the count
  * latched at uvc_start_streaming() (proving the element applied it before the
@@ -219,6 +233,12 @@ void mock_uvc_reset(void) {
   g_probe_call_count = 0;
   g_format_size_call_count = 0;
   g_last_started_payload = 0;
+  g_probe_mode = MOCK_UVC_PROBE_HEALTHY;
+  g_committed_rate = 0;
+  g_stale_pending_rate = 0;
+  g_stale_pending = false;
+  g_first_probe_error = UVC_SUCCESS;
+  g_last_format_size_result = UVC_SUCCESS;
   g_last_transfer_buffers = 0;
   g_transfer_buffers_call_count = 0;
   g_last_started_transfer_buffers = 0;
@@ -405,6 +425,40 @@ int mock_uvc_format_size_call_count(void) {
   int n = g_format_size_call_count;
   pthread_mutex_unlock(&g_lock);
   return n;
+}
+
+void mock_uvc_set_probe_mode(mock_uvc_probe_mode_t mode) {
+  pthread_mutex_lock(&g_lock);
+  g_probe_mode = mode;
+  /* Arming or disarming clears any half-finished probe pair, so a test never
+   * inherits a pending rejection from the mode it just left. */
+  g_stale_pending = false;
+  g_stale_pending_rate = 0;
+  pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_committed_mode(int width, int height, int fps) {
+  uint64_t rate = (width > 0 && height > 0 && fps > 0)
+                      ? (uint64_t)width * (uint64_t)height * (uint64_t)fps
+                      : 0;
+  pthread_mutex_lock(&g_lock);
+  g_committed_rate = rate;
+  g_stale_pending = false;
+  g_stale_pending_rate = 0;
+  pthread_mutex_unlock(&g_lock);
+}
+
+void mock_uvc_set_first_probe_error(uvc_error_t err) {
+  pthread_mutex_lock(&g_lock);
+  g_first_probe_error = err;
+  pthread_mutex_unlock(&g_lock);
+}
+
+uvc_error_t mock_uvc_last_format_size_result(void) {
+  pthread_mutex_lock(&g_lock);
+  uvc_error_t r = g_last_format_size_result;
+  pthread_mutex_unlock(&g_lock);
+  return r;
 }
 
 uint8_t mock_uvc_last_transfer_buffers(void) {
@@ -973,12 +1027,47 @@ uvc_error_t uvc_get_stream_ctrl_format_size(uvc_device_handle_t *devh,
                                             uvc_stream_ctrl_t *ctrl,
                                             enum uvc_frame_format format,
                                             int width, int height, int fps) {
-  (void)format; (void)width; (void)height; (void)fps;
+  (void)format;
   if (!devh || !ctrl)
     return UVC_ERROR_INVALID_PARAM;
+
+  uint64_t rate = (width > 0 && height > 0 && fps > 0)
+                      ? (uint64_t)width * (uint64_t)height * (uint64_t)fps
+                      : 0;
+
   pthread_mutex_lock(&g_lock);
   g_format_size_call_count++;
+
+  /* One-shot injection, ahead of the stale-readback model: these are the error
+   * codes a probe retry must propagate rather than absorb. */
+  if (g_first_probe_error != UVC_SUCCESS) {
+    uvc_error_t injected = g_first_probe_error;
+    g_first_probe_error = UVC_SUCCESS;
+    g_last_format_size_result = injected;
+    pthread_mutex_unlock(&g_lock);
+    return injected;
+  }
+
+  /* The measured asymmetry: only a mode LARGER than the committed one is
+   * rejected, and only on its FIRST probe. Same/smaller never is, which is why
+   * the comparison is one-sided rather than an equality against the previous
+   * mode. */
+  if (g_probe_mode == MOCK_UVC_PROBE_STALE_READBACK && rate > g_committed_rate
+      && !(g_stale_pending && g_stale_pending_rate == rate)) {
+    g_stale_pending = true;
+    g_stale_pending_rate = rate;
+    g_last_format_size_result = UVC_ERROR_INVALID_MODE;
+    pthread_mutex_unlock(&g_lock);
+    return UVC_ERROR_INVALID_MODE;
+  }
+
+  /* An accepted probe leaves the device committed to the mode it asked for. */
+  g_committed_rate = rate;
+  g_stale_pending = false;
+  g_stale_pending_rate = 0;
+  g_last_format_size_result = UVC_SUCCESS;
   pthread_mutex_unlock(&g_lock);
+
   memset(ctrl, 0, sizeof(*ctrl));
   ctrl->bFormatIndex = 1;
   ctrl->bFrameIndex = 1;

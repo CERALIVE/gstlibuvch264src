@@ -942,6 +942,10 @@ set(_quirks_cases
   "quirks_deliverable_caps_unquirked_intact:test_quirks_deliverable_caps_unquirked_keeps_every_rate"
   "quirks_filter_signal_agrees:test_quirks_filter_signal_agrees_with_the_open_device_ladder"
   "quirks_filter_signal_unquirked_noop:test_quirks_filter_signal_leaves_an_unquirked_device_untouched"
+  "quirks_stale_disarmed_osmo_probes_twice:test_quirks_stale_model_disarmed_osmo_row_probes_twice"
+  "quirks_stale_disarmed_unquirked_probes_once:test_quirks_stale_model_disarmed_unquirked_probes_once"
+  "quirks_stale_readback_double_probe_recovers:test_quirks_stale_readback_double_probe_row_recovers"
+  "quirks_stale_readback_single_probe_invalid_mode:test_quirks_stale_readback_single_probe_row_fails_invalid_mode"
 )
 # The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
 # which may spawn the control thread, so keep them off the shared control-socket

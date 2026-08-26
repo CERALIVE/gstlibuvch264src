@@ -28,6 +28,15 @@
  *   quirks_ladder_without_quirk_*    red/green pair over the Osmo's REAL H.264
  *   quirks_ladder_with_osmo_quirk_*  ladder: unquirked still picks 3840x2160@60,
  *                                    the quirked Osmo lands on 3840x2160@30.
+ *   quirks_stale_model_disarmed_*    the probe counts (2 for the Osmo row, 1 for
+ *                                    an unquirked device) with the mock's
+ *                                    stale-readback model OFF, which is the
+ *                                    default every other target runs under.
+ *   quirks_stale_readback_*          the same counts with it ARMED: the
+ *                                    QUIRK_DOUBLE_PROBE row recovers on its
+ *                                    second probe, a row without the flag dies
+ *                                    on UVC_ERROR_INVALID_MODE, and a request at
+ *                                    the committed mode passes first try.
  */
 
 #include <gst/check/gstcheck.h>
@@ -775,6 +784,195 @@ GST_START_TEST (test_quirks_filter_signal_leaves_an_unquirked_device_untouched)
 
 GST_END_TEST;
 
+/* ------------------------------------------------------------------------- *
+ * Characterization of the CURRENT quirk behavior against the mock's
+ * stale-readback probe model (MOCK_UVC_PROBE_STALE_READBACK). The model is
+ * PROVISIONAL - the measured evidence it reproduces, and the reason it is
+ * one-sided rather than symmetric, are documented on mock_uvc_probe_mode_t in
+ * mock_libuvc.h. These four cases pin what the shipped table does today, so the
+ * probe-policy work that replaces it has a green baseline to move from.
+ * ------------------------------------------------------------------------- */
+
+/* Play until the pipeline posts a fatal bus ERROR, which is where a negotiate()
+ * failure surfaces on a live source (same approach as test_negotiate.c). */
+static gboolean
+play_until_error (GstElement * pipeline)
+{
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  GstPad *pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, NULL,
+      NULL);
+  gst_object_unref (pad);
+  gst_object_unref (sink);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+
+  GstBus *bus = gst_element_get_bus (pipeline);
+  GstMessage *msg =
+      gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND, GST_MESSAGE_ERROR);
+  gst_object_unref (bus);
+
+  if (msg == NULL)
+    return FALSE;
+  gst_message_unref (msg);
+  return TRUE;
+}
+
+/* Baseline half 1: with the model DISARMED - the default every other target in
+ * the suite runs under - the shipped Osmo row still issues its two probes and
+ * both of them succeed. */
+GST_START_TEST (test_quirks_stale_model_disarmed_osmo_row_probes_twice)
+{
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_HEALTHY);
+  mock_uvc_set_device_descriptor (0, OSMO_VID, OSMO_PID, NULL, 0, 0);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "the Osmo must negotiate and stream against a healthy mock");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "the shipped Osmo row must probe exactly TWICE; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_SUCCESS,
+      "a disarmed mock must answer every probe with UVC_SUCCESS");
+}
+
+GST_END_TEST;
+
+/* Baseline half 2: an unquirked vid:pid against the SHIPPED table probes once. */
+GST_START_TEST (test_quirks_stale_model_disarmed_unquirked_probes_once)
+{
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_HEALTHY);
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "an unquirked device must negotiate and stream");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "a device with no quirk row must probe exactly ONCE; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_SUCCESS,
+      "a disarmed mock must answer the single probe with UVC_SUCCESS");
+}
+
+GST_END_TEST;
+
+/* WITH QUIRK_DOUBLE_PROBE: the discarded first probe absorbs the stale-readback
+ * rejection and the real probe lands, so the mode increase the board measured as
+ * 20/20 FAIL on one probe negotiates cleanly here. This is the double probe
+ * earning its row, reproduced in software. */
+GST_START_TEST (test_quirks_stale_readback_double_probe_row_recovers)
+{
+  static const uvc_quirk_entry_t table[] = {
+    { QUIRK_TEST_VID, QUIRK_TEST_PID, QUIRK_DOUBLE_PROBE },
+  };
+
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  /* The measured 1920x1080@30 -> 3840x2160@60 transition: the device sits
+   * committed at 1080p30 and negotiation asks for the top advertised mode. */
+  mock_uvc_set_committed_mode (1920, 1080, 30);
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_STALE_READBACK);
+  uvc_quirks_set_test_table (table, G_N_ELEMENTS (table));
+
+  GstElement *pipeline = build_pipeline ();
+  gint w = 0, h = 0, fps_n = 0, fps_d = 0;
+  gboolean got = play_and_get_negotiated (pipeline, &w, &h, &fps_n, &fps_d);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got,
+      "QUIRK_DOUBLE_PROBE must carry negotiation through the stale readback");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "the recovery must cost exactly two probes; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_SUCCESS,
+      "the SECOND probe is the one that must succeed");
+  fail_unless (w == 3840 && h == 2160 && fps_n == 60 && fps_d == 1,
+      "the row arms no cap, so the top advertised mode must still win; "
+      "got %dx%d@%d/%d", w, h, fps_n, fps_d);
+}
+
+GST_END_TEST;
+
+/* WITHOUT QUIRK_DOUBLE_PROBE: the same armed device gets one probe, that probe
+ * is the rejected one, and negotiation dies on UVC_ERROR_INVALID_MODE - the
+ * field symptom "Unable to get stream control: Invalid mode".
+ *
+ * The second half is the control that keeps the model honest, and it is a
+ * DECREASE rather than a same-mode repeat on purpose: only a decrease tells the
+ * measured one-sided model apart from a symmetric "always answer from the
+ * previous mode" device, which would reject this half too. The board measured
+ * decreases passing, so that symmetric shape must not creep in. Both halves ask
+ * for the identical mode; only the committed state the device starts from
+ * differs, which is what makes the pair a direction control. */
+GST_START_TEST (test_quirks_stale_readback_single_probe_row_fails_invalid_mode)
+{
+  /* A row that exists and carries a flag, but NOT QUIRK_DOUBLE_PROBE. The cap
+   * pins BOTH halves onto 3840x2160@30 (248 832 000 px/s, the top rate under a
+   * 300 000 000 ceiling) so the requested mode is a constant and only the probe
+   * policy is under test. */
+  static const uvc_quirk_entry_t table[] = {
+    { QUIRK_TEST_VID, QUIRK_TEST_PID, QUIRK_MAX_PIXEL_RATE, 300000000u },
+  };
+
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  mock_uvc_set_committed_mode (1920, 1080, 30);
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_STALE_READBACK);
+  uvc_quirks_set_test_table (table, G_N_ELEMENTS (table));
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean errored = play_until_error (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (errored,
+      "a single-probe negotiation against the stale readback must fail loudly");
+  fail_unless (g_atomic_int_get (&g_buffers_seen) == 0,
+      "no buffer may flow when negotiation never completed; got %d",
+      g_atomic_int_get (&g_buffers_seen));
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "without the quirk there is exactly ONE probe and no retry; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_ERROR_INVALID_MODE,
+      "the failure must be UVC_ERROR_INVALID_MODE, not some other error");
+
+  mock_uvc_reset ();
+  g_atomic_int_set (&g_buffers_seen, 0);
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  /* Committed ABOVE the capped target, so the identical request is now a
+   * DECREASE (497 664 000 -> 248 832 000 px/s). */
+  mock_uvc_set_committed_mode (3840, 2160, 60);
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_STALE_READBACK);
+
+  GstElement *decreasing = build_pipeline ();
+  gint w = 0, h = 0, fps_n = 0, fps_d = 0;
+  gboolean got = play_and_get_negotiated (decreasing, &w, &h, &fps_n, &fps_d);
+  gst_element_set_state (decreasing, GST_STATE_NULL);
+  gst_object_unref (decreasing);
+
+  fail_unless (got,
+      "a request BELOW the committed mode must negotiate on the first try");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "the passing direction must still cost exactly one probe; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_SUCCESS,
+      "the armed model must not reject a decrease - modelling one would make it "
+      "symmetric, which contradicts the measurement");
+  fail_unless (w == 3840 && h == 2160 && fps_n == 30 && fps_d == 1,
+      "the control run must negotiate the same mode the failing half asked for; "
+      "got %dx%d@%d/%d", w, h, fps_n, fps_d);
+}
+
+GST_END_TEST;
+
 static Suite *
 quirks_suite (void)
 {
@@ -800,6 +998,10 @@ quirks_suite (void)
   tcase_add_test (tc, test_quirks_deliverable_caps_unquirked_keeps_every_rate);
   tcase_add_test (tc, test_quirks_filter_signal_agrees_with_the_open_device_ladder);
   tcase_add_test (tc, test_quirks_filter_signal_leaves_an_unquirked_device_untouched);
+  tcase_add_test (tc, test_quirks_stale_model_disarmed_osmo_row_probes_twice);
+  tcase_add_test (tc, test_quirks_stale_model_disarmed_unquirked_probes_once);
+  tcase_add_test (tc, test_quirks_stale_readback_double_probe_row_recovers);
+  tcase_add_test (tc, test_quirks_stale_readback_single_probe_row_fails_invalid_mode);
 
   return s;
 }
