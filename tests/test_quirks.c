@@ -97,6 +97,7 @@ setup (void)
   }
 
   mock_uvc_reset ();
+  g_unsetenv ("LIBUVCH264SRC_PROBE_POLICY");
   /* Always start from the production (empty) table; a test that wants a quirk
    * injects its own table and the next setup() clears it again. */
   uvc_quirks_set_test_table (NULL, 0);
@@ -973,6 +974,178 @@ GST_START_TEST (test_quirks_stale_readback_single_probe_row_fails_invalid_mode)
 
 GST_END_TEST;
 
+static gint g_probe_policy_warning_count;
+
+static void
+probe_policy_warning_log_func (GstDebugCategory * category, GstDebugLevel level,
+    const gchar * file, const gchar * function, gint line, GObject * object,
+    GstDebugMessage * message, gpointer user_data)
+{
+  (void) category; (void) file; (void) function; (void) line; (void) object;
+  (void) user_data;
+  const gchar *text = gst_debug_message_get (message);
+  if (level == GST_LEVEL_WARNING && text != NULL
+      && g_strstr_len (text, -1, "LIBUVCH264SRC_PROBE_POLICY") != NULL)
+    g_atomic_int_inc (&g_probe_policy_warning_count);
+}
+
+GST_START_TEST (test_probe_policy_retry_recovers_invalid_mode_once)
+{
+  mock_uvc_set_format_mode (MOCK_UVC_FORMAT_OSMO_LADDER);
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  mock_uvc_set_committed_mode (1920, 1080, 30);
+  mock_uvc_set_probe_mode (MOCK_UVC_PROBE_STALE_READBACK);
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "retry", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got,
+      "retry policy must recover from the first UVC_ERROR_INVALID_MODE");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "INVALID_MODE retry must issue exactly two probes; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_SUCCESS,
+      "the single retry must succeed");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_retry_propagates_pipe_without_retry)
+{
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  mock_uvc_set_first_probe_error (UVC_ERROR_PIPE);
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "retry", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean errored = play_until_error (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (errored, "UVC_ERROR_PIPE must propagate as a negotiation error");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "UVC_ERROR_PIPE must not be retried; got %d probes",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_ERROR_PIPE,
+      "the propagated result must remain UVC_ERROR_PIPE");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_retry_propagates_no_device_without_retry)
+{
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  mock_uvc_set_first_probe_error (UVC_ERROR_NO_DEVICE);
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "retry", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean errored = play_until_error (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (errored,
+      "UVC_ERROR_NO_DEVICE must propagate as a negotiation error");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "UVC_ERROR_NO_DEVICE must not be retried; got %d probes",
+      mock_uvc_format_size_call_count ());
+  fail_unless (mock_uvc_last_format_size_result () == UVC_ERROR_NO_DEVICE,
+      "the propagated result must remain UVC_ERROR_NO_DEVICE");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_retry_healthy_device_probes_once)
+{
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "retry", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "a healthy device must negotiate under retry policy");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "retry policy must stop after a healthy first probe; got %d",
+      mock_uvc_format_size_call_count ());
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_single_overrides_double_probe_row)
+{
+  static const uvc_quirk_entry_t table[] = {
+    { QUIRK_TEST_VID, QUIRK_TEST_PID, QUIRK_DOUBLE_PROBE },
+  };
+
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  uvc_quirks_set_test_table (table, G_N_ELEMENTS (table));
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "single", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "single policy must negotiate a healthy device");
+  fail_unless (mock_uvc_format_size_call_count () == 1,
+      "single policy must override the double-probe row; got %d probes",
+      mock_uvc_format_size_call_count ());
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_double_is_capped_at_two_attempts)
+{
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "double", TRUE);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+
+  fail_unless (got, "double policy must negotiate a healthy device");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "double policy must issue exactly two probes, never more; got %d",
+      mock_uvc_format_size_call_count ());
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_probe_policy_invalid_value_warns_once_and_uses_table)
+{
+  static const uvc_quirk_entry_t table[] = {
+    { QUIRK_TEST_VID, QUIRK_TEST_PID, QUIRK_DOUBLE_PROBE },
+  };
+
+  mock_uvc_set_device_descriptor (0, QUIRK_TEST_VID, QUIRK_TEST_PID, NULL, 0, 0);
+  uvc_quirks_set_test_table (table, G_N_ELEMENTS (table));
+  g_setenv ("LIBUVCH264SRC_PROBE_POLICY", "bogus", TRUE);
+  g_atomic_int_set (&g_probe_policy_warning_count, 0);
+  gst_debug_set_active (TRUE);
+  gst_debug_set_threshold_for_name ("libuvch264src", GST_LEVEL_WARNING);
+  gst_debug_add_log_function (probe_policy_warning_log_func, NULL, NULL);
+
+  GstElement *pipeline = build_pipeline ();
+  gboolean got = play_until_buffer (pipeline);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  gst_debug_remove_log_function (probe_policy_warning_log_func);
+
+  fail_unless (got, "an invalid policy value must fall back without failing");
+  fail_unless (mock_uvc_format_size_call_count () == 2,
+      "invalid policy must preserve the table-driven double probe; got %d",
+      mock_uvc_format_size_call_count ());
+  fail_unless (g_atomic_int_get (&g_probe_policy_warning_count) == 1,
+      "invalid policy must emit exactly one GST_WARNING; got %d",
+      g_atomic_int_get (&g_probe_policy_warning_count));
+}
+
+GST_END_TEST;
+
 static Suite *
 quirks_suite (void)
 {
@@ -1002,6 +1175,13 @@ quirks_suite (void)
   tcase_add_test (tc, test_quirks_stale_model_disarmed_unquirked_probes_once);
   tcase_add_test (tc, test_quirks_stale_readback_double_probe_row_recovers);
   tcase_add_test (tc, test_quirks_stale_readback_single_probe_row_fails_invalid_mode);
+  tcase_add_test (tc, test_probe_policy_retry_recovers_invalid_mode_once);
+  tcase_add_test (tc, test_probe_policy_retry_propagates_pipe_without_retry);
+  tcase_add_test (tc, test_probe_policy_retry_propagates_no_device_without_retry);
+  tcase_add_test (tc, test_probe_policy_retry_healthy_device_probes_once);
+  tcase_add_test (tc, test_probe_policy_single_overrides_double_probe_row);
+  tcase_add_test (tc, test_probe_policy_double_is_capped_at_two_attempts);
+  tcase_add_test (tc, test_probe_policy_invalid_value_warns_once_and_uses_table);
 
   return s;
 }

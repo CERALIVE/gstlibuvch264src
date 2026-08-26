@@ -924,7 +924,9 @@ endif()
 # the test seam is gated by this PRIVATE compile definition.
 # -----------------------------------------------------------------------------
 add_static_gstcheck_exe(test_quirks)
-target_compile_definitions(test_quirks PRIVATE LIBUVCH264SRC_TESTING)
+target_compile_definitions(test_quirks PRIVATE
+  LIBUVCH264SRC_TESTING
+  LIBUVCH264SRC_PROBE_POLICY_OVERRIDE)
 
 set(_quirks_cases
   "quirks_lookup_hit:test_quirks_lookup_hit"
@@ -946,6 +948,13 @@ set(_quirks_cases
   "quirks_stale_disarmed_unquirked_probes_once:test_quirks_stale_model_disarmed_unquirked_probes_once"
   "quirks_stale_readback_double_probe_recovers:test_quirks_stale_readback_double_probe_row_recovers"
   "quirks_stale_readback_single_probe_invalid_mode:test_quirks_stale_readback_single_probe_row_fails_invalid_mode"
+  "probe_policy_retry_invalid_mode:test_probe_policy_retry_recovers_invalid_mode_once"
+  "probe_policy_retry_pipe:test_probe_policy_retry_propagates_pipe_without_retry"
+  "probe_policy_retry_no_device:test_probe_policy_retry_propagates_no_device_without_retry"
+  "probe_policy_retry_healthy_once:test_probe_policy_retry_healthy_device_probes_once"
+  "probe_policy_single_overrides_table:test_probe_policy_single_overrides_double_probe_row"
+  "probe_policy_double_attempt_cap:test_probe_policy_double_is_capped_at_two_attempts"
+  "probe_policy_invalid_value:test_probe_policy_invalid_value_warns_once_and_uses_table"
 )
 # The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
 # which may spawn the control thread, so keep them off the shared control-socket

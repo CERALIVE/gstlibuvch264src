@@ -14,6 +14,9 @@ project('libuvch264src', 'c',
 # sibling CMake test build already relies on (CMAKE_C_STANDARD 11 +
 # CMAKE_C_EXTENSIONS ON == -std=gnu11).
 add_project_arguments('-D_GNU_SOURCE', language: 'c')
+if get_option('probe_policy_override')
+  add_project_arguments('-DLIBUVCH264SRC_PROBE_POLICY_OVERRIDE', language: 'c')
+endif
 
 gst_dep = dependency('gstreamer-1.0', version: '>=1.14')
 gst_base_dep = dependency('gstreamer-base-1.0', version: '>=1.14')
