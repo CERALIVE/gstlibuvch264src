@@ -238,9 +238,9 @@ uint32_t mock_uvc_last_started_payload(void);
  * extra probe (max-payload unset = byte-for-byte unchanged negotiation). */
 int mock_uvc_probe_call_count(void);
 
-/* uvc_get_stream_ctrl_format_size() calls since reset (Task 12 quirk seam). A
- * default negotiation issues exactly 1; a device keyed to QUIRK_DOUBLE_PROBE
- * issues exactly 2 (the first result discarded). */
+/* uvc_get_stream_ctrl_format_size() calls since reset. A healthy default
+ * negotiation issues exactly 1; an initial UVC_ERROR_INVALID_MODE permits one
+ * retry, for exactly 2 total attempts. */
 int mock_uvc_format_size_call_count(void);
 
 /* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). The last
