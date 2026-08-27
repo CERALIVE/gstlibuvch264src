@@ -93,8 +93,9 @@
 #           [--outdir <dir>]
 #       (b) PHANTOM matrix - Drill C. Per-mode bounded runs (default
 #       num-buffers=300) with access units counted at an `identity` probe, SPS
-#       geometry read back from the `h264parse` src caps, wall-clock fps
-#       computed here, and an element-level GST_ERROR/GST_WARN scan. Arms:
+#       geometry read back from the `h264parse` src caps, fps measured across
+#       the first-to-last AU PTS span, and an element-level GST_ERROR/GST_WARN
+#       scan. Full process wall time remains in the evidence. Arms:
 #         after-smaller  commit --smaller-mode first, then the subject mode
 #         cold-start     one operator camera power-cycle per replicate
 #         after-replug   one operator physical replug per replicate
@@ -117,9 +118,11 @@
 # PER-RUN PASS RULE (computed HERE, never by the caller)
 # ---------------------------------------------------------------------------
 #   AU count == requested count (300/300 by default, at the identity probe)
-#   AND AU_count / wall_seconds >= 0.90 * nominal_fps
+#   AND (AU_count - 1) / (last_AU_PTS - first_AU_PTS) >= 0.90 * nominal_fps
 #   AND SPS-derived geometry (h264parse caps) == requested geometry
 #   AND zero element-level GST_ERROR / GST_WARN lines
+# If fewer than two AUs carry parseable `H:MM:SS.nanoseconds` PTS values, the
+# fps calculation falls back explicitly to AU_count / wall_seconds.
 # A run missing any provenance field, or whose transcript could not be scored,
 # is INCONCLUSIVE - never a pass.
 #
@@ -211,6 +214,47 @@ usage() { sed -n '2,162p' "$0"; }
 
 ts_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
+
+run_rate_metrics() {
+  local logfile=$1 aus=$2 wall_s=$3 stream_s fps
+
+  stream_s=$(awk -v expected="$aus" '
+    /GstIdentity:auprobe: last-message = chain/ {
+      chain_count++
+      if (match($0, /pts: [0-9]+:[0-9][0-9]:[0-9][0-9]\.[0-9]+,/)) {
+        token = substr($0, RSTART + 5, RLENGTH - 6)
+        if (split(token, hms, ":") != 3 || split(hms[3], second_parts, ".") != 2 ||
+            length(second_parts[2]) != 9 || hms[2] >= 60 || second_parts[1] >= 60) {
+          next
+        }
+        pts = (hms[1] * 3600) + (hms[2] * 60) + hms[3]
+        parsed_count++
+        if (parsed_count == 1) {
+          first_pts = pts
+        }
+        last_pts = pts
+      }
+    }
+    END {
+      if (chain_count != expected || parsed_count != chain_count || parsed_count < 2 ||
+          last_pts <= first_pts) {
+        exit 1
+      }
+      printf "%.9f", last_pts - first_pts
+    }
+  ' "$logfile" 2>/dev/null) || stream_s=
+
+  if [ -n "$stream_s" ]; then
+    fps=$(awk -v a="$aus" -v s="$stream_s" \
+      'BEGIN { printf "%.3f", (a - 1) / s }')
+    printf '%s %s pts-span\n' "$stream_s" "$fps"
+    return 0
+  fi
+
+  fps=$(awk -v a="$aus" -v s="$wall_s" \
+    'BEGIN { if (s <= 0) print "0.000"; else printf "%.3f", a / s }')
+  printf 'unavailable %s wall-fallback\n' "$fps"
+}
 
 RUN_LOG=
 log() {
@@ -799,7 +843,9 @@ finish() {
 
 RUN_AUS=0
 RUN_WALL_S=0
+RUN_STREAM_S=unavailable
 RUN_FPS=0
+RUN_FPS_SOURCE=wall-fallback
 RUN_GEOM=
 RUN_ERRORS=0
 RUN_INVALID_MODE=0
@@ -809,7 +855,8 @@ gst_run() {
   local w h f t0 t1 caps_line
   w=$(mode_width "$mode"); h=$(mode_height "$mode"); f=$(mode_fps "$mode")
 
-  RUN_AUS=0; RUN_WALL_S=0; RUN_FPS=0; RUN_GEOM=; RUN_ERRORS=0; RUN_INVALID_MODE=0
+  RUN_AUS=0; RUN_WALL_S=0; RUN_STREAM_S=unavailable; RUN_FPS=0
+  RUN_FPS_SOURCE=wall-fallback; RUN_GEOM=; RUN_ERRORS=0; RUN_INVALID_MODE=0
 
   local -a limiter=()
   local -a srcprops=()
@@ -861,7 +908,9 @@ gst_run() {
     [ -n "$gw" ] && [ -n "$gh" ] && RUN_GEOM="${gw}x${gh}"
   fi
 
-  RUN_FPS=$(awk -v a="$RUN_AUS" -v s="$RUN_WALL_S" 'BEGIN { if (s <= 0) print "0.000"; else printf "%.3f", a / s }')
+  read -r RUN_STREAM_S RUN_FPS RUN_FPS_SOURCE < <(
+    run_rate_metrics "$logfile" "$RUN_AUS" "$RUN_WALL_S"
+  )
   return 0
 }
 
@@ -874,7 +923,7 @@ score_run() {
   floor=$(awk -v f="$f" 'BEGIN { printf "%.3f", 0.90 * f }')
 
   if [ "$PROVENANCE_COMPLETE" != yes ]; then
-    record "RUN_SCORE: INCONCLUSIVE mode=$mode reason=provenance-incomplete"
+    record "RUN_SCORE: INCONCLUSIVE mode=$mode reason=provenance-incomplete aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE"
     return 2
   fi
   if [ "$kind" = bounded ]; then
@@ -895,14 +944,14 @@ score_run() {
   fi
 
   if [ -z "$RUN_GEOM" ] && [ "$RUN_AUS" -eq 0 ] && [ "$RUN_INVALID_MODE" -eq 0 ] && [ "$RUN_ERRORS" -eq 0 ]; then
-    record "RUN_SCORE: INCONCLUSIVE mode=$mode reason=no-transcript-signal wall=${RUN_WALL_S}s"
+    record "RUN_SCORE: INCONCLUSIVE mode=$mode reason=no-transcript-signal aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE"
     return 2
   fi
   if [ "$ok" -eq 1 ]; then
-    record "RUN_SCORE: PASS mode=$mode aus=$RUN_AUS wall=${RUN_WALL_S}s fps=$RUN_FPS floor=$floor geometry=$RUN_GEOM errors=0"
+    record "RUN_SCORE: PASS mode=$mode aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE floor=$floor geometry=$RUN_GEOM errors=0"
     return 0
   fi
-  record "RUN_SCORE: FAIL mode=$mode aus=$RUN_AUS wall=${RUN_WALL_S}s fps=$RUN_FPS floor=$floor geometry=${RUN_GEOM:-unreadable} errors=$RUN_ERRORS invalid_mode=$RUN_INVALID_MODE reasons:$reasons"
+  record "RUN_SCORE: FAIL mode=$mode aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE floor=$floor geometry=${RUN_GEOM:-unreadable} errors=$RUN_ERRORS invalid_mode=$RUN_INVALID_MODE reasons:$reasons"
   return 1
 }
 
@@ -1192,9 +1241,9 @@ cmd_sustained() {
     score_run "$mode" 0 sustained
     rc=$?
     case "$rc" in
-      0) passes=$((passes + 1)); record "SUSTAINED_RUN: PASS replicate=$i aus=$RUN_AUS wall=${RUN_WALL_S}s fps=$RUN_FPS" ;;
-      1) fails=$((fails + 1)); record "SUSTAINED_RUN: FAIL replicate=$i aus=$RUN_AUS wall=${RUN_WALL_S}s fps=$RUN_FPS" ;;
-      *) incs=$((incs + 1)); record "SUSTAINED_RUN: INCONCLUSIVE replicate=$i" ;;
+      0) passes=$((passes + 1)); record "SUSTAINED_RUN: PASS replicate=$i aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE" ;;
+      1) fails=$((fails + 1)); record "SUSTAINED_RUN: FAIL replicate=$i aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE" ;;
+      *) incs=$((incs + 1)); record "SUSTAINED_RUN: INCONCLUSIVE replicate=$i aus=$RUN_AUS wall=${RUN_WALL_S}s stream_s=$RUN_STREAM_S fps=$RUN_FPS fps_source=$RUN_FPS_SOURCE" ;;
     esac
     sleep 5
   done
@@ -1384,6 +1433,7 @@ cmd_verdict() {
 
 # --- argument parsing -------------------------------------------------------
 
+main() {
 [ $# -gt 0 ] || { usage; exit 1; }
 
 SUBCOMMAND=$1; shift
@@ -1438,3 +1488,8 @@ case "$SUBCOMMAND" in
   verdict)         cmd_verdict ;;
   *) echo "unknown subcommand: $SUBCOMMAND" >&2; usage; exit 1 ;;
 esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
