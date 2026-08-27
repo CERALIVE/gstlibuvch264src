@@ -1,7 +1,7 @@
 # Camera Compatibility Matrix
 
 **Status:** informational, updated as devices get validated
-**Date:** 2026-07-03
+**Date:** 2026-07-03 (§2 Step 6, Type-C behaviour: 2026-08-27)
 **Scope:** what `libuvch264src` can talk to today, how, and how confident we are about each device family
 
 This note answers three questions a field technician or on-call engineer asks
@@ -193,6 +193,71 @@ See `quirks.c` for the full evidence and for how to raise the cap.
 If you find another camera that needs either workaround, that's a signal to add a
 table entry — not something the field-triage steps above can toggle at the
 command line today.
+
+### Step 6: over USB-C to USB-C, check the Type-C role BEFORE blaming the element
+
+**Verdict scope:** measured 2026-08-26/27 on a DJI Osmo Pocket 3 (`2ca3:0023`,
+`bcdDevice=0504`) against two RK3588 boards (Radxa ROCK 5B+ and Orange Pi 5 Plus)
+running locally built mainline-track kernels. It is a statement about that camera
+and those boards, not a general claim about USB-C cameras.
+
+When the camera is attached to an RK3588 board with a C-to-C cable, a whole class of
+"the camera isn't detected" reports never reaches this element at all. Both ends are
+dual-role, so the port's role is settled by CC-line arbitration, and when the board
+loses that arbitration it is running as a USB *peripheral* — the camera's bus is
+absent from `/sys/bus/usb/devices/` entirely, and `lsusb` in Step 1 shows nothing.
+No plugin-side change can repair that. Check the role first:
+
+```bash
+cat /sys/class/typec/port0/port_type      # expect: [dual] source sink
+cat /sys/class/typec/port0/power_role
+cat /sys/class/typec/port0/data_role      # the camera needs: [host] device
+cat /sys/class/typec/port0/../port0-partner/... 2>/dev/null   # partner presence
+```
+
+`data_role` reading `host [device]` with a partner present is the signature. On a
+CeraLive image the on-board `ceralive-typec-policy` requests a bounded data-role
+swap to `host` automatically on a settled sink/device attach; the useful diagnostic
+is `journalctl -u ceralive-typec-policy.service`. Do not "fix" this by pinning
+`port_type` to `source` — that was tried and retired: with a forced-source port the
+Osmo never presented Rd and **no attachment formed at all, 3 of 3 physical
+replicates**.
+
+**Camera-side preflight, and it matters more than it looks.** The Osmo has an
+on-camera Type-C mode selector, and the camera must be in its **webcam / UVC** mode
+before any of the above is meaningful — a camera sitting in a file-transfer or
+charge-only mode is not a UVC device and will not enumerate one however the roles
+land. Confirm the on-screen mode before escalating.
+
+**Battery-state caveat.** A DJI Osmo Pocket 3 with a critically low battery has been
+observed negotiating defensively over Type-C, so a "camera not detected" report from
+a nearly flat camera is not trustworthy evidence of anything. The 2026-08-27
+adjudication above was deliberately run at a confirmed **88% battery** for exactly
+this reason. Charge the camera before treating a negotiation failure as a finding.
+
+**What the healthy-battery adjudication actually found** (2026-08-27, verdict
+`MIXED`, all three legs machine-computed by a hardware drill rather than read off a
+log by hand):
+
+- Under a **forced-source** port the camera **never presents Rd** — 3/3 replicates,
+  no attach — which is the conclusive part and the reason the force-source approach
+  is gone.
+- Under a genuine **dual-role** port the natural arbitration is *not* deterministic
+  toward sink as had been assumed: across 3 replicates the board landed
+  source/host **once** and sink/device twice. So "the camera is always Rp-only" is
+  an oversimplification — it is Rp-only in the forced-source arm, and merely
+  *usually* the source-side winner in free arbitration.
+- The **data-role swap works cleanly**: first-attempt success on both replicates
+  where it was needed, after which the camera enumerated normally as
+  `2ca3:0023` and this element negotiated as usual.
+- A **power-role swap request** is not production-grade against this camera:
+  4 attempts across the session gave 1 clean success, 1 timeout, and 2 rejections,
+  so the shipped board policy never issues one.
+
+None of this changes anything inside this element. It is recorded here because the
+symptom — "the camera isn't detected" — is identical to a negotiation failure, and
+Step 2's descriptor inventory will print nothing at all when the device was never on
+the bus to begin with.
 
 ---
 
