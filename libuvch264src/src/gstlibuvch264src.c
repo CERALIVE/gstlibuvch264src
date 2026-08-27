@@ -806,9 +806,10 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         goto out;
     }
 
-    GstLibuvcProbePolicy probe_policy =
-        (quirk_limits.flags & QUIRK_DOUBLE_PROBE)
-        ? PROBE_POLICY_DOUBLE : PROBE_POLICY_SINGLE;
+    /* Rule G's G1 hardware verdict made the error-triggered policy universal:
+     * a healthy device still costs one probe, while INVALID_MODE gets one and
+     * only one retry. The compile-gated override remains the drill seam. */
+    GstLibuvcProbePolicy probe_policy = PROBE_POLICY_RETRY;
 #ifdef LIBUVCH264SRC_PROBE_POLICY_OVERRIDE
     const gchar *probe_policy_override = g_getenv("LIBUVCH264SRC_PROBE_POLICY");
     if (probe_policy_override != NULL) {
