@@ -1,7 +1,7 @@
 # Camera Compatibility Matrix
 
 **Status:** informational, updated as devices get validated
-**Date:** 2026-07-03
+**Date:** 2026-07-03 (§2 Steps 5-6 updated 2026-08-27)
 **Scope:** what `libuvch264src` can talk to today, how, and how confident we are about each device family
 
 This note answers three questions a field technician or on-call engineer asks
@@ -116,19 +116,24 @@ See AGENTS.md DISCONNECT / RECONNECT BEHAVIOR for the exact detection window
 ### Step 5: check for a vid:pid quirk match
 
 The element carries a vid:pid quirk table (`libuvch264src/src/quirks.{c,h}`) with
-two flags:
+a single flag:
 
-- `QUIRK_DOUBLE_PROBE` — for cameras that need
-  `uvc_get_stream_ctrl_format_size()` called twice before the negotiated format
-  sticks (libuvc upstream issue #242).
 - `QUIRK_MAX_PIXEL_RATE` — for cameras that advertise frame intervals they
-  cannot deliver. The row carries the highest `width x height x fps` PROVEN to
-  stream, and negotiation drops every advertised rate above it.
+  cannot deliver. The row carries the highest `width x height x fps` the element
+  is willing to select, and negotiation drops every advertised rate above it.
 
-The table currently holds **one** row: the DJI Osmo Pocket 3 (`2ca3:0023`), which
-sets **both** flags, capped at `3840x2160x30` = 248 832 000 px/s.
+The table holds **one** row: the DJI Osmo Pocket 3 (`2ca3:0023`), capped at
+`3840x2160x30` = 248 832 000 px/s.
 
-**Why it needs the double probe (the "camera is not detected" symptom).**
+Stream-control probing is **no longer a quirk**. Since the 2026-08-27 probe-policy
+campaign, every device gets the same bounded retry: one normal probe, and exactly
+one retry when libuvc returns `UVC_ERROR_INVALID_MODE`. A successful first probe
+still stops after one attempt, and every other libuvc error propagates untouched.
+The old `QUIRK_DOUBLE_PROBE` flag that used to carry this per-device is gone from
+the table, the header, and `negotiate()`; the paragraphs below are the dated
+evidence that led there.
+
+**Why the stale-readback retry exists (the "camera is not detected" symptom).**
 `uvc_probe_stream_ctrl()` SET_CURs the control it wants, GET_CURs it back, and
 rejects the mode if the readback disagrees. The Osmo answers that first GET_CUR
 from the mode it PREVIOUSLY committed, so a negotiation asking for a mode LARGER
@@ -147,6 +152,37 @@ otherwise. The `720p → 1080p` row matters most: the element's own shipping mod
 is affected, so this is not a 4K-only concern. It presents as intermittent in the
 field only because whether it fires depends on what mode the device last
 committed.
+
+**2026-08-27 probe-policy campaign.** A fresh Rock 5B+ run reproduced the same
+directional failure at larger counts. The harness emitted:
+
+```text
+CLASS_COUNTS: class=increase n=10 failures=10 inconclusive=0
+CLASS_COUNTS: class=same n=10 failures=0 inconclusive=0
+CLASS_COUNTS: class=decrease n=10 failures=0 inconclusive=0
+RULE_A_BRANCH: REPRODUCED policy=single n=10 failures=10 rate=100.0%
+```
+
+The behavior-triggered `retry` policy then ran the same three classes at N=10
+per class with no failures or inconclusive attempts. Its aggregate decision was:
+
+```text
+RULE_G: G1 retry_runs=1 failures=0 undersized_classes=0
+```
+
+An unconditional two-probe diagnostic arm also passed every class, but the
+selected general policy is the narrower retry, and it now applies to **every**
+device rather than to a quirked row: make one normal probe, retry once only when
+libuvc returns `UVC_ERROR_INVALID_MODE`, and propagate every other error. That is
+what retired `QUIRK_DOUBLE_PROBE` — the workaround became the default, so the
+per-device flag had nothing left to switch on. See
+[UVC probe negotiation](uvc-probe-negotiation.md) for the method, provenance, and
+design rationale.
+
+A later shipping-build run on 2026-08-27 re-confirmed it end to end: the
+production `.so`, built with no development probe-policy override compiled in,
+passed the increase, same, and decrease transition classes at N=10 each with zero
+negotiation failures.
 
 **Why it also carries a pixel-rate cap.** Its H.264 descriptor advertises
 3840x2160 at 60/50/48 fps, and `negotiate()` prefers the largest area at the
@@ -180,19 +216,123 @@ have silently measured something else.
 
 > **The caveat below still stands for every FUTURE raise, including 4K@60.** The
 > original zero-frame observation was real and was never explained (one candidate:
-> the same stale-readback defect `QUIRK_DOUBLE_PROBE` exists for can leave a
-> bound-but-silent stream when the readback happens to compare equal), so
+> the same stale-readback defect the bounded `UVC_ERROR_INVALID_MODE` retry exists
+> for can leave a bound-but-silent stream when the readback compares equal), so
 > 4K@60/50/48 remain capped out. Raising the cap further is the one-number change
 > described in `quirks.c` — do not make it on the strength of a descriptor, a
 > datasheet, a successful `uvc_get_stream_ctrl_format_size()`, or this note alone.
 > It takes advancing frames on real hardware: a bounded access-unit count,
 > SPS-verified geometry, reproduced.
 
+**2026-08-27 cap adjudication.** The shipping-candidate `retry` arm did not
+revive the higher advertised rates. The harness emitted the same failures for
+the unconditional-double diagnostic arm, and the reduced single-probe control
+also failed at 4K@60:
+
+```text
+VERDICT_CELL: FAIL arm=after-smaller mode=3840x2160@60 failures=45/45
+VERDICT_CELL: FAIL arm=after-smaller mode=3840x2160@50 failures=45/45
+VERDICT_CELL: FAIL arm=after-smaller mode=3840x2160@48 failures=45/45
+VERDICT_CELL: PASS arm=after-smaller mode=3840x2160@30 passes=5/5
+RULE_C_FINAL: C2 rate=248832000 provenance=edge-aggregate-contiguous-ceiling
+```
+
+The failed high-rate runs reported `Unable to negotiate common caps` followed
+by `not-negotiated (-4)`, with no `Invalid mode` signal and no delivered access
+units. That is a caps-negotiation rejection, not the stale-readback condition the
+bounded retry fixes. The cold-start and after-replug cells were formally recorded
+as `SKIPPED reason=unattended`; they were not counted as passes. The conservative
+aggregate therefore retains the verified 4K@30 ceiling.
+
+**Shipping-build timing caveat (2026-08-27).** Two independent production-build
+confirmations exposed an occasional early-stream timing transient at 4K@30: 2 of
+20 runs fell below the harness's whole-process 27 fps floor. Both still delivered
+all 300/300 access units at SPS-verified `3840x2160`, with zero element errors and
+zero invalid-mode errors. Frame-level PTS analysis found no sustained slowdown.
+One run waited about 1.33 s for its first frame and then held normal cadence for
+all 299 subsequent intervals; the other had exactly one 0.423 s gap between
+frames 2 and 3, with every remaining interval normally paced. This is consistent
+with USB isochronous-transfer scheduling settling near stream start. Treat it as
+an operational startup caveat, not evidence that the camera cannot deliver
+4K@30; the retained 248 832 000 px/s ceiling remains the measured safe ceiling.
+
+**Verdict scope:** these 2026-08-27 probe and cap results apply to the tested DJI
+Osmo Pocket 3 `2ca3:0023`, `bcdDevice 5.04`, firmware/product string
+`DJIPocket3`, serial `123456789ABCDEF`, on a Radxa ROCK 5B+ running
+`7.2.0-ceralive-rk3588`. They do not establish behavior for another firmware,
+serial, camera model, or host stack.
+
 See `quirks.c` for the full evidence and for how to raise the cap.
 
-If you find another camera that needs either workaround, that's a signal to add a
-table entry — not something the field-triage steps above can toggle at the
-command line today.
+If you find another camera that advertises rates it cannot deliver, that's a
+signal to add a table entry — not something the field-triage steps above can
+toggle at the command line today. A camera that needs the stale-readback retry
+needs no entry at all: it already gets it.
+
+### Step 6: over USB-C to USB-C, check the Type-C role BEFORE blaming the element
+
+**Verdict scope:** measured 2026-08-26/27 on a DJI Osmo Pocket 3 (`2ca3:0023`,
+`bcdDevice=0504`) against two RK3588 boards (Radxa ROCK 5B+ and Orange Pi 5 Plus)
+running locally built mainline-track kernels. It is a statement about that camera
+and those boards, not a general claim about USB-C cameras.
+
+When the camera is attached to an RK3588 board with a C-to-C cable, a whole class of
+"the camera isn't detected" reports never reaches this element at all. Both ends are
+dual-role, so the port's role is settled by CC-line arbitration, and when the board
+loses that arbitration it is running as a USB *peripheral* — the camera's bus is
+absent from `/sys/bus/usb/devices/` entirely, and `lsusb` in Step 1 shows nothing.
+No plugin-side change can repair that. Check the role first:
+
+```bash
+cat /sys/class/typec/port0/port_type      # expect: [dual] source sink
+cat /sys/class/typec/port0/power_role
+cat /sys/class/typec/port0/data_role      # the camera needs: [host] device
+cat /sys/class/typec/port0/../port0-partner/... 2>/dev/null   # partner presence
+```
+
+`data_role` reading `host [device]` with a partner present is the signature. On a
+CeraLive image the on-board `ceralive-typec-policy` requests a bounded data-role
+swap to `host` automatically on a settled sink/device attach; the useful diagnostic
+is `journalctl -u ceralive-typec-policy.service`. Do not "fix" this by pinning
+`port_type` to `source` — that was tried and retired: with a forced-source port the
+Osmo never presented Rd and **no attachment formed at all, 3 of 3 physical
+replicates**.
+
+**Camera-side preflight, and it matters more than it looks.** The Osmo has an
+on-camera Type-C mode selector, and the camera must be in its **webcam / UVC** mode
+before any of the above is meaningful — a camera sitting in a file-transfer or
+charge-only mode is not a UVC device and will not enumerate one however the roles
+land. Confirm the on-screen mode before escalating.
+
+**Battery-state caveat.** A DJI Osmo Pocket 3 with a critically low battery has been
+observed negotiating defensively over Type-C, so a "camera not detected" report from
+a nearly flat camera is not trustworthy evidence of anything. The 2026-08-27
+adjudication above was deliberately run at a confirmed **88% battery** for exactly
+this reason. Charge the camera before treating a negotiation failure as a finding.
+
+**What the healthy-battery adjudication actually found** (2026-08-27, verdict
+`MIXED`, all three legs machine-computed by a hardware drill rather than read off a
+log by hand):
+
+- Under a **forced-source** port the camera **never presents Rd** — 3/3 replicates,
+  no attach — which is the conclusive part and the reason the force-source approach
+  is gone.
+- Under a genuine **dual-role** port the natural arbitration is *not* deterministic
+  toward sink as had been assumed: across 3 replicates the board landed
+  source/host **once** and sink/device twice. So "the camera is always Rp-only" is
+  an oversimplification — it is Rp-only in the forced-source arm, and merely
+  *usually* the source-side winner in free arbitration.
+- The **data-role swap works cleanly**: first-attempt success on both replicates
+  where it was needed, after which the camera enumerated normally as
+  `2ca3:0023` and this element negotiated as usual.
+- A **power-role swap request** is not production-grade against this camera:
+  4 attempts across the session gave 1 clean success, 1 timeout, and 2 rejections,
+  so the shipped board policy never issues one.
+
+None of this changes anything inside this element. It is recorded here because the
+symptom — "the camera isn't detected" — is identical to a negotiation failure, and
+Step 2's descriptor inventory will print nothing at all when the device was never on
+the bus to begin with.
 
 ---
 
@@ -219,7 +359,7 @@ state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
 | A11 | upstream PR #224 | skip-equivalent | already in `2f32812` (pre-dates this hardening wave) | "Only detach an actually-active kernel driver" is already covered by the fork's `libusb_set_auto_detach_kernel_driver` call plus `uvc_claim_if`'s tolerance of the no-active-driver error codes. |
 | A12 | pupil-labs `92d2f82` + `74e7a96` (clock half only) | adapt + pick | `9874f4c` | Preserves `dwClockFrequency` from the VideoControl header for `bcdUVC` 0x0110 and 0x0150 (previously only 0x0100/0x010a set it). Plumbing only; per the SCR-ABSENT verdict in `scr-investigation.md`, this value is never surfaced on frames, so it has no PTS behavior impact. |
 | A13 | saki4510t `2596242` | skip-equivalent | none (confirmed no-op) | The libuvc-portion of this commit is comment-only for ref/unref (already correct in the fork) plus an Android-JNI-only function absent from this codebase entirely. Nothing to land. |
-| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Implemented as the `QUIRK_DOUBLE_PROBE` vid:pid quirk seam in `libuvch264src/src/quirks.{c,h}`, wired into `negotiate()`. The DJI Osmo Pocket 3 row sets it alongside `QUIRK_MAX_PIXEL_RATE` — board-measured 23/23 `Invalid mode` failures on a mode increase with a single probe, 0 with two (§2 Step 5). |
+| A14 | libuvc upstream issue #242 (double-probe workaround) | plugin-only, not a fork patch | `3d5003e` (plugin repo, not the fork) | Originally shipped as the `QUIRK_DOUBLE_PROBE` vid:pid quirk flag, set on the DJI Osmo Pocket 3 row — board-measured 23/23 `Invalid mode` failures on a mode increase with a single probe, 0 with two (§2 Step 5, 2026-07-30). **Superseded 2026-08-27:** the workaround is now the universal default, a bounded single retry on `UVC_ERROR_INVALID_MODE` inside `negotiate()`, and the flag was removed. The behaviour A14 asked for still ships; it is simply no longer per-device. |
 
 **Plugin-side commits that consume the fork's hardening:**
 
@@ -227,7 +367,7 @@ state and finalized in the fork's `CHANGELOG.ceralive.md`. Each backlog ID
 |----------------|-------------|
 | `94a7c21` | Bumped `FORK_SHA` in `scripts/build-libuvc.sh` to `6210f2f...` (ceralive-v0.0.7.3) and fixed stale `v0.0.7.1`-era prose comments. |
 | `c46daee` | Added the opt-in `transfer-buffers` property (consumes fork A2's `uvc_set_transfer_buffers()`). |
-| `3d5003e` | Added the negotiation-failure descriptor-inventory diagnostics (§2 above) and the `QUIRK_DOUBLE_PROBE` quirk seam (A14). |
+| `3d5003e` | Added the negotiation-failure descriptor-inventory diagnostics (§2 above) and the `QUIRK_DOUBLE_PROBE` quirk seam (A14). The quirk flag was later retired on 2026-08-27 when its behaviour became the universal probe default; the diagnostics are unchanged. |
 | `3cbab94` | Test-only fix scoping the fork-only transfer-buffers test cases behind the `TB_API_AVAILABLE` build-time guard, so the `-DLIBUVC_USE_FORK=OFF` (upstream) build stays green. |
 
 For the full 8-commit-plus-changelog fork history, see

@@ -618,6 +618,35 @@ static void gst_libuvc_h264_src_publish_ladder(GstLibuvcH264Src *self,
     gst_caps_unref(ladder);
 }
 
+typedef enum {
+    PROBE_POLICY_SINGLE,
+    PROBE_POLICY_DOUBLE,
+    PROBE_POLICY_RETRY,
+} GstLibuvcProbePolicy;
+
+static int gst_libuvc_h264_src_probe_stream_ctrl(GstLibuvcH264Src *self,
+        gint width, gint height, gint framerate, GstLibuvcProbePolicy policy) {
+    int res;
+
+    if (policy == PROBE_POLICY_DOUBLE) {
+        uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                        self->frame_format, width, height, framerate);
+    }
+
+    res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                          self->frame_format, width, height, framerate);
+    if (policy == PROBE_POLICY_RETRY && res == UVC_ERROR_INVALID_MODE) {
+        GST_INFO_OBJECT(self,
+            "Retrying stream-control probe after %s (%d) for %dx%d@%d",
+            uvc_strerror(res), res, width, height, framerate);
+        res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                              self->frame_format, width, height,
+                                              framerate);
+    }
+
+    return res;
+}
+
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
 
@@ -777,18 +806,29 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         goto out;
     }
 
-    // Reuses the flags resolved above the selection loop: a device with no row has
-    // none set and the probe count stays at 1. QUIRK_DOUBLE_PROBE (libuvc #242)
-    // issues the format-size probe twice, discarding the first result.
-    if (quirk_limits.flags & QUIRK_DOUBLE_PROBE) {
-        // Some devices return a stale/rejected stream control on the first
-        // probe; run it once and discard the result before the real probe.
-        uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
-                                        self->frame_format, width, height, framerate);
+    /* Rule G's G1 hardware verdict made the error-triggered policy universal:
+     * a healthy device still costs one probe, while INVALID_MODE gets one and
+     * only one retry. The compile-gated override remains the drill seam. */
+    GstLibuvcProbePolicy probe_policy = PROBE_POLICY_RETRY;
+#ifdef LIBUVCH264SRC_PROBE_POLICY_OVERRIDE
+    const gchar *probe_policy_override = g_getenv("LIBUVCH264SRC_PROBE_POLICY");
+    if (probe_policy_override != NULL) {
+        if (g_str_equal(probe_policy_override, "single")) {
+            probe_policy = PROBE_POLICY_SINGLE;
+        } else if (g_str_equal(probe_policy_override, "double")) {
+            probe_policy = PROBE_POLICY_DOUBLE;
+        } else if (g_str_equal(probe_policy_override, "retry")) {
+            probe_policy = PROBE_POLICY_RETRY;
+        } else {
+            GST_WARNING_OBJECT(self,
+                "Ignoring invalid LIBUVCH264SRC_PROBE_POLICY value '%s'",
+                probe_policy_override);
+        }
     }
+#endif
 
-    int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
-                                              self->frame_format, width, height, framerate);
+    int res = gst_libuvc_h264_src_probe_stream_ctrl(self, width, height,
+                                                    framerate, probe_policy);
     if (res < 0) {
         GST_ERROR_OBJECT(self, "Unable to get stream control: %s", uvc_strerror(res));
         goto out;

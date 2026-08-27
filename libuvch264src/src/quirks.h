@@ -29,19 +29,21 @@
 
 G_BEGIN_DECLS
 
-/* Quirk flags. A row's `flags` is the OR of the workarounds that device needs.
- *
- *   QUIRK_DOUBLE_PROBE  Issue uvc_get_stream_ctrl_format_size() TWICE, discarding
- *                       the first result. Works around cameras that return a
- *                       stale/rejected stream control on the first probe
- *                       (libuvc issue #242).
+/* Stream-control probing is no longer a per-device quirk. The recorded G1
+ * verdict (`retry_runs=1 failures=0 undersized_classes=0`) made one retry on
+ * UVC_ERROR_INVALID_MODE the default for every device; a successful first probe
+ * still stops immediately. Quirk rows now carry device-specific limits only.
  *
  *   QUIRK_MAX_PIXEL_RATE  The device advertises frame intervals it cannot
  *                       actually deliver, so descriptor-truth != device-truth.
- *                       The row's `max_pixel_rate` is the highest
- *                       width x height x fps that has been PROVEN to stream;
- *                       negotiation drops every advertised rate above it. */
-#define QUIRK_DOUBLE_PROBE   (1u << 0)
+ *                       The row's `max_pixel_rate` is PARKED at the highest
+ *                       width x height x fps that has been confirmed good on
+ *                       real hardware - deliberately not the highest rate the
+ *                       device has ever been seen to produce, because a cap set
+ *                       too low only costs resolution while a cap set too high
+ *                       costs the whole stream. Negotiation drops every
+ *                       advertised rate above it. See quirks.c for the per-row
+ *                       evidence and the bar for moving the number. */
 #define QUIRK_MAX_PIXEL_RATE (1u << 1)
 
 /* One quirk table row: a USB vendor:product ID mapped to its quirk flags, plus

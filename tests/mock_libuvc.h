@@ -77,6 +77,36 @@ typedef enum {
   MOCK_UVC_PAYLOAD_REJECT,
 } mock_uvc_payload_mode_t;
 
+/* How the mock's uvc_get_stream_ctrl_format_size() answers a probe.
+ *
+ * PROVISIONAL MODEL - to be validated against the Drill A board capture before
+ * anything is built on top of it. What is MEASURED (192.168.78.131, 2026-07-30,
+ * one probe vs two, same binary otherwise) is the OUTCOME and its DIRECTION:
+ *
+ *   1280x720@30  -> 1920x1080@30   1 probe: 3/3 FAIL    2 probes: 3/3 pass
+ *   1920x1080@30 -> 3840x2160@60   1 probe: 20/20 FAIL  2 probes: 4/4 pass
+ *   same mode again, or SMALLER    1 probe: pass
+ *
+ * 23/23 failures on a mode INCREASE, 0 otherwise. The MECHANISM behind that
+ * direction-specificity is what stays provisional: libuvc SET_CURs the control
+ * it wants, GET_CURs it back and rejects the mode when the readback disagrees
+ * (_uvc_stream_params_negotiated, libuvc src/stream.c), and the Osmo answers the
+ * first GET_CUR out of its previously committed mode - but a bFrameIndex
+ * comparison alone would reject a DECREASE just as readily, and decreases
+ * measurably pass. So this mock reproduces the measured asymmetry directly
+ * rather than deriving it from an unproven mechanism, and deliberately does NOT
+ * model a symmetric "always answer from the previous mode" device. */
+typedef enum {
+  /* Every probe succeeds on its first call - the historic behavior, and what
+   * every pre-existing test in the suite sees. */
+  MOCK_UVC_PROBE_HEALTHY = 0,
+  /* The FIRST probe of a mode LARGER (by width x height x fps) than the mock's
+   * tracked last-committed mode returns UVC_ERROR_INVALID_MODE; an immediate
+   * second probe of that SAME mode succeeds and commits it. A request at or
+   * below the committed mode succeeds first try. */
+  MOCK_UVC_PROBE_STALE_READBACK,
+} mock_uvc_probe_mode_t;
+
 /* Shape of the single format/frame descriptor uvc_get_format_descs() advertises,
  * used to exercise the element's negotiate() edge cases. */
 typedef enum {
@@ -208,9 +238,9 @@ uint32_t mock_uvc_last_started_payload(void);
  * extra probe (max-payload unset = byte-for-byte unchanged negotiation). */
 int mock_uvc_probe_call_count(void);
 
-/* uvc_get_stream_ctrl_format_size() calls since reset (Task 12 quirk seam). A
- * default negotiation issues exactly 1; a device keyed to QUIRK_DOUBLE_PROBE
- * issues exactly 2 (the first result discarded). */
+/* uvc_get_stream_ctrl_format_size() calls since reset. A healthy default
+ * negotiation issues exactly 1; an initial UVC_ERROR_INVALID_MODE permits one
+ * retry, for exactly 2 total attempts. */
 int mock_uvc_format_size_call_count(void);
 
 /* Transfer-buffers observability (A2 fork uvc_set_transfer_buffers). The last
@@ -239,6 +269,28 @@ void mock_uvc_set_start_streaming_result(uvc_error_t result);
  * assertable. Set it AFTER the initial open so only the reopens fail. 0
  * (default) injects no failure. */
 void mock_uvc_set_reopen_fail_count(int n);
+
+/* Arm or disarm the stale-readback probe model; see mock_uvc_probe_mode_t.
+ * MOCK_UVC_PROBE_HEALTHY is the default, so an unarmed target's negotiation is
+ * byte-for-byte what it always was. */
+void mock_uvc_set_probe_mode(mock_uvc_probe_mode_t mode);
+
+/* Seed the mode the mock treats as already committed on the device, which is
+ * what STALE_READBACK compares an incoming probe against. Reset clears it to
+ * 0x0@0, so with nothing seeded EVERY mode counts as an increase. A successful
+ * probe commits its own mode, exactly as the device does. */
+void mock_uvc_set_committed_mode(int width, int height, int fps);
+
+/* Fail the NEXT uvc_get_stream_ctrl_format_size() with `err` (one-shot: the call
+ * after it behaves normally), ahead of and independent of the stale-readback
+ * model. For the error codes a probe retry must NOT swallow - UVC_ERROR_PIPE and
+ * UVC_ERROR_NO_DEVICE. UVC_SUCCESS (the default) disarms it. */
+void mock_uvc_set_first_probe_error(uvc_error_t err);
+
+/* What the LAST uvc_get_stream_ctrl_format_size() returned. Lets a test prove
+ * negotiation failed on the specific error the model injected (INVALID_MODE)
+ * rather than merely failing to produce a buffer. */
+uvc_error_t mock_uvc_last_format_size_result(void);
 
 #ifdef __cplusplus
 }

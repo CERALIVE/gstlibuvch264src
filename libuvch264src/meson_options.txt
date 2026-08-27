@@ -1,0 +1,2 @@
+option('probe_policy_override', type: 'boolean', value: false,
+  description: 'Enable the development-only LIBUVCH264SRC_PROBE_POLICY environment override')

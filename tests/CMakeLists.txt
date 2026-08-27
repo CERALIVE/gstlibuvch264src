@@ -924,28 +924,47 @@ endif()
 # the test seam is gated by this PRIVATE compile definition.
 # -----------------------------------------------------------------------------
 add_static_gstcheck_exe(test_quirks)
-target_compile_definitions(test_quirks PRIVATE LIBUVCH264SRC_TESTING)
+target_compile_definitions(test_quirks PRIVATE
+  LIBUVCH264SRC_TESTING
+  LIBUVCH264SRC_PROBE_POLICY_OVERRIDE)
 
 set(_quirks_cases
   "quirks_lookup_hit:test_quirks_lookup_hit"
   "quirks_lookup_miss:test_quirks_lookup_miss"
   "quirks_production_table_untouched:test_quirks_production_table_unrelated_devices_untouched"
-  "quirks_double_probe:test_quirks_double_probe"
-  "quirks_empty_table_single_probe:test_quirks_empty_table_single_probe"
+  "quirks_max_rate_row_healthy_once:test_quirks_max_rate_row_healthy_probes_once"
+  "quirks_unmatched_row_healthy_once:test_quirks_unmatched_row_healthy_probes_once"
   "quirks_osmo_row_caps_phantom_rates:test_quirks_osmo_row_caps_phantom_rates"
   "quirks_max_fps_ceiling:test_quirks_max_fps_ceiling"
+  "quirks_synthetic_row_discrete_filter:test_quirks_synthetic_row_filters_discrete_list"
+  "quirks_synthetic_row_range_clamp:test_quirks_synthetic_row_clamps_fraction_range"
+  "quirks_synthetic_row_drop_empty:test_quirks_synthetic_row_drops_empty_mode"
+  "quirks_synthetic_row_max_fps:test_quirks_synthetic_row_max_fps_ceiling"
   "quirks_limits_pure_lookup:test_quirks_limits_pure_lookup"
   "quirks_ladder_no_quirk_picks_4k60:test_quirks_ladder_without_quirk_picks_phantom_4k60"
   "quirks_ladder_osmo_avoids_phantom:test_quirks_ladder_with_osmo_quirk_avoids_phantom"
-  "quirks_osmo_row_double_probes:test_quirks_osmo_row_double_probes_and_still_caps"
+  "quirks_osmo_row_healthy_once:test_quirks_osmo_row_healthy_probe_once_and_still_caps"
   "quirks_deliverable_caps_excludes_phantom:test_quirks_deliverable_caps_excludes_the_phantom_rates"
   "quirks_deliverable_caps_unquirked_intact:test_quirks_deliverable_caps_unquirked_keeps_every_rate"
   "quirks_filter_signal_agrees:test_quirks_filter_signal_agrees_with_the_open_device_ladder"
   "quirks_filter_signal_unquirked_noop:test_quirks_filter_signal_leaves_an_unquirked_device_untouched"
+  "quirks_stale_disarmed_osmo_probes_once:test_quirks_stale_model_disarmed_osmo_row_probes_once"
+  "quirks_stale_disarmed_unquirked_probes_once:test_quirks_stale_model_disarmed_unquirked_probes_once"
+  "quirks_stale_readback_default_recovers:test_quirks_stale_readback_default_retry_recovers"
+  "quirks_stale_readback_default_directional:test_quirks_stale_readback_default_retry_is_directional"
+  "probe_policy_default_invalid_mode:test_probe_policy_default_recovers_invalid_mode_once"
+  "probe_policy_default_attempt_cap:test_probe_policy_default_stops_after_second_invalid_mode"
+  "probe_policy_default_pipe:test_probe_policy_default_propagates_pipe_without_retry"
+  "probe_policy_default_no_device:test_probe_policy_default_propagates_no_device_without_retry"
+  "probe_policy_default_healthy_once:test_probe_policy_default_healthy_device_probes_once"
+  "probe_policy_retry_override:test_probe_policy_retry_override_recovers_invalid_mode_once"
+  "probe_policy_single_overrides_default:test_probe_policy_single_overrides_default_retry"
+  "probe_policy_double_attempt_cap:test_probe_policy_double_is_capped_at_two_attempts"
+  "probe_policy_invalid_value:test_probe_policy_invalid_value_warns_once_and_uses_default"
 )
-# The double-probe, empty-table and two ladder cases enter PLAYING -> start(),
-# which may spawn the control thread, so keep them off the shared control-socket
-# resource like the other start()-driven suites (RESOURCE_LOCK, applied by helper).
+# These cases enter PLAYING -> start(), which may spawn the control thread, so
+# keep them off the shared control-socket resource like the other start()-driven
+# suites (RESOURCE_LOCK, applied by helper).
 add_gstcheck_multicase_test(test_quirks "quirks"
   "${STATIC_SUITE_SANITIZER}" "${_quirks_cases}")
 
