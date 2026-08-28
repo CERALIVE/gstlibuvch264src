@@ -85,6 +85,9 @@
 #       negotiation failures were recorded. A Drill A baseline that REPRODUCES
 #       the defect therefore ends VERDICT: FAIL / exit 1 - that is the honest
 #       machine statement about the single-probe policy, not a harness error.
+#       Both legs are required evidence: a commit leg that produces no AUs is
+#       INCONCLUSIVE, while a subject transcript containing an element error is
+#       FAIL. Only a genuinely signal-free zero-AU subject is INCONCLUSIVE.
 #       Read RULE_A_BRANCH for the branch decision, never the exit code.
 #
 #   phantom --env <env> --mode <WxH@fps> [--mode ...] [--policy <p>]
@@ -996,6 +999,19 @@ transition_pairs_for_class() {
   esac
 }
 
+transition_result_kind() {
+  local aus=$1 errors=$2 invalid_mode=$3
+  if [ "$invalid_mode" -gt 0 ]; then
+    echo invalid-mode
+  elif [ "$errors" -gt 0 ]; then
+    echo error
+  elif [ "$aus" -eq 0 ]; then
+    echo no-aus
+  else
+    echo pass
+  fi
+}
+
 cmd_transition() {
   require_gate; require_env_name; require_root
   require_tools gst-launch-1.0 timeout sha256sum lsusb awk
@@ -1016,7 +1032,8 @@ cmd_transition() {
 
   record "MODE: transition policy=$POLICY repeat=$n classes=${classes[*]} vid_pid=$VID_PID"
 
-  local class pair from to i idx=0 fails total inconclusive commit_aus
+  local class pair from to i idx=0 fails total inconclusive
+  local commit_aus commit_errors commit_invalid_mode commit_kind subject_kind
   local -a class_pairs=()
   local increase_fails=0 increase_total=0
   local any_fail=0 any_inconclusive=0
@@ -1034,14 +1051,24 @@ cmd_transition() {
       log "--- $class replicate $i/$n: commit $from then negotiate $to ---"
       gst_run "$RUNDIR/t$(printf '%03d' "$idx")-commit.log" "$from" "$COMMIT_BUFFERS"
       commit_aus=$RUN_AUS
+      commit_errors=$RUN_ERRORS
+      commit_invalid_mode=$RUN_INVALID_MODE
+      commit_kind=$(transition_result_kind "$commit_aus" "$commit_errors" "$commit_invalid_mode")
       sleep 2
       gst_run "$RUNDIR/t$(printf '%03d' "$idx")-subject.log" "$to" "$SUBJECT_BUFFERS"
+      subject_kind=$(transition_result_kind "$RUN_AUS" "$RUN_ERRORS" "$RUN_INVALID_MODE")
       total=$((total + 1))
 
-      if [ "$RUN_INVALID_MODE" -gt 0 ]; then
+      if [ "$commit_kind" != pass ]; then
+        inconclusive=$((inconclusive + 1))
+        record "TRANSITION: INCONCLUSIVE class=$class replicate=$i from=$from to=$to reason=commit-$commit_kind commit_aus=$commit_aus commit_errors=$commit_errors commit_invalid_mode=$commit_invalid_mode"
+      elif [ "$subject_kind" = invalid-mode ]; then
         fails=$((fails + 1))
         record "TRANSITION: FAIL class=$class replicate=$i from=$from to=$to invalid_mode=$RUN_INVALID_MODE commit_aus=$commit_aus"
-      elif [ "$RUN_AUS" -eq 0 ]; then
+      elif [ "$subject_kind" = error ]; then
+        fails=$((fails + 1))
+        record "TRANSITION: FAIL class=$class replicate=$i from=$from to=$to element_errors=$RUN_ERRORS commit_aus=$commit_aus"
+      elif [ "$subject_kind" = no-aus ]; then
         inconclusive=$((inconclusive + 1))
         record "TRANSITION: INCONCLUSIVE class=$class replicate=$i from=$from to=$to reason=no-aus-no-error commit_aus=$commit_aus"
       else

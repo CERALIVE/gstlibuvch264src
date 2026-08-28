@@ -56,9 +56,16 @@ EOF
   assert_equal 1.000 "$fps" "malformed-PTS wall fallback fps"
   assert_equal wall-fallback "$source" "malformed-PTS fallback source"
 
+  transition_kind=$(transition_result_kind 0 2 0 2>/dev/null || true)
+  assert_equal error "$transition_kind" "zero-AU element error classification"
+  assert_equal invalid-mode "$(transition_result_kind 0 0 1)" "invalid-mode classification"
+  assert_equal no-aus "$(transition_result_kind 0 0 0)" "signal-free zero-AU classification"
+  assert_equal pass "$(transition_result_kind 30 0 0)" "successful transition classification"
+
   printf 'OLD_METHOD: wall=1.400s fps=%s floor=27.000 verdict=%s\n' "$old_fps" "$old_verdict"
   printf 'NEW_METHOD: wall=1.400s stream=%ss fps=%s source=%s floor=27.000 verdict=%s\n' \
     "0.100000000" "30.000" "pts-span" "$new_verdict"
   printf 'FALLBACKS: one-frame=PASS malformed-pts=PASS source=wall-fallback\n'
+  printf 'TRANSITION_CLASSIFICATION: element-error=FAIL invalid-mode=FAIL no-signal=INCONCLUSIVE pass=PASS\n'
   printf 'PASS: negotiation-matrix PTS-span scoring self-test\n'
 fi
