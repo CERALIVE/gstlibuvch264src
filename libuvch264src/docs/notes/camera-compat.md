@@ -244,17 +244,19 @@ bounded retry fixes. The cold-start and after-replug cells were formally recorde
 as `SKIPPED reason=unattended`; they were not counted as passes. The conservative
 aggregate therefore retains the verified 4K@30 ceiling.
 
-**Shipping-build timing caveat (2026-08-27).** Two independent production-build
-confirmations exposed an occasional early-stream timing transient at 4K@30: 2 of
-20 runs fell below the harness's whole-process 27 fps floor. Both still delivered
-all 300/300 access units at SPS-verified `3840x2160`, with zero element errors and
-zero invalid-mode errors. Frame-level PTS analysis found no sustained slowdown.
-One run waited about 1.33 s for its first frame and then held normal cadence for
-all 299 subsequent intervals; the other had exactly one 0.423 s gap between
-frames 2 and 3, with every remaining interval normally paced. This is consistent
-with USB isochronous-transfer scheduling settling near stream start. Treat it as
-an operational startup caveat, not evidence that the camera cannot deliver
-4K@30; the retained 248 832 000 px/s ceiling remains the measured safe ceiling.
+**Shipping-build timing correction (2026-08-28).** Three initial production-build
+confirmation cells each emitted `VERDICT: FAIL` at 9/10 because the harness
+computed fps as AU count divided by whole-process wall time, including process
+spawn, negotiation, and USB/libuvc startup. The harness's `run_rate_metrics()`
+now scores sustained delivery rate from
+`(AU count - 1) / (last AU PTS - first AU PTS)` instead. The corrected
+function re-scored all 30 preserved captures as passing at 27.725–29.976 fps, and
+a fresh live shipping-build cell then emitted `VERDICT: PASS` at 10/10 with
+`fps_source=pts-span` on every replicate (27.859–29.969 fps). Every capture
+delivered 300/300 access units at SPS-verified `3840x2160`, with zero element
+errors. The original three FAIL outputs remain historical facts about the buggy
+wall-clock scorer; the corrected live script verdict is the shipping confirmation.
+The retained 248 832 000 px/s ceiling is confirmed.
 
 **Verdict scope:** these 2026-08-27 probe and cap results apply to the tested DJI
 Osmo Pocket 3 `2ca3:0023`, `bcdDevice 5.04`, firmware/product string
