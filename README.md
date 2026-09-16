@@ -1,13 +1,23 @@
-# gstlibuvch264src
+# gstlibuvcsrc
 
-GStreamer source element for UVC H.264 (and H.265) capture devices — DJI action cameras and compatible USB UVC hardware. Developed by UnlimitedIRL; forked and maintained under CeraLive.
+Portable userspace libuvc GStreamer source for UVC **H.264 and H.265** devices.
+Capture works on any kernel/platform with the required userspace dependencies
+and USB access; it is not Rockchip-specific or limited to a kernel version.
+Actual camera modes depend on descriptors and deliverable-caps policy, not a
+blanket hardware qualification. Developed by UnlimitedIRL; maintained by CeraLive.
+
+Use **`libuvcsrc`**. `libuvch264src` and `libuvch26xsrc` remain working aliases
+of the same implementation. The package is **`gstreamer1.0-libuvcsrc`**, with
+versioned `Provides`, `Replaces` and `Conflicts` for `gstreamer1.0-libuvch264src`.
+Production packages target Debian 13 Trixie; Bookworm source-build CI is retained.
+The single plugin binary and libuvc SONAMEs do not change.
 
 Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths bypass this element entirely.
 
 > **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in `ceralive-v0.0.7.9`, SHA `ada082b5009e38a89eb7cd6176683b508cd99ff5`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
-[![CI](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/build-check.yml)
-[![Release](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvch264src/actions/workflows/publish-release.yml)
+[![CI](https://github.com/CERALIVE/gstlibuvcsrc/actions/workflows/build-check.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvcsrc/actions/workflows/build-check.yml)
+[![Release](https://github.com/CERALIVE/gstlibuvcsrc/actions/workflows/publish-release.yml/badge.svg)](https://github.com/CERALIVE/gstlibuvcsrc/actions/workflows/publish-release.yml)
 
 ---
 
@@ -15,18 +25,18 @@ Feeds raw H.264/H.265 bitstream into the cerastream pipeline. HDMI capture paths
 
 ### H.264 — Basic Capture
 
-**Display on HDMI output (Rockchip, kernel 6.6):**
+**Display with a mainline V4L2 decoder (including 7.2, when available):**
 ```
-gst-launch-1.0 libuvch264src index=0 \
+gst-launch-1.0 libuvcsrc index=0 \
   ! video/x-h264,width=1920,height=1080,framerate=30/1 \
   ! queue ! h264parse ! queue ! v4l2slh264dec ! queue ! videoconvert ! kmssink
 ```
 
-**Display on HDMI output (Rockchip, kernel 5.10):**
+**Display on RK3588 with the CeraLive 7.2 island stack:**
 ```
-gst-launch-1.0 libuvch264src index=0 \
+gst-launch-1.0 libuvcsrc index=0 \
   ! video/x-h264,width=1920,height=1080,framerate=30/1 \
-  ! queue ! h264parse ! queue ! mppvideodec ! queue ! videoconvert ! kmssink
+  ! queue ! h264parse ! queue ! mppvideodec ! queue ! rgaconvert ! kmssink
 ```
 
 **Select device by USB serial number:**
@@ -52,20 +62,20 @@ gst-launch-1.0 libuvch264src index=0 pan=18000 tilt=0 zoom=100 \
 
 ### H.265 — Capture and Decode
 
-Use the `libuvch26xsrc` alias when working with H.265. It registers the same element under a dual-codec name that makes the codec intent explicit.
+Use `libuvcsrc` for either codec; select the codec with caps, not a factory name.
 
-**H.265 decode to display (Rockchip, kernel 6.6):**
+**H.265 display with a mainline V4L2 decoder (including 7.2, when available):**
 ```
-gst-launch-1.0 libuvch26xsrc index=0 \
+gst-launch-1.0 libuvcsrc index=0 \
   ! video/x-h265,width=1920,height=1080,framerate=30/1 \
   ! queue ! h265parse ! queue ! v4l2slh265dec ! queue ! videoconvert ! kmssink
 ```
 
-**H.265 decode to display (Rockchip, kernel 5.10):**
+**H.265 display on RK3588 with the CeraLive 7.2 island stack:**
 ```
-gst-launch-1.0 libuvch26xsrc index=0 \
+gst-launch-1.0 libuvcsrc index=0 \
   ! video/x-h265,width=1920,height=1080,framerate=30/1 \
-  ! queue ! h265parse ! queue ! mppvideodec ! queue ! videoconvert ! kmssink
+  ! queue ! h265parse ! queue ! mppvideodec ! queue ! rgaconvert ! kmssink
 ```
 
 **H.265 capture by serial number — pipe to fakesink for testing:**
@@ -197,7 +207,7 @@ gst-launch-1.0 libuvch264src index="1234:5678" \
 
 ---
 
-### Wedged-device recovery (always on)
+### Wedged-device recovery (enabled by default)
 
 A UVC device can go silent while still fully present on the bus — enumerated and
 answering every control transfer, but delivering nothing. A close/reopen does not
@@ -205,8 +215,9 @@ clear that state; only a USB port reset does. Before reporting a disconnect the
 element therefore issues one `libusb_reset_device()`, then polls for the device
 to re-enumerate, reopens, and waits for a real frame — because a successful
 `uvc_start_streaming()` on a still-wedged device returns OK and delivers nothing,
-so only a delivered frame proves recovery. This needs no configuration and no
-extra privilege, and a genuinely unplugged device still surfaces the usual
+so only a delivered frame proves recovery. With `reconnect=false`, the default
+`auto-port-reset=true` enables this attempt; disabling it skips the reset. USB
+access still requires appropriate permissions. A genuinely unplugged device surfaces the usual
 `RESOURCE/READ` error (the reset simply fails).
 
 Nothing here is timed against a particular camera: recovery finishes as soon as
@@ -261,8 +272,8 @@ gst-launch-1.0 libuvch264src index=0 deep-port-recovery=true \
 
 Set `reconnect=true` to enable in-element auto-reconnect when the device is unplugged
 mid-stream. The element retries with exponential backoff (1, 2, 4, 8, 16 s; up to 5
-attempts) before posting an error. Default is `false` — a disconnect immediately ends
-the stream.
+attempts) before posting an error. Default is `false` — the one-shot wedge recovery
+runs first when `auto-port-reset=true`, then an unrecovered disconnect ends the stream.
 
 A `vid:pid` or `serial:` selector survives a replug (bus address can change). An ordinal
 or `bus:` selector may resolve to a different physical device after replug.
@@ -325,14 +336,24 @@ g_free(path);
 
 ---
 
-### Rockchip decoder/encoder reference
+### Downstream pairing, not capture compatibility
 
-| Kernel | H.264 decoder | H.265 decoder | Encoder (both codecs) |
-|--------|---------------|---------------|-----------------------|
-| 5.10   | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
-| 6.6    | `v4l2slh264dec` | `v4l2slh265dec` | `mpph264enc` / `mpph265enc` |
+| Kernel / configured variant | H.264 decoder | H.265 decoder | Encoder |
+|---|---|---|---|
+| 5.10 with MPP drivers/userspace | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
+| 6.6 mainline V4L2 decode | `v4l2slh264dec` | `v4l2slh265dec` | Depends on installed encoder driver/userspace |
+| 7.2 mainline | V4L2 elements available | V4L2 elements available | Depends on installed encoder driver/userspace |
+| 7.2 with CeraLive island — RK3588-optimised | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
 
-On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP layer. On kernel 6.6, the V4L2 stateless decoders are codec-specific.
+Decoder/encoder availability depends on the installed driver/UAPI and matching
+userspace, not a kernel cutoff. CeraLive's RK3588 variant uses its MPP elements,
+`rgaconvert`, librga fork and island drivers; generic upstream acceleration is not
+a production fallback. Other platforms select their own downstream elements.
+Which sources the kernel exposes through UVC/V4L2 varies with kernel UVC support;
+that is separate from both libuvc capture portability and downstream pairing.
+
+For H.26x capture, the [v4l2src evaluation](libuvch264src/docs/notes/v4l2src-spike.md)
+concludes **VERDICT: NOT-VIABLE**: no generic V4L2 replacement or fallback.
 
 ---
 
@@ -372,8 +393,12 @@ This element stamps PTS as pipeline running-time. Residual A/V drift with a Blue
 | `reset-rearm-frames` | uint | `30` | Frames the device must deliver after a recovery before the one-shot port reset re-arms for a later wedge |
 | `auto-port-reset` | bool | `true` | Issue the silence-triggered USB port reset; set `false` to skip `USBDEVFS_RESET` and use normal disconnect handling |
 | `deep-port-recovery` | bool | `false` | Escalate once more when the port reset AND its reopens have both failed: a device-level `authorized` re-probe, or a port-level `disable` cycle if the device no longer enumerates. Needs root; never runs on a hub carrying another device. Off by default — proven to fire on hardware, not proven to recover |
+| `deliverable-caps` | GstCaps, read-only | `NULL` | Post-quirk mode ladder; NULL means unknown, not empty |
 
 Action signal: `set-ptz(pan, tilt, zoom)` — drives all three axes in one call; returns `TRUE` if at least one supported axis succeeded.
+
+Action signal: `filter-deliverable-caps(advertised, vendor-id, product-id)` — pure
+post-quirk caps filtering without opening hardware, shared with negotiation.
 
 ---
 

@@ -1,10 +1,11 @@
 # Multi-architecture support (driven by buildx --platform; CI builds amd64 + arm64)
 ARG TARGETARCH
 
-# Base pinned to a digest (not the mutable :latest / floating :bookworm tag) so the
+# Base pinned to a digest (not the mutable :latest / floating :trixie tag) so the
 # build is reproducible and verifiable offline. Refresh via:
-#   docker buildx imagetools inspect debian:bookworm-slim   (use the index Digest)
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS build
+#   docker buildx imagetools inspect debian:trixie-slim   (use the index Digest)
+ARG BUILD_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM ${BUILD_BASE} AS build
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -38,7 +39,7 @@ COPY . /app
 # Source selected by the LIBUVC_USE_FORK build arg (see the ADR at
 # libuvch264src/docs/notes/libuvc-fork-adr.md):
 #
-#   1 (default): CeraLive/libuvc fork at the pinned ceralive-v0.0.7.8 SHA. The
+#   1 (default): CeraLive/libuvc fork at the SHA in scripts/build-libuvc.sh. The
 #                three changes are commits on the fork, so NO patch(1) step runs.
 #   0 (rollback): upstream v0.0.7 at its pinned SHA + the UVC 1.5 / H.265 patches
 #                from patches/ (the pre-fork path). Build with

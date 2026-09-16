@@ -15,10 +15,11 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.config.arch }}
+    name: Build ${{ matrix.config.arch }} (${{ matrix.suite }})
     runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:
+        suite: [trixie, bookworm]
         config:
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -37,12 +38,23 @@ jobs:
           context: .
           outputs: build
           platforms: linux/${{ matrix.config.arch }}
+          build-args: |
+            BUILD_BASE=${{ matrix.suite == 'bookworm' && 'debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df' || 'debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132' }}
           cache-from: type=gha,scope=${{ matrix.config.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.config.arch }}
 
       - name: Verify plugin was built
         run: |
           ls -la build/usr/lib/*/gstreamer-1.0/
+
+      - name: Package contract (production Trixie)
+        if: matrix.suite == 'trixie'
+        env:
+          VERSION: 0.0.0
+          ARCH: ${{ matrix.config.arch }}
+        run: |
+          bash scripts/build-deb.sh
+          bash tests/package-contract.sh "dist/gstreamer1.0-libuvcsrc_${VERSION}_${ARCH}.deb"
 
       - name: Build Summary
         run: |

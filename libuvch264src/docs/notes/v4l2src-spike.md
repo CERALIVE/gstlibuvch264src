@@ -23,7 +23,7 @@ element's primary target, on **either** kernel (5.10 or 6.6), because the
 device's UVC descriptors make `uvcvideo` fail buffer setup before a single frame
 is delivered. It *could* in principle capture from a spec-compliant generic UVC
 H.264/H.265 camera, but doing so would forfeit the in-band SPS/PPS injection,
-the XU/vendor PTZ control mapping, the silence-based disconnect detection, the
+the standard UVC Camera-Terminal PTZ surface, the silence-based disconnect detection, the
 in-element reconnect, and the running-time PTS contract that `cerastream`
 currently relies on — replacing one well-understood element with a
 device-class-dependent split path and a pile of downstream regressions. The
@@ -82,9 +82,9 @@ path on both kernels in the CeraLive matrix:
 | 5.10   | `sizeimage` derived as 0; `REQBUFS` cannot size compressed buffers | capture fails |
 | 6.6    | same descriptor-driven sizing; same `REQBUFS` failure | capture fails |
 
-The Rockchip **decoder** generation differs across these kernels (`mppvideodec`
-on 5.10; codec-specific `v4l2slh264dec`/`v4l2slh265dec` on 6.6 — README/AGENTS
-decoder matrix), but that is the *decode* leg, downstream of capture. The
+The **decoder** is selected by the installed platform variant, driver/UAPI and
+userspace, not a kernel cutoff. Mainline 7.2 offers V4L2 elements; the CeraLive
+7.2 island uses MPP elements optimised for RK3588. That is the *decode* leg. The
 capture-side `uvcvideo`→`v4l2src` buffer-allocation failure is upstream of the
 decoder and is identical on both. Changing the decoder does nothing for it.
 
@@ -153,7 +153,7 @@ DJI — buys nothing and adds real cost:
   starvation, format-enum quirks) and its own test matrix — none of which the
   current mock-backed ctest suite covers.
 - **Feature divergence between paths.** Everything in §3 (SPS/PPS injection,
-  XU/PTZ mapping, silence-based disconnect, reconnect, PTS policy) exists in the
+   standard PTZ surface, silence-based disconnect, reconnect, PTS policy) exists in the
   libuvc path and is **absent** from a bare `v4l2src`. A device routed to
   `v4l2src` silently loses all of it, so the two paths are not behaviorally
   interchangeable from `cerastream`'s point of view.
@@ -163,10 +163,9 @@ DJI — buys nothing and adds real cost:
   `v4l2src` would, at best, duplicate a path libuvc already serves while
   dropping that path's features. The net is strictly negative.
 
-There is one legitimate, *non-capture* reason to keep V4L2 in view: the Rockchip
-**decode** side genuinely is V4L2 (`v4l2slh264dec`/`v4l2slh265dec` on 6.6,
-`mppvideodec` via MPP on 5.10). That is orthogonal to this spike — it is
-downstream of `h264parse` and unaffected by how frames are *captured*.
+V4L2 decode on a mainline variant is orthogonal to this spike. The CeraLive
+RK3588 island variant uses MPP decode. Both are downstream of parsing and
+independent of how frames are *captured*.
 
 ---
 
@@ -178,8 +177,9 @@ on. Each item below is a concrete regression.
 
 ### 3.1 Loss of in-band SPS/PPS (and VPS) injection
 
-`frame_pipeline.c` does work `v4l2src` does not. On every IDR it re-prepends the
-cached parameter sets so each keyframe is independently decodable:
+`frame_pipeline.c` prepends cached SPS/PPS/VPS on the first IDR and on later
+IDRs when parameter-set reception has re-armed insertion. It does not promise
+unconditional insertion on every keyframe:
 
 ```c
 case UNIT_FRAME_IDR:
@@ -206,24 +206,14 @@ the pipeline what the source already does in one place, and only partially
 (h264parse can only re-send sets it has already *seen*; it cannot cache across
 restarts the way the element's disk cache does).
 
-### 3.2 Loss of XU / vendor PTZ control mapping
+### 3.2 Loss of the standard UVC PTZ control surface
 
-The element exposes `pan`/`tilt`/`zoom` GObject properties and a `set-ptz`
-action signal, plus an opt-in Unix-domain control socket, all routed through
-capability-gated libuvc control calls (`ptz_control.c`). DJI/UVC PTZ and many
-vendor features live in **UVC Extension Units (XU)**, which `v4l2src` does not
-surface at all. Driving them through V4L2 would require:
-
-- `UVCIOC_CTRL_MAP` ioctls to map each vendor XU control onto a V4L2 control ID
-  (a separate, error-prone registration step, often needing exact GUID + unit ID
-  + selector + size, frequently root-only), and
-- a parallel re-implementation of the clamping, the capability gate (silently
-  ignore an axis the device does not report), the shared pan/tilt control
-  re-send, and the JSON control-socket surface —
-
-none of which `v4l2src` provides. The current programmatic control surface used
-by cerastream/CeraUI (`g_object_set` / `set-ptz`) would simply stop existing and
-would have to be rebuilt against `VIDIOC_S_CTRL` plus `UVCIOC_CTRL_MAP`.
+The element exposes `pan`/`tilt`/`zoom` properties, a `set-ptz` action and an
+optional socket through capability-gated standard Camera-Terminal calls:
+`uvc_get/set_pantilt_abs` and `uvc_get/set_zoom_abs`. A V4L2 replacement would
+need to preserve the capability gate, clamping, shared pan/tilt re-send and
+programmatic/socket interfaces. Vendor-XU controls are **not implemented**;
+the separate DJI XU investigation is report-only, not a feature lost here.
 
 ### 3.3 Disconnect handling — worse, and kernel-version-dependent
 
@@ -278,7 +268,8 @@ latency budgeting — and would need re-validation end to end.
 
 `cerastream` consumes this element for both `InputKind::UvcH264` (negotiated to
 `video/x-h264`) and `InputKind::UvcH265` (`video/x-h265`) via the
-`libuvch26xsrc` dual-codec factory. It depends on the element's properties
+`libuvch264src` compatibility factory, the same implementation as canonical
+`libuvcsrc` and alias `libuvch26xsrc`. It depends on the element's properties
 (`index` device selection by ordinal/`vid:pid`/`serial`/`bus`, `pan`/`tilt`/
 `zoom`, `reconnect`, the control socket) and on the `RESOURCE, READ` disconnect
 error. A `v4l2src`-based source would change the element factory, the device
@@ -302,14 +293,13 @@ unified capture path for both DJI and generic UVC H.264/H.265 devices.
    a working path while dropping that path's features and adding a routing
    front-end and a second test matrix.
 3. **The feature loss is severe and load-bearing:** in-band SPS/PPS/VPS
-   injection, IDR gating, XU/vendor PTZ via properties + socket, silence-based
+   injection, IDR gating, standard UVC PTZ via properties + socket, silence-based
    disconnect, in-element reconnect, and the running-time PTS contract — all
    relied on by `cerastream` and the SRT chain — vanish with a bare `v4l2src`.
 4. **Keep V4L2 in its correct role.** V4L2 stays exactly where it already is:
    the cheap, non-fatal `VIDIOC_TRY_FMT` capability probe at `start()`
-   (`uvc_device.c`), and the **decode** leg downstream
-   (`v4l2slh264dec`/`v4l2slh265dec` on 6.6, `mppvideodec`/MPP on 5.10). Neither
-   is capture, and neither is changed by this verdict.
+   (`uvc_device.c`), and optional **decode** on mainline variants. The CeraLive
+   7.2 island selects MPP decode. Neither decoder choice changes this verdict.
 
 **Hardware-test caveat (non-blocking).** The DJI failure mode is established by
 the descriptor analysis and the element's own `sizeimage > 0` probe gate, and is

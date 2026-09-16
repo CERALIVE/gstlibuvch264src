@@ -34,6 +34,31 @@ GST_START_TEST (test_plugin_is_registered)
 
 GST_END_TEST;
 
+GST_START_TEST (test_canonical_factory_matches_aliases)
+{
+  GstElement *canonical = gst_element_factory_make ("libuvcsrc", NULL);
+  fail_unless (canonical != NULL, "canonical libuvcsrc factory not registered");
+  const gchar *aliases[] = { ELEMENT_NAME, ELEMENT_ALIAS };
+  GstPad *canonical_pad = gst_element_get_static_pad (canonical, "src");
+  GstCaps *canonical_caps = gst_pad_get_pad_template_caps (canonical_pad);
+  for (guint i = 0; i < G_N_ELEMENTS (aliases); i++) {
+    GstElement *alias = gst_element_factory_make (aliases[i], NULL);
+    fail_unless (alias != NULL);
+    fail_unless (G_OBJECT_TYPE (canonical) == G_OBJECT_TYPE (alias));
+    GstPad *pad = gst_element_get_static_pad (alias, "src");
+    GstCaps *caps = gst_pad_get_pad_template_caps (pad);
+    fail_unless (gst_caps_is_equal (canonical_caps, caps));
+    gst_caps_unref (caps);
+    gst_object_unref (pad);
+    gst_object_unref (alias);
+  }
+  gst_caps_unref (canonical_caps);
+  gst_object_unref (canonical_pad);
+  gst_object_unref (canonical);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_element_factories_exist)
 {
   GstElementFactory *factory = gst_element_factory_find (ELEMENT_NAME);
@@ -199,6 +224,7 @@ plugin_load_suite (void)
   suite_add_tcase (s, tc);
   tcase_add_test (tc, test_plugin_is_registered);
   tcase_add_test (tc, test_element_factories_exist);
+  tcase_add_test (tc, test_canonical_factory_matches_aliases);
   tcase_add_test (tc, test_element_creates_and_is_pushsrc);
   tcase_add_test (tc, test_element_has_index_property);
   tcase_add_test (tc, test_element_has_ptz_properties);
