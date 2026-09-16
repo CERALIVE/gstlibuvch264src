@@ -404,6 +404,13 @@ post-quirk caps filtering without opening hardware, shared with negotiation.
 
 ## Build Steps
 
+Release Docker builds use digest-pinned Debian 13 Trixie, matching the device
+target suite. Before compilation, the build checks `/etc/os-release` against
+`BUILD_SUITE=trixie`. CI retains Bookworm source-portability builds on arm64 and
+amd64 by explicitly setting both `BUILD_BASE` and `BUILD_SUITE=bookworm`; those
+builds are not the production packages. This does not restrict native source
+builds or the downstream decoder choices described above.
+
 ```bash
 sudo apt install build-essential cmake git meson pkg-config
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
@@ -433,6 +440,9 @@ sudo cp /usr/local/lib/libuvc.* /usr/lib/${MULTIARCH}/
 ## Running Tests
 
 The test suite is hardware-independent — it uses a libuvc mock and does not require a UVC device.
+
+Run `bash tests/build-suite-contract.sh` for the build-container suite gate's
+positive and negative fixtures; this needs no Docker daemon or hardware.
 
 ```bash
 # With sanitizers (recommended)

@@ -368,10 +368,16 @@ libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `f3ed
 **Two stages: pinned Debian 13 Trixie `build`, then `FROM scratch` `runtime`.**
 The production base matches the device target suite. Bookworm remains a separate
 source-portability CI build on both architectures, not the production package base.
+Before installing build dependencies, `scripts/check-build-suite.sh` checks the
+container's actual Debian identity and suite against `BUILD_SUITE` (default
+`trixie`). CI explicitly selects `bookworm` for its portability legs; changing
+only `BUILD_BASE` to the wrong suite fails before compilation. This is a build
+gate, not a restriction on the portable source or its downstream decoder pairing.
 `runtime` carries ONLY `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so`
 and the three `libuvc.so*` entries. Never export a distro `/usr` as the payload.
 `scripts/build-deb.sh` packages that tree with `dpkg-deb`, checks the GLIBC 2.41
-ceiling and libjpeg.so.62 ABI, and declares the Trixie runtime dependencies.
+ceiling and the libuvc ELF dependency `libjpeg.so.62`, and declares the Trixie
+runtime dependencies.
 `tests/package-contract.sh` checks the exact payload and old-name compatibility.
 `GST_PLUGIN_DEFINE` names CeraLive and this repository as package/origin: this is
 a diagnostic metadata judgement, with no change to registration or media behavior.
@@ -379,6 +385,10 @@ a diagnostic metadata judgement, with no change to registration or media behavio
 ---
 
 ## TEST
+
+The separate `bash tests/build-suite-contract.sh` fixture test covers matching
+Trixie/Bookworm builds, mismatched suites, a non-Debian identity and missing suite
+metadata (including an inherited environment value). It runs in the CI guard job.
 
 Hardware-independent ctest suite. Two build shapes:
 
