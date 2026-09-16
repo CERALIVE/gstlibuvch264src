@@ -1,20 +1,30 @@
-# gstlibuvch264src
+# gstlibuvcsrc
 
-GStreamer source element that pulls H.264 frames directly from DJI action cameras and UVC devices via libuvc. Developed by UnlimitedIRL; forked/maintained under CeraLive.
+Portable userspace libuvc GStreamer source for UVC H.264 **and** H.265. Capture
+works independently of kernel version and platform; it is not RK3588-bound.
+It requires GStreamer/core and base ≥1.14, libuvc and libusb, USB access and a
+device exposing supported formats. No claim that every camera/mode is qualified.
+Developed by UnlimitedIRL; forked/maintained under CeraLive.
 
 > **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in `ceralive-v0.0.7.9`, SHA `ada082b5009e38a89eb7cd6176683b508cd99ff5`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
 
-Parent manifest: [`../AGENTS.md`](../AGENTS.md)
+Canonical factory: `libuvcsrc`. `libuvch264src` and `libuvch26xsrc` are retained
+aliases of the same GType. Internal source paths, plugin identity and the single
+`libgstlibuvch264src.so`, libuvc SONAMEs, cache keys and socket paths stay stable.
 
 ---
 
 ## ROLE IN THE GROUP
 
-Capture source element — feeds raw H.264 bitstream from DJI/UVC cameras into the cerastream pipeline. **Optional device-image component**: the image build may or may not include this plugin depending on capture hardware. HDMI capture paths bypass this element entirely.
+Capture source — feeds H.264/H.265 elementary streams from UVC devices into
+cerastream. The standard image requires `gstreamer1.0-libuvcsrc` through its
+first-party APT package list, independently of its provenance-only REPOS list.
+The package provides/replaces/conflicts with `gstreamer1.0-libuvch264src` so only
+one package owns the payload. HDMI capture bypasses this element.
 
 Data flow position:
 ```
-libuvch264src (this) → cerastream → srtla → irl-srt-server
+libuvcsrc (this) → cerastream → srtla-send-rs → srtla → irl-srt-server
 ```
 
 ---
@@ -22,7 +32,7 @@ libuvch264src (this) → cerastream → srtla → irl-srt-server
 ## STRUCTURE
 
 ```
-gstlibuvch264src/
+gstlibuvcsrc/
 ├── libuvch264src/           # GStreamer plugin source (Meson build — canonical)
 │   ├── src/                 # C source — split into cohesive modules
 │   │   ├── gstlibuvch264src.c          # GObject boilerplate, properties, vmethods, plugin_init
@@ -34,7 +44,7 @@ gstlibuvch264src/
 │   │   ├── spspps_path.h               # Pure path-builder (no GObject dep, unit-testable)
 │   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
 │   │   ├── uvc_device.{c,h}      # USB teardown helper + V4L2 capability probe
-│   │   ├── quirks.{c,h}                 # vid:pid quirk table: MAX_PIXEL_RATE only; one row (Osmo Pocket 3, 4K@30 cap)
+│   │   ├── quirks.{c,h}                 # Generic table-driven pixel-rate limits and caps filtering; injectable test rows
 │   │   └── usb_port_recovery.{c,h}      # deep USB recovery: device `authorized` / port `disable` rung (no GObject, no libuvc, sysfs-root parameterized)
 │   ├── docs/notes/
 │   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
@@ -83,7 +93,7 @@ gstlibuvch264src/
 │   ├── libuvc-h265-support.patch  # H.265 stream format support
 │   └── README.md
 ├── CMakeLists.txt           # TEST-ONLY build: compiles plugin + full ctest suite
-├── Dockerfile               # Reproducible build environment (pinned Debian bookworm + libuvc SHA)
+├── Dockerfile               # Production: pinned Debian Trixie + libuvc SHA; Bookworm source-build CI retained
 └── README.md
 ```
 
@@ -126,7 +136,7 @@ gstlibuvch264src/
 
 ## PROPERTIES
 
-All properties are on the `libuvch264src` (and `libuvch26xsrc` alias) element.
+All properties are on `libuvcsrc` and its `libuvch264src` / `libuvch26xsrc` aliases.
 
 ### `index` (string, default `"0"`)
 
@@ -167,7 +177,10 @@ Read this property back after `PAUSED` to discover the resolved path.
 
 ### `reconnect` (boolean, default `false`)
 
-Opt-in in-element auto-reconnect on a mid-stream disconnect. Default is **off**: a disconnect always posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and ends the stream. When set to `true`, the element first attempts a bounded-backoff teardown/reopen (see DISCONNECT / RECONNECT BEHAVIOR) and only errors out if every retry is exhausted. Gated on the Task 4 spike verdict (`libuvch264src/docs/notes/reconnect-spike.md`).
+Opt-in bounded-backoff teardown/reopen on sustained silence. Default is **off**:
+the default `auto-port-reset=true` first attempts one-shot wedge recovery before
+`GST_ELEMENT_ERROR(RESOURCE, READ)`. With `reconnect=true`, the reconnect ladder
+runs instead. See DISCONNECT / RECONNECT BEHAVIOR.
 
 ### `max-payload` (uint, range 0..4194304, default `0`)
 
@@ -293,11 +306,13 @@ Regression-guarded by `tests/test_au_alignment.c` (`au_single_slice_characteriza
 
 At `start()`, after `uvc_open()` succeeds, the element issues one `VIDIOC_TRY_FMT` ioctl against `/dev/video<N>` (where N is the device ordinal). This is a cheap, non-destructive probe — it does not change any device state. The result is logged via `GST_INFO_OBJECT`:
 
-- `"V4L2 native H.264: available"` — kernel V4L2 driver reports H.264 support
+- `"V4L2 native H.264: available"` — TRY_FMT reports H.264 with positive sizeimage
 - `"V4L2 native H.264: unavailable"` — driver present but H.264 not reported
 - `"V4L2 probe unavailable: cannot open /dev/videoN"` — no V4L2 node at that index
 
-The probe is **non-fatal** in all cases. A mismatch between the UVC ordinal and the V4L2 node index just logs "unavailable" and the element continues normally.
+The probe is **non-fatal** in all cases. Its ordinal-derived node does not prove
+USB identity correspondence or frame delivery. It never selects or rejects the
+libuvc capture path and does not probe H.265.
 
 ---
 
@@ -325,26 +340,41 @@ sudo cp /usr/local/lib/libuvc.* /usr/lib/${MULTIARCH}/
 
 `$(gcc -print-multiarch)` resolves to `aarch64-linux-gnu` on arm64, `x86_64-linux-gnu` on amd64, etc. Do not hardcode the arch string.
 
-Rockchip decoder/encoder reference:
+Downstream pairing — **variant selection, not capture-plugin compatibility**:
 
-| Kernel | H.264 decoder | H.265 decoder | Encoder (both codecs) |
-|--------|---------------|---------------|-----------------------|
-| 5.10   | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
-| 6.6    | `v4l2slh264dec` | `v4l2slh265dec` | `mpph264enc` / `mpph265enc` |
+| Kernel / configured variant | H.264 decoder | H.265 decoder | Encoder |
+|---|---|---|---|
+| 5.10 with MPP drivers/userspace | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
+| 6.6 mainline V4L2 decode | `v4l2slh264dec` | `v4l2slh265dec` | Depends on installed encoder driver/userspace |
+| 7.2 mainline | V4L2 elements available | V4L2 elements available | Depends on installed encoder driver/userspace |
+| 7.2 with CeraLive island — RK3588-optimised | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
 
-On kernel 5.10, `mppvideodec` handles both H.264 and H.265 via the Rockchip MPP layer. On kernel 6.6, the V4L2 stateless decoders are codec-specific.
+MPP availability depends on the driver/UAPI and matched userspace, not a kernel
+minor cutoff. CeraLive's RK3588 path pairs these elements with `rgaconvert`, its
+librga fork and island drivers. Capture remains portable userspace libuvc.
+Which sources the kernel exposes through UVC/V4L2 varies with kernel UVC support;
+that inventory/capture-family axis is separate from downstream silicon pairing.
 
 ### Reproducible Docker build
 
 The `Dockerfile` pins both the base image and the libuvc source:
 
 ```
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 ```
 
 libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `f3eda76` on `main`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
 
-**Two stages: pinned Debian bookworm `build`, then `FROM scratch` `runtime`.** The release recipe (`publish-release.yml`) exports the *final* stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`). The `runtime` stage MUST stay `FROM scratch`, carrying ONLY the plugin payload that the `build` stage stages under `/out`: `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so` + `usr/lib/<triplet>/libuvc.so*` (the symlink chain; `libuvc.a`/`.pc` are build-only and excluded). Do NOT switch `runtime` back to a distro base to add runtime deps — that exports the entire distro `/usr` and produced a ~56 MB `.deb` that dpkg-file-conflicts with `coreutils`/`libc` on install. GStreamer/libusb/libjpeg are runtime deps from the target system (`Depends: libgstreamer1.0-0`, `libusb-1.0-0`, `libjpeg62-turbo`, `libc6 (>= 2.36)`), not bundled in the image. The base image intentionally matches the device image's Debian bookworm ABI so the plugin cannot pick up Ubuntu 24.04-only symbols such as `GLIBC_2.38` or `libjpeg.so.8`.
+**Two stages: pinned Debian 13 Trixie `build`, then `FROM scratch` `runtime`.**
+The production base matches the device target suite. Bookworm remains a separate
+source-portability CI build on both architectures, not the production package base.
+`runtime` carries ONLY `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so`
+and the three `libuvc.so*` entries. Never export a distro `/usr` as the payload.
+`scripts/build-deb.sh` packages that tree with `dpkg-deb`, checks the GLIBC 2.41
+ceiling and libjpeg.so.62 ABI, and declares the Trixie runtime dependencies.
+`tests/package-contract.sh` checks the exact payload and old-name compatibility.
+`GST_PLUGIN_DEFINE` names CeraLive and this repository as package/origin: this is
+a diagnostic metadata judgement, with no change to registration or media behavior.
 
 ---
 
@@ -419,7 +449,8 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Stable: `v2026.6.2`
 - Beta: `v2026.6.3-beta.1`
 
-**FPM .deb version:** The `VERSION` env var from `calculate-version` is passed directly to FPM's `-v` flag (line 99 in `publish-release.yml`), producing `.deb` packages with CalVer versions like `gstreamer1.0-libuvch264src_2026.6.2_arm64.deb`.
+**Debian version:** `calculate-version` passes `VERSION` to `scripts/build-deb.sh`,
+producing `gstreamer1.0-libuvcsrc_<VERSION>_<ARCH>.deb`. Old release assets stay immutable.
 
 **No version file needed.** The workflow calculates the version at publish time from the git tag history; there is no tracked `VERSION` file in the repo. This is intentional — the single source of truth is the git tag namespace (`v*`).
 
@@ -428,7 +459,7 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 ## ANTI-PATTERNS
 
 - Do NOT link against system libuvc if it exists; the pinned fork/upstream copy is intentional for version pinning.
-- Do NOT modify `scripts/build-libuvc.sh` SHA constants without updating both `FORK_SHA` and `UPSTREAM_SHA` together — they are the single source of truth for the dependency.
+- Update only the selected dependency's pin in `scripts/build-libuvc.sh`, with its provenance and validation; the fork and upstream fallback pins are independent.
 - Do NOT hardcode `aarch64-linux-gnu` in build paths — use `$(gcc -print-multiarch)`.
 - Do NOT reintroduce a fixed, device-measured settle constant between the port reset and the reopen. It was measured on one DJI Osmo Pocket 3 and shipped as `RESET_SETTLE_MS` (4 s); it both over-waited on fast devices and burned the single reopen on slow ones. The replacement polls re-enumeration and requires a delivered frame, bounded by `reset-settle-max-ms`.
 - Do NOT treat a successful `uvc_start_streaming()` as proof the device recovered — it returns OK on a still-wedged device. Only a delivered frame proves it.
@@ -456,4 +487,4 @@ The `.deb` version is derived **purely from git tags** at publish time via the `
 - Do NOT special-case a device inside `gst_libuvc_h264_negotiate()` (`if (vid == ... && w == 3840 ...)`). The quirk table exists so device knowledge stays data-driven — one row, no branching in the selection loop.
 - Do NOT re-derive the quirk exclusion outside `uvc_quirks_filter_caps()` — not in the engine, not in the UI, not in a second helper here. That split is precisely the shipped defect this function was added to close: the filtered ladder lived only inside `negotiate()`, so cerastream and CeraUI advertised `3840x2160@50` for a camera the element was guaranteed to refuse, and an operator picked it and lost a stream (board `192.168.78.131`, 2026-07-30 — twelve requests, twelve `Unable to negotiate common caps`). `negotiate()`, `deliverable-caps` and `filter-deliverable-caps` must all keep calling the one function.
 - Do NOT make `deliverable-caps` return an EMPTY caps when nothing is known. Empty means "this camera has no modes"; a consumer that trusts it will hide every option and strand the operator. `NULL` is the unknown answer, and `filter-deliverable-caps` on an unquirked vid:pid returns its input unchanged for the same reason — the filter may only ever REMOVE modes it has a positive verdict for.
-- This plugin is **not** in the device image REPOS list by default — don't assume it's always present on device.
+- The standard image installs this package through FIRST_PARTY_APT_PKGS, not REPOS. Custom installations must still check element availability.

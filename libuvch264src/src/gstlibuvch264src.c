@@ -2287,7 +2287,8 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
 }
 
 static gboolean plugin_init(GstPlugin *plugin) {
-    // Also register under the libuvch26xsrc alias since it now supports both H264 and H265
+    if (!gst_element_register(plugin, "libuvcsrc", GST_RANK_NONE, GST_TYPE_LIBUVC_H264_SRC))
+      return FALSE;
     if (!gst_element_register(plugin, "libuvch26xsrc", GST_RANK_NONE, GST_TYPE_LIBUVC_H264_SRC))
       return FALSE;
     return gst_element_register(plugin, "libuvch264src", GST_RANK_NONE, GST_TYPE_LIBUVC_H264_SRC);
@@ -2303,6 +2304,6 @@ GST_PLUGIN_DEFINE(
     plugin_init,
     VERSION,
     "LGPL",
-    "GStreamer",
-    "https://gstreamer.freedesktop.org/"
+    "CeraLive",
+    "https://github.com/CERALIVE/gstlibuvcsrc"
 )
