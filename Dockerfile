@@ -7,6 +7,10 @@ ARG TARGETARCH
 ARG BUILD_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 FROM ${BUILD_BASE} AS build
 
+ARG BUILD_SUITE=trixie
+COPY scripts/check-build-suite.sh /usr/local/bin/check-build-suite
+RUN bash /usr/local/bin/check-build-suite "${BUILD_SUITE}"
+
 # Set the working directory inside the container
 WORKDIR /app
 
@@ -78,7 +82,7 @@ RUN GNUARCH=$(case "${TARGETARCH}" in \
 	cp -a /usr/local/lib/libuvc.so* /out/usr/lib/${GNUARCH}/
 
 # Runtime stage MUST stay `FROM scratch`. The release workflow exports this final
-# stage wholesale (`buildx --output type=local,dest=build` → `fpm build/usr/=/usr/`).
+# stage wholesale (`buildx --output type=local,dest=build` → `scripts/build-deb.sh`).
 # A distro stage here exported the entire distro /usr, producing a ~56 MB .deb
 # that dpkg-file-conflicts with coreutils/libc on install. GStreamer/libusb/libjpeg
 # are runtime deps from the target system (see package Depends), not bundled.
