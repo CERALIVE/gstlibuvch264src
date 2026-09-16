@@ -39,6 +39,7 @@ jobs:
           outputs: build
           platforms: linux/${{ matrix.config.arch }}
           build-args: |
+            BUILD_SUITE=${{ matrix.suite }}
             BUILD_BASE=${{ matrix.suite == 'bookworm' && 'debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df' || 'debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132' }}
           cache-from: type=gha,scope=${{ matrix.config.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.config.arch }}
@@ -77,6 +78,9 @@ jobs:
       # git + coreutils are needed — no build toolchain for these two checks.
       - name: Source-list consistency (sources.txt vs build)
         run: bash scripts/check-source-list.sh
+
+      - name: Build suite contract
+        run: bash tests/build-suite-contract.sh
 
       - name: Fork pin integrity + capability presence
         run: bash scripts/check-libuvc-fork.sh
