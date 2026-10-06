@@ -77,7 +77,7 @@ if [ -z "${MOCK_PLUGIN_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
   MOCK_SO=""
-  # Prefer the canonical build dir (AGENTS.md); only it is guaranteed in sync
+  # Prefer the canonical build dir (docs/agents/build.md); only it is guaranteed in sync
   # with the current tree. Other build*/ dirs (e.g. an audit build) may carry a
   # stale mock without the latest changes, so never auto-pick them by name.
   if [ -f "$REPO_ROOT/build/gstreamer-1.0-mock/libgstlibuvch264src.so" ]; then

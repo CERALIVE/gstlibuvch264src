@@ -1,500 +1,88 @@
 # gstlibuvcsrc
 
-Portable userspace libuvc GStreamer source for UVC H.264 **and** H.265. Capture
-works independently of kernel version and platform; it is not RK3588-bound.
-It requires GStreamer/core and base ≥1.14, libuvc and libusb, USB access and a
-device exposing supported formats. No claim that every camera/mode is qualified.
-Developed by UnlimitedIRL; forked/maintained under CeraLive.
+Parent: [Workspace rules](https://github.com/CERALIVE/ceralive/blob/master/AGENTS.md).
 
-> **Security:** CVE-2026-1991 (null-deref in scan-streaming path) is fixed in the CeraLive fork at commit `eae7f49` (first shipped in tag `ceralive-v0.0.7.2`, carried forward in `ceralive-v0.0.7.9`, SHA `ada082b5009e38a89eb7cd6176683b508cd99ff5`) and also carried as `patches/cve-2026-1991-scan-streaming-nullguard.patch` for the upstream fallback path. Upstream libuvc is effectively dead (last commit 2024); the CeraLive fork at `https://github.com/CeraLive/libuvc.git` is the canonical dependency.
+<!-- workspace-hard-rules:begin -->
+## Workspace hard rules (identical in every CeraLive AGENTS.md)
+- Commits and PRs carry the human author only: no Co-authored-by, no AI attribution.
+- Start from the updated canonical branch; rebase to update; never `reset --hard` or discard others' work.
+- One focused PR per repo, opened against CERALIVE/<repo>; the root policy PR merges first.
+- A repo is self-contained: no path above its root; consume @ceralive packages from the registry, never link:/file:.
+- Never delete, skip or weaken a test; every behavior change ships with a test.
+- A user-visible change updates docs.ceralive.tv in English and Spanish (es-419), and any ceralive.tv claim it touches, in the same release.
+- AGENTS.md holds rules and routing only, within budget; contracts and history live in docs/agents/.
+- Full canon: https://github.com/CERALIVE/ceralive/blob/master/AGENTS.md
+<!-- workspace-hard-rules:end -->
 
-Canonical factory: `libuvcsrc`. `libuvch264src` and `libuvch26xsrc` are retained
-aliases of the same GType. Internal source paths, plugin identity and the single
-`libgstlibuvch264src.so`, libuvc SONAMEs, cache keys and socket paths stay stable.
+## ROLE
 
----
-
-## ROLE IN THE GROUP
-
-Capture source — feeds H.264/H.265 elementary streams from UVC devices into
-cerastream. The standard image requires `gstreamer1.0-libuvcsrc` through its
-first-party APT package list, independently of its provenance-only REPOS list.
-The package provides/replaces/conflicts with `gstreamer1.0-libuvch264src` so only
-one package owns the payload. HDMI capture bypasses this element.
-
-Data flow position:
-```
-libuvcsrc (this) → cerastream → srtla-send-rs → srtla → irl-srt-server
-```
-
----
+Portable userspace libuvc GStreamer H.264/H.265 capture source feeding cerastream.
+Requires supported camera formats and USB access; portability is not hardware qualification.
 
 ## STRUCTURE
 
-```
-gstlibuvcsrc/
-├── libuvch264src/           # GStreamer plugin source (Meson build — canonical)
-│   ├── src/                 # C source — split into cohesive modules
-│   │   ├── gstlibuvch264src.c          # GObject boilerplate, properties, vmethods, plugin_init
-│   │   ├── gstlibuvch264src.h          # Public element type/cast macros
-│   │   ├── gstlibuvch264src_internal.h # Instance struct + GST_CAT_DEFAULT (shared across TUs)
-│   │   ├── gstlibuvch264src_error.{c,h}# uvc_error_t → GST_ELEMENT_ERROR mapping helper
-│   │   ├── frame_pipeline.{c,h}        # NAL parsing, frame_callback, PTS estimation
-│   │   ├── spspps_cache.{c,h}          # SPS/PPS/VPS disk cache (path safety, resolution key)
-│   │   ├── spspps_path.h               # Pure path-builder (no GObject dep, unit-testable)
-│   │   ├── ptz_control.{c,h}           # PTZ probe/set helpers + control socket bind/unbind/thread
-│   │   ├── uvc_device.{c,h}      # USB teardown helper + V4L2 capability probe
-│   │   ├── quirks.{c,h}                 # Generic table-driven pixel-rate limits and caps filtering; injectable test rows
-│   │   └── usb_port_recovery.{c,h}      # deep USB recovery: device `authorized` / port `disable` rung (no GObject, no libuvc, sysfs-root parameterized)
-│   ├── docs/notes/
-│   │   ├── reconnect-spike.md          # Spike verdict: libuvc dead-handle teardown is SAFE
-│   │   ├── bmaxpayload-analysis.md     # max-payload bandwidth tuning analysis
-│   │   ├── dji-xu-investigation.md     # DJI XU control investigation (report only; no code shipped)
-│   │   ├── v4l2src-spike.md            # v4l2src evaluation spike (report only; no code shipped)
-│   │   ├── scr-investigation.md        # SCR-based PTS investigation (verdict: SCR-ABSENT; no code change)
-│   │   ├── libuvc-fork-adr.md          # ADR: CeraLive fork as canonical libuvc dependency
-│   │   └── camera-compat.md            # Mechanism-per-family compat matrix + field-triage + fork provenance
-│   └── meson.build                     # Canonical production build
-├── tests/                   # Hardware-independent ctest suite (mock-backed)
-│   ├── mock_libuvc.{c,h}    # libuvc mock (~16 fns); env/API config; PTZ + descriptor support
-│   ├── mock_libusb.{c,h}    # libusb mock for teardown double-close tests
-│   ├── test_plugin_load.c   # Smoke: registration, factories, pads, index default
-│   ├── test_mock_smoke.c    # gst-check: 10-buffer pipeline via mock
-│   ├── test_device_select.c # Device selection: ordinal/vid:pid/serial/bus + index validation
-│   ├── test_ptz.c           # PTZ properties + capability gate
-│   ├── test_socket.c        # Control socket: default-off, per-instance path, mode 0600
-│   ├── test_negotiate.c     # Caps negotiation: leak (LSAN), zero-format, framerate edge cases, inventory log
-│   ├── test_usb_teardown.c  # USB teardown: single libusb_close, real interface count
-│   ├── test_pts_thread_safety.c # PTS/clock race + frame throughput
-│   ├── test_pts_monotonic.c # PTS monotonicity + restart IDR gate
-│   ├── test_live_source.c   # LATENCY query, buffer OFFSET, SPS/PPS write-on-change
-│   ├── test_sps_bounds.c    # SPS/PPS/VPS NAL copy bounds (heap overflow guard)
-│   ├── test_nal_parse.c     # NAL parser: multi-slice, 3+4-byte start codes, size_t bounds
-│   ├── test_au_alignment.c  # alignment=au contract: one buffer per access unit (AUD + AUD-less)
-│   ├── test_cache.c         # SPS/PPS cache path safety + resolution key
-│   ├── test_error_map.c     # uvc_error_t → GST_ELEMENT_ERROR mapping
-│   ├── test_v4l2_probe.c    # V4L2 VIDIOC_TRY_FMT probe (non-fatal)
-│   ├── test_compat.c        # API compatibility: property existence + type assertions
-│   ├── test_cve_2026_1991.c # CVE-2026-1991 regression: null-deref guard in scan-streaming path
-│   ├── test_cache_race.c    # SPS/PPS cache concurrent read/write race (TSan)
-│   ├── test_transfer_buffers.c # transfer-buffers property: sentinel/clamp/reconnect re-arm, fork-only gated
-│   ├── test_quirks.c        # vid:pid quirk lookup/limits, universal probe-retry policy, Osmo pixel-rate cap, synthetic-row caps filtering
-│   ├── test_usb_port_recovery.c # deep-recovery helper against a synthetic sysfs tree: rung selection + leaf-target vetoes
-│   ├── board/               # Manual hardware drills plus hardware-free harness self-tests
-│   │   ├── negotiation-matrix.sh         # Real-camera drill; AU PTS-span fps scorer
-│   │   ├── negotiation-matrix-selftest.sh# Synthetic startup-gap/fallback regression test
-│   │   └── wedge-recovery.sh             # Gated-SIGKILL wedge + real-libusb_reset_device recovery timing
-│   ├── fuzz_nal.c           # NAL parser fuzz harness (libFuzzer entry point)
-│   ├── tsan.suppressions    # TSan suppressions for third-party + baselined GMutex blind spots
-│   └── tsan_pts.suppressions# TSan suppressions for PTS/clock GMutex (permanent blind spot)
-├── patches/                 # libuvc patches for the upstream fallback path (LIBUVC_USE_FORK=OFF)
-│   ├── cve-2026-1991-scan-streaming-nullguard.patch  # CVE-2026-1991 null-deref fix (upstream fallback)
-│   ├── uvc15-support.patch  # UVC 1.5 support
-│   ├── libuvc-h265-support.patch  # H.265 stream format support
-│   └── README.md
-├── CMakeLists.txt           # TEST-ONLY build: compiles plugin + full ctest suite
-├── Dockerfile               # Production: pinned Debian Trixie + libuvc SHA; Bookworm source-build CI retained
-└── README.md
+- `libuvch264src/` — canonical Meson plugin sources and capture notes.
+- `tests/` — mock-backed CMake/ctest suite and gated board drills.
+- `scripts/` — pinned dependency build, packaging and CI guards.
+- `patches/` — upstream fallback patches.
+- `docs/` — engineering notes and preserved agent contracts.
+- `.github/` — CI, release workflow and PR checklist.
+
+## COMMANDS
+
+```bash
+bash scripts/check-source-list.sh
+bash tests/build-suite-contract.sh
+bash scripts/check-libuvc-fork.sh
+cmake -B build -DENABLE_SANITIZERS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+cmake --build build
+ctest --test-dir build --output-on-failure
+bash scripts/check-reproducibility.sh
+bash tests/board/negotiation-matrix-selftest.sh
 ```
 
-> `libuvc/` is no longer vendored in-tree. By default (`LIBUVC_USE_FORK=ON`),
-> `scripts/build-libuvc.sh` clones the CeraLive fork at the hardened SHA
-> (`f3eda76` on `main`, PR #7 — the `uvc_close()` status-transfer + interface-release fix; supersedes tag `ceralive-v0.0.7.9`/`ada082b`, which is an ancestor) — no patch step needed. With
-> `LIBUVC_USE_FORK=OFF`, it falls back to upstream v0.0.7
-> (`68d07a00e11d1944e27b7295ee69673239c00b4b`) and applies the patches from
-> `patches/` (including the CVE-2026-1991 null-guard). The Dockerfile and the
-> top-level `CMakeLists.txt` both delegate to this script.
-
----
+Production: Dockerfile builds pinned libuvc, then `meson setup build ./libuvch264src/`,
+`meson compile` and `meson install --no-rebuild` from `build/`.
+CI builds amd64/arm64 on Trixie and Bookworm; production packaging is Trixie only:
+`VERSION=0.0.0 ARCH=amd64 bash scripts/build-deb.sh`, then
+`bash tests/package-contract.sh dist/gstreamer1.0-libuvcsrc_0.0.0_amd64.deb`.
+See the build contract for staging and pinned dependency commands.
 
 ## WHERE TO LOOK
 
-| Task | Location |
-|------|----------|
-| Plugin element logic | `libuvch264src/src/gstlibuvch264src.c` |
-| NAL parsing / PTS / frame callback | `libuvch264src/src/frame_pipeline.c` |
-| Access-unit aggregation (`alignment=au`) | `libuvch264src/src/frame_pipeline.c` → `split_access_units()` |
-| PTZ probe/set + control socket | `libuvch264src/src/ptz_control.c` |
-| USB teardown + V4L2 probe | `libuvch264src/src/uvc_device.c` |
-| Wedged-device USB port-reset recovery | `libuvch264src/src/gstlibuvch264src.c` → `gst_libuvc_h264_src_reset_silent_device()` |
-| Deep USB recovery rung (post-reset `error -71`) | `libuvch264src/src/usb_port_recovery.c`; ladder position in `gstlibuvch264src.c` → `gst_libuvc_h264_src_deep_recovery()` |
-| SPS/PPS cache | `libuvch264src/src/spspps_cache.c` |
-| Error mapping helper | `libuvch264src/src/gstlibuvch264src_error.c` |
-| vid:pid quirk seam (table + lookup) | `libuvch264src/src/quirks.c` |
-| Meson build config | `libuvch264src/meson.build` |
-| Build environment | `Dockerfile` |
-| Reconnect feasibility verdict | `libuvch264src/docs/notes/reconnect-spike.md` |
-| max-payload tuning analysis | `libuvch264src/docs/notes/bmaxpayload-analysis.md` |
-| DJI XU investigation (report only) | `libuvch264src/docs/notes/dji-xu-investigation.md` |
-| v4l2src evaluation spike (report only) | `libuvch264src/docs/notes/v4l2src-spike.md` |
-| SCR/PTS investigation (verdict: SCR-ABSENT) | `libuvch264src/docs/notes/scr-investigation.md` |
-| libuvc fork ADR | `libuvch264src/docs/notes/libuvc-fork-adr.md` |
-| Camera compat matrix + field triage + fork provenance | `libuvch264src/docs/notes/camera-compat.md` |
-| Example pipelines | `README.md` |
-
----
-
-## PROPERTIES
-
-All properties are on `libuvcsrc` and its `libuvch264src` / `libuvch26xsrc` aliases.
-
-### `index` (string, default `"0"`)
-
-Selects one device from the libuvc enumeration. Accepts four forms:
-
-| Form | Example | Meaning |
-|------|---------|---------|
-| `"N"` | `"0"` | Ordinal into the enumerated list (default, backward-compatible) |
-| `"vid:pid"` | `"1234:5678"` | Hex USB vendor:product ID |
-| `"serial:<sn>"` | `"serial:CAM-001"` | Exact USB serial-number string |
-| `"bus:<b>:<a>"` | `"bus:1:5"` | Decimal USB bus number and device address |
-
-A malformed selector posts `GST_ELEMENT_ERROR(RESOURCE, SETTINGS)` and fails `start()` loudly — the old `atoi()` silent-select-0 trap is gone. `vid:pid` and `serial:` selectors survive a device replug (bus/address can change); `bus:` and ordinal selectors may resolve to a different physical device after replug.
-
-### `pan` / `tilt` (int, range ±648000, default 0)
-
-Absolute pan/tilt position in UVC arcseconds. Capability-gated: a set on an axis the device does not report is silently ignored. Pan and tilt share one UVC control, so setting one axis re-sends the other from its cached value. Readable at any time; returns the last successfully applied value.
-
-### `zoom` (int, range 0..65535, default 0)
-
-Absolute zoom as a UVC focal length. Capability-gated the same way as pan/tilt.
-
-### `control-socket` (boolean, default `false`)
-
-Enables the opt-in Unix-domain PTZ control socket. Default is **off** — nothing binds unless you set this to `true`. The old world-accessible `/tmp/libuvc_control` path is gone.
-
-### `control-socket-path` (string, default `null`)
-
-Explicit path for the control socket. When `null` (the default), the element auto-selects a per-instance path under `$XDG_RUNTIME_DIR`:
-
-```
-$XDG_RUNTIME_DIR/libuvch264src-<pid>-<seq>.sock
-```
-
-The `<seq>` counter is per-process-atomic, so two instances in the same process never collide. The socket is created with mode `0600`. If `XDG_RUNTIME_DIR` is unset and no explicit path is given, the bind fails non-fatally (a warning is logged; the media path continues).
-
-Read this property back after `PAUSED` to discover the resolved path.
-
-### `reconnect` (boolean, default `false`)
-
-Opt-in bounded-backoff teardown/reopen on sustained silence. Default is **off**:
-the default `auto-port-reset=true` first attempts one-shot wedge recovery before
-`GST_ELEMENT_ERROR(RESOURCE, READ)`. With `reconnect=true`, the reconnect ladder
-runs instead. See DISCONNECT / RECONNECT BEHAVIOR.
-
-### `max-payload` (uint, range 0..4194304, default `0`)
-
-USB payload transfer size hint in bytes (`dwMaxPayloadTransferSize`). `0` (the default) leaves the device-negotiated value unchanged. A nonzero value is clamped to `[512, 4194304]`, applied via UVC probe/commit with read-back, and falls back to the device-negotiated value if the device refuses it. Read-back reports the effective committed value. See `libuvch264src/docs/notes/bmaxpayload-analysis.md` for tuning guidance.
-
-### `transfer-buffers` (uint, range 0..255, default `0`)
-
-USB transfer buffer count hint: the number of USB transfer buffers `libuvc` submits per stream. `0` (the default, and the sentinel) leaves the library's default count unchanged — no device write at all. A nonzero value is clamped to `[2, 100]` and applied via the CeraLive fork's `uvc_set_transfer_buffers()` right before streaming starts, in both the initial `start()` and on every reconnect re-arm (the fork API rejects the call mid-stream, so it must precede `uvc_start_streaming()`). Read-back reports the effective (clamped) value once applied; before that it reports the requested value. Requires the CeraLive libuvc fork (backs fork item A2, `libuvch264src/docs/notes/camera-compat.md` §3); on upstream libuvc (`LIBUVC_USE_FORK=OFF`) a nonzero request is a no-op with one warning, and the property itself is otherwise harmless to set on either build.
-
-### `reset-settle-max-ms` (uint, range 0..120000, default `8000`)
-
-Budget, in milliseconds, for the element's **own** readiness loop after a port reset — re-enumeration polling, the reopen retries, and the wait for the first real frame. It is a budget, not a delay: the recovery returns the instant frames are actually flowing, so a device that comes back quickly is not made to wait. When it is spent the element stops starting new attempts and falls through to the usual `RESOURCE/READ` disconnect error. Also bounds the re-enumeration poll on a `start()` that had to force-clean a previous session.
-
-**It does not bound the total.** `uvc_stop_streaming()` and `uvc_close()` are synchronous and libuvc exposes no interruption seam, so on a device that is still re-enumerating the teardown between attempts can push the total well past this value — measured **21880 ms and 21893 ms against an 8000 ms budget** on two independent hardware runs. Size it for the fast path; the worst-case tail is teardown-bound, not policy-bound. See DISCONNECT / RECONNECT BEHAVIOR.
-
-### `reset-rearm-frames` (uint, range 1..100000, default `30`)
-
-Frames the device must deliver after a recovery before the one-shot port reset re-arms for a LATER wedge. The default is ~1 s at 30 fps. Re-arming on the first frame back would let a device that emits one frame and immediately re-wedges reset the port in an endless loop.
-
-### `auto-port-reset` (boolean, default `true`)
-
-Controls the silence-triggered wedge-recovery port reset. The default remains `true` and preserves the always-on recovery behavior. Set it to `false` for a device or scenario where issuing `USBDEVFS_RESET` risks stranding the camera; sustained silence then skips the reset and falls through to the normal `RESOURCE/READ` disconnect error path.
-
-### `deep-port-recovery` (boolean, default `false`)
-
-Opt-in escalation for the case the port reset cannot fix: a reset the device never comes back from. The kernel retries enumeration `PORT_INIT_TRIES` times, each failing `error -71` (`EPROTO`), then logs `unable to enumerate USB device` and stops — and at that point the device object is gone, so there is nothing left for another `libusb_reset_device()` to reset.
-
-When `true`, the element escalates **once per silence episode**, and only after the port reset AND every reopen inside `reset-settle-max-ms` have already failed:
-
-1. **Device-level `authorized` 0→1**, if the device object survived and still reports the vid:pid captured before the reset. A logical deauthorise + re-probe of exactly one device; the port's power state is untouched.
-2. **Port-level `disable` 1→0** (1 s hold), if the device object is gone. Clears `PORT_POWER` and the latched `C_CONNECTION`/`C_ENABLE` bits so the hub sees a genuine connect-change.
-
-Then one further settle pass — polling, reopen, and a **delivered frame** — before falling through to the usual `RESOURCE/READ` disconnect error. This means an enabled rung can roughly **double** the worst-case recovery time, which is a second reason it is opt-in.
-
-**Why it defaults to `false`.** On board `192.168.78.131` the rung is proven to **fire** and proven **not to recover**: the port cycle drives xHCI `PORTSC` from `Powered Connected Enabled` to `Powered-off Not-connected Disabled Link:Disabled` and back with `Change: CSC`, the kernel re-runs enumeration from scratch with a fresh address — and the device still failed `error -71`, 3/3 cycles at a 10 s hold. Turning it on by default would spend a second budget and root-only sysfs writes on every wedge with no evidence behind it. Flipping the default requires a separate commit with a real ×3 recovery. See `.omo/evidence/device-platform-wave4/task-11-board-proof.md`.
-
-**Bounds and safety.**
-
-- **It is a port STATE cycle, not a proven VBUS removal.** `PORTSC` reports `Powered-off`, but the same root hub advertises `wHubCharacteristic 0x000a` = *"No power switching"* and the board's Type-C 5 V rail is a separate GPIO regulator. Nothing here establishes that VBUS physically dropped; the logs say "logical re-probe" for that reason.
-- **Never touches a hub carrying another device.** No sysfs attribute reports a hub's power-switching mode, and ganged hubs are real on this hardware (the board's Terminus `1a40:0101` reports `Ganged power switching`), so a port whose hub has any other enumerated child is refused outright.
-- **Never touches a device that is not ours.** Bus addresses are recycled; the vid:pid captured before the reset is re-checked, and a mismatch at either the device path or the port's current occupant is refused.
-- **Needs privilege.** USB sysfs attributes are root-writable only. Embedded in a root service (cerastream's unit has no `User=`) the writes land; run as a normal user they return `denied` and are logged as such rather than silently doing nothing.
-- The target is resolved from sysfs **while the device is still open** — after a failed re-enumeration there is no device directory left to resolve a port from.
-
-### `deliverable-caps` (GstCaps, read-only)
-
-The post-quirk mode ladder `negotiate()` actually selects from — what this element will **accept**, not what the device **advertises**. `NULL` until a device has been negotiated; a consumer must read `NULL` as *unknown*, never as *no modes*.
-
-For a camera with a `QUIRK_MAX_PIXEL_RATE` row these differ: the DJI Osmo Pocket 3 advertises `3840x2160@60/50/48` and this property omits all three, because negotiation refuses them.
-
-### Action signal: `filter-deliverable-caps(advertised, vendor-id, product-id)` → GstCaps
-
-The same exclusion applied to a **caller-supplied** ladder, with no device involved. Pure caps arithmetic — it does not open, probe, or touch any camera.
-
-This exists for consumers that enumerate devices. cerastream already holds the advertised ladder (from `GstDevice::caps()`, a v4l2 enumeration) and the USB ids, and must not open the camera to learn which modes are real — opening one through libuvc detaches `uvcvideo` and destroys `/dev/videoN` for seconds. It emits this on a throwaway element instance instead.
-
-Both surfaces and `negotiate()` route through the single `uvc_quirks_filter_caps()` in `quirks.c`, so the modes an operator is **offered** are by construction the modes negotiation will **accept**.
-
-### Action signal: `set-ptz(pan, tilt, zoom)` → boolean
-
-Drives all three PTZ axes in one emission. Each axis is applied only when the device reports it. Returns `TRUE` if at least one supported axis was driven and every attempted set succeeded.
-
----
-
-## PTZ CONTROL SURFACE
-
-Two independent surfaces, both capability-gated:
-
-**Native GObject properties (always available, no socket needed)**
-Set `pan`, `tilt`, `zoom` via `g_object_set()` or `gst-launch-1.0 ... pan=N`. The `set-ptz` action signal drives all three in one call. These are the preferred interface for programmatic control from cerastream/CeraUI.
-
-**Opt-in Unix-domain socket (default off)**
-Set `control-socket=true` to enable. The socket accepts JSON commands for `PAN_TILT`, `ZOOM`, `GET_POSITION`, and `GET_CAPABILITIES`. Routes through the same `ptz_set_pan/tilt/zoom` helpers as the native props — same clamping, same capability gate, same locking. A consumer must read the resolved `control-socket-path` property (or set an explicit path) after enabling the socket.
-
----
-
-## DISCONNECT / RECONNECT BEHAVIOR
-
-**Wedged-device recovery (enabled by default, one-shot per silence episode).** Sustained silence has TWO causes that are indistinguishable from inside `create()`: the device was unplugged, or it is still fully present but **wedged** — enumerated, answering every control transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the streaming endpoint. Measured on a DJI Osmo Pocket 3 (`2ca3:0023`) after the holding process died without `uvc_close()`; reproduced identically through libuvc AND through the kernel `uvcvideo` driver, which is what proves it is device state and not an element bug. **A close/reopen does not clear it — only a USB port reset does.** With the default `auto-port-reset=true`, `create()` runs `gst_libuvc_h264_src_recover_wedged_device()`: ONE `libusb_reset_device()` on the live handle, then a **readiness-driven** return to streaming — poll `uvc_find_devices()` on a micro-backoff until the device re-enumerates, reopen, restart, and require an **actual delivered frame**. With `auto-port-reset=false`, it skips the reset and falls through to the normal disconnect error. Notes:
-
-- `LIBUSB_ERROR_NOT_FOUND` counts as **success** — libusb returns it when the reset re-enumerated the device, which is the outcome we want. Any other non-zero status means the port reset did not happen, so the device really is unreachable and the disconnect error surfaces as before.
-- **A successful `uvc_start_streaming()` is not proof of recovery.** A reopen issued too soon after the reset returns OK from both `uvc_open()` and `uvc_start_streaming()` and then delivers zero frames — indistinguishable from the wedge just cleared. libuvc exposes no readiness API, so a **delivered frame is the readiness signal**; the recovery waits for one and, if the reopen came too early, tears it down and tries again. The proving frame is pushed back to the queue front, so it is never dropped.
-- **No device-measured timing constant is encoded anywhere.** The recovery ends the moment frames actually flow, so a device that comes back in 200 ms costs 200 ms. `reset-settle-max-ms` (default 8000) budgets the element's own readiness loop, not the synchronous libuvc teardown between attempts (see the property docs — measured worst case ~22 s against an 8 s budget). The re-enumeration poll backs off 25 → 200 ms and is interruptible, so a NULL/PAUSED transition never waits it out.
-- **The libuvc context is re-created on the recovery path.** MEASURED: after a real port reset the device re-enumerates, and a context held open across that reset can no longer open it — a freshly started process streamed again 14.4 s in while the element, on its original context, could not reopen at all inside a 30 s budget. `uvc_exit()` + `uvc_init()` is what makes the recovery equivalent to the fresh process that demonstrably works; it took the measured recovery from *never* to **288 ms**.
-- It is **still one port reset per silence episode, not the `reconnect` ladder**. Retries inside the budget are reopens only — the reset itself never repeats. `reconnect` remains the property that buys the 1/2/4/8/16 s retry schedule; when `reconnect=true` that path runs instead and is unchanged.
-- The one-shot re-arms only after the device has PROVEN it recovered (`reset-rearm-frames`, default 30 — ~1 s at 30 fps). Re-arming on the first frame back lets a device that emits one frame and re-wedges reset the port forever.
-- Cost to a genuinely absent device: nothing — the reset fails and the error surfaces immediately, without spending the budget.
-- Real-hardware coverage: `tests/board/wedge-recovery.sh` (manual, board-only, never registered with ctest) induces a real wedge with a gated SIGKILL and measures reset-to-advancing-frames against the bound.
-- **When the reset itself does not take**, the opt-in `deep-port-recovery` rung escalates once more (see its property docs). It is default-off, sits strictly below the reset in the ladder, and is skipped entirely whenever the reset already recovered the device.
-
-**Disconnect detection (always on):** When the UVC device is unplugged mid-stream, libuvc stops delivering frames silently — in callback mode it does **not** invoke the callback with a NULL frame, it simply goes quiet (Task 4 spike). `create()` therefore infers a disconnect from sustained silence: it counts consecutive `g_async_queue_timeout_pop` timeouts (each `TIMEOUT_DURATION` = 1 s), and after `DISCONNECT_TIMEOUT_COUNT` (5) in a row — i.e. ~5 s with no frame — it treats the device as gone. The counter resets on every real frame and in `start()`, so an isolated gap never trips it. On a confirmed disconnect with `reconnect=false` (the default), it posts `GST_ELEMENT_ERROR(RESOURCE, READ)` and returns `GST_FLOW_ERROR`; downstream (cerastream) handles the error.
-
-**Reconnect (opt-in, default off):** With the `reconnect` property set to `true`, a confirmed disconnect first triggers an in-element reconnect before any error is posted. The path uses the spike's verified **native** teardown — `uvc_stop_streaming()` → `uvc_close()` → `uvc_unref_device()` (the callback thread joins cleanly and the libusb handle is closed exactly once) — then re-enumerates and re-resolves the `index` selector against a fresh device list (bus/address can change across a replug; a `vid:pid`/`serial:` selector survives it, a `bus:`/ordinal one may resolve to a different device), reopens, re-runs `uvc_get_stream_ctrl_format_size` with the negotiated geometry, and restarts streaming. Retries use bounded exponential backoff (1, 2, 4, 8, 16 s; `RECONNECT_MAX_RETRIES` = 5); the backoff is interruptible so a state change to NULL/PAUSED tears down promptly. If every retry is exhausted, it falls back to the disconnect error above. On success the IDR gate and PTS baseline are re-armed so the resumed stream waits for a fresh IDR.
-
-**Critical teardown constraint:** `force_usb_release()` must NOT be called before `uvc_close()` — including on the reconnect path. The spike proved `force_usb_release()` + `uvc_close()` double-closes the libusb handle. The element's teardown (in `stop()` and reconnect) lets `uvc_close()` own the single `libusb_close()` call; `force_usb_release()` only drops interface claims on the still-open handle.
-
----
-
-## OUTPUT BUFFER CONTRACT (`alignment=au`)
-
-Both pad templates advertise `alignment=(string)au`, so **every `GstBuffer` the element pushes is exactly one access unit** — one displayed picture, however many NAL units the device split it into. Downstream (`h264parse`, `v4l2slh264dec`/`mppvideodec`, the muxers) trusts that claim to find frame boundaries; the element must therefore honour it rather than merely assert it.
-
-`frame_callback()` parses one libuvc delivery into NAL units, partitions those units into access units (`split_access_units()`), and emits ONE buffer per access unit. Boundary detection, in priority order:
-
-- **AUD present** — an Access Unit Delimiter (H.264 `nal_unit_type` 9, H.265 `AUD_NUT` 35, both mapped to `UNIT_AUD`) *is* by definition the first NAL of its access unit, so it is an exact boundary. No heuristic involved.
-- **AUD absent** — the standard fallback: a slice NAL that opens a new picture ends the access unit that already holds one. "Opens a new picture" is read from the first bit of the slice payload — H.264's `first_mb_in_slice` is `ue(v)`, whose value 0 is the single bit `1`, and H.265's `first_slice_segment_in_pic_flag` is a raw `u(1)` — so a set top bit on the first payload byte means first-slice. Emulation prevention cannot disturb that byte (a `0x03` is only inserted after two `0x00` bytes, and the preceding NAL header is non-zero for every slice).
-- Any non-VCL run (SEI, parameter sets) immediately preceding a new picture's first slice belongs to the **following** access unit, so the cut is placed at the head of that run.
-- A device that emits neither an AUD nor a decodable first-slice bit never splits: the whole delivery becomes one access unit. That is the same grouping a single-picture delivery gets, and it is never a mid-picture cut.
-
-**Behaviour that did NOT change:**
-
-- Single-slice 1080p — the overwhelmingly common case — is byte-identical to the old per-NAL path: its access unit is one slice, so the one emitted buffer holds exactly the delivered bytes. Pinned by the `au_single_slice_characterization` ctest case, which was written and proven green BEFORE the aggregation landed.
-- Parameter sets are still consumed from the wire and re-prepended from the cache. They are written immediately **before** the access unit's first IDR slice, never at the head of the buffer, so an AUD stays the very first NAL of its access unit.
-- The pre-first-IDR gate, the SPS/PPS/VPS bounds clamp, and the write-on-change cache policy are unchanged.
-
-**PTS convention.** An aggregated access unit carries the arrival running-time of the delivery it came from — identically the PTS its **first** slice would have been stamped with under the per-NAL path, since every NAL of one delivery shares a single arrival instant. `GST_BUFFER_OFFSET` is now an access-unit counter rather than a NAL counter; for the single-slice case the sequence is unchanged. The `prev_pts` monotonic clamp no longer fires for slices of one picture (they are aggregated); it still covers a delivery that carried more than one access unit, whose AUs share an arrival `ts`.
-
-Regression-guarded by `tests/test_au_alignment.c` (`au_single_slice_characterization`, `au_multi_slice_aud`, `au_aud_less_fallback`).
-
----
-
-## V4L2 CAPABILITY PROBE
-
-At `start()`, after `uvc_open()` succeeds, the element issues one `VIDIOC_TRY_FMT` ioctl against `/dev/video<N>` (where N is the device ordinal). This is a cheap, non-destructive probe — it does not change any device state. The result is logged via `GST_INFO_OBJECT`:
-
-- `"V4L2 native H.264: available"` — TRY_FMT reports H.264 with positive sizeimage
-- `"V4L2 native H.264: unavailable"` — driver present but H.264 not reported
-- `"V4L2 probe unavailable: cannot open /dev/videoN"` — no V4L2 node at that index
-
-The probe is **non-fatal** in all cases. Its ordinal-derived node does not prove
-USB identity correspondence or frame delivery. It never selects or rejects the
-libuvc capture path and does not probe H.265.
-
----
-
-## BUILD
-
-### Production build (Meson, canonical)
-
-```bash
-# 1. Build libuvc (CeraLive fork, default) — no patch step needed
-scripts/build-libuvc.sh
-
-# To use upstream v0.0.7 + patches fallback instead:
-# LIBUVC_USE_FORK=OFF scripts/build-libuvc.sh
-
-# 2. Build plugin
-meson setup build libuvch264src/
-cd build && meson compile && meson install
-
-# 3. Move .so to system GStreamer path (multiarch-aware)
-MULTIARCH=$(gcc -print-multiarch)
-sudo mv /usr/local/lib/${MULTIARCH}/gstreamer-1.0/libgstlibuvch264src.so \
-        /lib/${MULTIARCH}/gstreamer-1.0/
-sudo cp /usr/local/lib/libuvc.* /usr/lib/${MULTIARCH}/
-```
-
-`$(gcc -print-multiarch)` resolves to `aarch64-linux-gnu` on arm64, `x86_64-linux-gnu` on amd64, etc. Do not hardcode the arch string.
-
-Downstream pairing — **variant selection, not capture-plugin compatibility**:
-
-| Kernel / configured variant | H.264 decoder | H.265 decoder | Encoder |
-|---|---|---|---|
-| 5.10 with MPP drivers/userspace | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
-| 6.6 mainline V4L2 decode | `v4l2slh264dec` | `v4l2slh265dec` | Depends on installed encoder driver/userspace |
-| 7.2 mainline | V4L2 elements available | V4L2 elements available | Depends on installed encoder driver/userspace |
-| 7.2 with CeraLive island — RK3588-optimised | `mppvideodec` | `mppvideodec` | `mpph264enc` / `mpph265enc` |
-
-MPP availability depends on the driver/UAPI and matched userspace, not a kernel
-minor cutoff. CeraLive's RK3588 path pairs these elements with `rgaconvert`, its
-librga fork and island drivers. Capture remains portable userspace libuvc.
-Which sources the kernel exposes through UVC/V4L2 varies with kernel UVC support;
-that inventory/capture-family axis is separate from downstream silicon pairing.
-
-### Reproducible Docker build
-
-The `Dockerfile` pins both the base image and the libuvc source:
-
-```
-debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
-```
-
-libuvc is fetched via `scripts/build-libuvc.sh` (fork mode by default, SHA `f3eda76` on `main`). The arch matrix fails loudly on unknown `TARGETARCH` values — no silent fallback.
-
-**Two stages: pinned Debian 13 Trixie `build`, then `FROM scratch` `runtime`.**
-The production base matches the device target suite. Bookworm remains a separate
-source-portability CI build on both architectures, not the production package base.
-Before installing build dependencies, `scripts/check-build-suite.sh` checks the
-container's actual Debian identity and suite against `BUILD_SUITE` (default
-`trixie`). CI explicitly selects `bookworm` for its portability legs; changing
-only `BUILD_BASE` to the wrong suite fails before compilation. This is a build
-gate, not a restriction on the portable source or its downstream decoder pairing.
-`runtime` carries ONLY `usr/lib/<triplet>/gstreamer-1.0/libgstlibuvch264src.so`
-and the three `libuvc.so*` entries. Never export a distro `/usr` as the payload.
-`scripts/build-deb.sh` packages that tree with `dpkg-deb`, checks the GLIBC 2.41
-ceiling and the libuvc ELF dependency `libjpeg.so.62`, and declares the Trixie
-runtime dependencies.
-`tests/package-contract.sh` checks the exact payload and old-name compatibility.
-`GST_PLUGIN_DEFINE` names CeraLive and this repository as package/origin: this is
-a diagnostic metadata judgement, with no change to registration or media behavior.
-
----
-
-## TEST
-
-The separate `bash tests/build-suite-contract.sh` fixture test covers matching
-Trixie/Bookworm builds, mismatched suites, a non-Debian identity and missing suite
-metadata (including an inherited environment value). It runs in the CI guard job.
-
-Hardware-independent ctest suite. Two build shapes:
-
-**Mock-backed plugin (`.so` loaded via `GST_PLUGIN_PATH`):** `test_plugin_load`, `test_mock_smoke` (+ `_asan`, `_tsan` variants). The mock plugin links the element TUs against `mock_libuvc.c` instead of real libuvc.
-
-**Static-registration (element TUs + mock linked into one exe):** all other test targets. Mock state is in-process, so counters and config are directly readable without env vars.
-
-```bash
-# Run the full suite (with sanitizers)
-cmake -B build -DENABLE_SANITIZERS=ON && cmake --build build && ctest --test-dir build --output-on-failure
-
-# Run without sanitizers (faster)
-cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure
-
-# Run a specific target
-ctest --test-dir build -R "ptz_properties|ptz_capability_gate"
-```
-
-**TSan note:** `GST_OBJECT_LOCK` is a `GMutex` implemented with a raw futex in uninstrumented GLib. Under `ignore_noninstrumented_modules=1`, TSan cannot see the happens-before relationship, so it reports correctly-locked PTS/clock accesses as races. These are permanent TSan blind spots (not bugs), baselined in `tsan_pts.suppressions`. The behavioral deadlock/throughput tests (`pts_thread_safety`, `frame_throughput`) provide real regression coverage that the suppressions cannot mask.
-
-**ASAN note:** `detect_leaks=0` is set for the mock-smoke variants (GStreamer one-time global allocs are noisy). The negotiate LSAN test uses `detect_leaks=1` with a targeted `__lsan_do_recoverable_leak_check()` after a warm-up window that swallows GStreamer's one-time globals.
-
-**Dual-codec status [EXISTS].** Both H.264 and H.265 pad templates are present and asserted by the test suite. `cerastream` uses this element for both `InputKind::UvcH264` (negotiated to `video/x-h264`) and `InputKind::UvcH265` (negotiated to `video/x-h265`). The `libuvch26xsrc` factory alias reflects this dual-codec capability.
-
-### Hardware-Independent Test Scope
-
-The entire ctest suite is **mock-backed** — `tests/mock_libuvc.c` stands in for libuvc and `tests/mock_libusb.c` for libusb, so CI needs no UVC camera. This bounds what the suite can and cannot prove:
-
-**The suite proves (in software, deterministically):**
-- Element registration, pad templates, property/signal surface, and caps negotiation (`test_plugin_load`, `test_compat`, `test_functional`, `test_negotiate`).
-- The pure logic that does NOT depend on a real device: the Annex-B NAL parser and its count/overflow bounds (`test_nal_parse` — including the `overflow` truncation-warning and `count_bound` suites), the SPS/PPS path builder, cache-key snapshot, and the cache file-open NULL/missing-file path (`test_cache`, `test_live_source` `spspps_key_snapshot`/`cache_open_null_path`).
-- Concurrency/teardown invariants observable in-process under sanitizers: the PTS/clock lock (`test_pts_thread_safety` TSan), the SPS/PPS-bounds clamp and cache index race (ASan/TSan), USB single-`libusb_close` teardown (`test_usb_teardown`), and the CVE-2026-1991 null-guard against the vendored libuvc.
-- Frame-callback-driven behavior fed by crafted access units through the mock: PTS monotonicity, IDR gating, write-on-change caching, disconnect/unlock lifecycle.
-- The `alignment=au` output-buffer contract (`test_au_alignment`): a multi-slice picture aggregates into ONE buffer both with and without an AUD in the bitstream, a second picture in the same delivery starts a new buffer, and single-slice 1080p stays byte-identical to the pre-aggregation path.
-- The `transfer-buffers` property contract (`test_transfer_buffers`: sentinel/clamp/reconnect re-arm, fork-only cases gated behind `TB_API_AVAILABLE` so the same test binary stays green on both `LIBUVC_USE_FORK=ON` and `OFF`) and the vid:pid quirk table (`test_quirks`: pure lookup/limits resolution, the universal bounded probe-retry policy — one `UVC_ERROR_INVALID_MODE` recovers in exactly two attempts, a second one propagates after two, `UVC_ERROR_PIPE`/`NO_DEVICE` propagate after one, and a healthy device probes exactly once — the shipped Osmo `QUIRK_MAX_PIXEL_RATE` cap, a red/green pair driving `negotiate()` against the Osmo's real advertised H.264 ladder — one case pins that an UNquirked device still picks the top mode 3840x2160@60, the other that the quirked Osmo lands on its capped ceiling 3840x2160@30 — and four `quirks_synthetic_row_*` cases that exercise every caps-filter branch (discrete-list filtering, fraction-range clamping, empty-mode drop, max-fps resolution) through an INJECTED test row, so the filter machinery stays covered independently of whatever the production table happens to hold) and the negotiation-failure descriptor inventory (`test_negotiate`'s `negotiate_inventory_logged` case).
-
-**Hardware-only, run by hand (NOT in ctest):** `tests/board/wedge-recovery.sh` induces a real wedge on a board — a gated SIGKILL of a holder that is provably streaming, matching the kill discipline the wedge investigation used — then measures reset-to-advancing-frames through the REAL `libusb_reset_device()` path and asserts it against `reset-settle-max-ms`, with a second USB port as a negative control. `tests/board/negotiation-matrix.sh` drives real-camera negotiation, phantom-mode, and sustained drills. Its fps floor uses `(AU count - 1) / (last AU PTS - first AU PTS)` so process startup is not mistaken for sustained delivery time, while every score still reports full process wall time. Missing, malformed, or fewer than two PTS samples visibly fall back to the former wall calculation. Transition scoring requires a valid commit leg: no commit AUs are INCONCLUSIVE, an element error in the subject leg is FAIL, and only a signal-free zero-AU subject remains INCONCLUSIVE. Both hardware harnesses are deliberately absent from `tests/CMakeLists.txt`; gated board operations skip (exit 77) unless `CERALIVE_BOARD_TEST=1`.
-
-**Hardware-free board-harness self-test:** run `bash tests/board/negotiation-matrix-selftest.sh`. Its synthetic identity logs prove a 1.3 s pre-frame startup delay changes the old wall-based verdict but not the PTS-span delivery rate, pin the explicit one-frame/malformed-PTS wall fallback, and keep transition element errors distinct from a genuinely signal-free zero-AU transcript. This test does not open a camera and is safe on a development host.
-
-**The suite does NOT prove (requires real hardware — out of scope here):**
-- Actual USB enumeration, `uvc_open()`/streaming against a physical DJI/UVC camera, real bandwidth at a given `max-payload`, or real PTZ motion on a device.
-- Whether a given camera actually emits multi-slice pictures or Access Unit Delimiters. The AU-alignment cases prove the element's grouping POLICY against crafted bitstreams; which shape a real DJI/UVC device puts on the wire at 1080p30 vs 2160p30 comes only from a board capture.
-- The V4L2 `VIDIOC_TRY_FMT` probe result for a real `/dev/videoN` (the test only asserts the probe is non-fatal when the node is absent).
-- Mid-stream physical replug/reconnect timing (the backoff schedule is asserted via a test hook, not a real unplug).
-- Real reset-to-advancing-frames timing. The mock pins the readiness POLICY (poll, reopen, require a frame, honour the bound) via the `MOCK_UVC_FRAME_SILENT` mode and the reset/poll hooks; the actual recovery duration on hardware comes only from `tests/board/wedge-recovery.sh`.
-
-When adding tests, keep them inside the mock-coverable boundary above — assert software behavior the mock can deterministically drive, never a hardware outcome the mock cannot model. Real-hardware validation tracks separately (see `cerastream/docs/notes/hardware-validation.md` for the device-class profiles).
-
----
-
-## VERSION SCHEME
-
-**CalVer derivation: git tag only (no source file).**
-
-The `.deb` version is derived **purely from git tags** at publish time via the `publish-release.yml` workflow. There is no separate `VERSION` file by design.
-
-**Authoritative version source:** `.github/workflows/publish-release.yml` (job `calculate-version`)
-
-**Scheme:** `YYYY.MINOR.PATCH` where:
-- `YYYY` = current year (UTC)
-- `MINOR` = current month (UTC, no zero-pad; e.g., `6` for June)
-- `PATCH` = monotonic counter per month (incremented from git tag history)
-
-**Example:** `2026.6.2` (June 2026, patch 2 — the hardening release)
-
-**Tag format:** `v<VERSION>` (stable) or `v<VERSION>-beta.<N>` (beta)
-- Stable: `v2026.6.2`
-- Beta: `v2026.6.3-beta.1`
-
-**Debian version:** `calculate-version` passes `VERSION` to `scripts/build-deb.sh`,
-producing `gstreamer1.0-libuvcsrc_<VERSION>_<ARCH>.deb`. Old release assets stay immutable.
-
-**No version file needed.** The workflow calculates the version at publish time from the git tag history; there is no tracked `VERSION` file in the repo. This is intentional — the single source of truth is the git tag namespace (`v*`).
-
----
-
-## ANTI-PATTERNS
-
-- Do NOT link against system libuvc if it exists; the pinned fork/upstream copy is intentional for version pinning.
-- Update only the selected dependency's pin in `scripts/build-libuvc.sh`, with its provenance and validation; the fork and upstream fallback pins are independent.
-- Do NOT hardcode `aarch64-linux-gnu` in build paths — use `$(gcc -print-multiarch)`.
-- Do NOT reintroduce a fixed, device-measured settle constant between the port reset and the reopen. It was measured on one DJI Osmo Pocket 3 and shipped as `RESET_SETTLE_MS` (4 s); it both over-waited on fast devices and burned the single reopen on slow ones. The replacement polls re-enumeration and requires a delivered frame, bounded by `reset-settle-max-ms`.
-- Do NOT treat a successful `uvc_start_streaming()` as proof the device recovered — it returns OK on a still-wedged device. Only a delivered frame proves it.
-- Do NOT present `reset-settle-max-ms` as a hard upper bound on recovery time. It bounds the element's own retry loop only; the synchronous libuvc teardown between attempts is uninterruptible and has been measured pushing the total to ~22 s against an 8 s budget.
-- Do NOT drop the `uvc_exit()`/`uvc_init()` on the recovery path — a libuvc context held across a port reset cannot reopen the re-enumerated device, and without the refresh the recovery never completes.
-- Do NOT treat `LIBUSB_ERROR_NOT_FOUND` from `libusb_reset_device()` as a failure — it means the reset re-enumerated the device, which is success.
-- Do NOT re-arm the port-reset one-shot on the first frame after a recovery; a device that emits one frame and re-wedges would then reset the port in an endless loop.
-- Do NOT write `authorized` on a `usbN-portM` directory or `disable` on a device directory. They live on different objects and neither exists on the other — measured 14/14 ports and 12/12 devices on the board. A device that failed enumeration has **no device directory at all**, which is exactly why the port path must be captured before the reset.
-- Do NOT describe the `deep-port-recovery` port cycle as a power cycle in logs, docs or commit messages. `PORTSC` reaching `Powered-off` is not proof the board's VBUS rail dropped, and the root hub in question advertises "No power switching" while still honouring the write. Only a hub control-transfer round-trip that proves per-port switching would justify the stronger claim, and this element does not make one.
-- Do NOT run the deep rung on a port whose hub carries another device, and do NOT replace the sibling-port check with a hub-descriptor capability read. Ganged hubs exist on this hardware, and the descriptor is demonstrably unreliable here (the xHCI root hub reports "No power switching" yet its `PORTSC` power bit does toggle).
-- Do NOT enable `deep-port-recovery` by default on the strength of the rung firing. It fired cleanly 3/3 on real hardware and recovered nothing; the default flips only on a board-proven ×3 recovery.
-- Do NOT reach the deep rung before the reset, or when the reset already recovered the device. The ordering is pinned by `test_reconnect.c`'s `deep_recovery_*` cases and is the whole point of the rung being an escalation.
-- Do NOT give the reset-recovery path the full `reconnect` retry ladder — the exhaustion tests assert an exact reopen-attempt count, and `reconnect` is the property that buys the ladder.
-- Do NOT call `force_usb_release()` before `uvc_close()` — it was a double-free/UAF vector; the fix lets `uvc_close()` own the single `libusb_close()`.
-- Do NOT push one `GstBuffer` per NAL unit. The pad templates advertise `alignment=au`; the element must emit one buffer per ACCESS UNIT. Splitting a multi-slice picture across buffers that each claim to be a whole access unit mis-frames every downstream consumer that trusts the caps.
-- Do NOT "fix" the `alignment=au` mismatch by weakening the caps to `alignment=nal`. Downstream reads the contract; the contract is correct and the emitter was not.
-- Do NOT write the cached parameter sets at the head of an aggregated access-unit buffer. They go immediately before the AU's first IDR slice, so an AUD — which must be the very first NAL of its access unit — keeps its position.
-- Do NOT enable `control-socket` by default or fall back to a world-accessible path when `XDG_RUNTIME_DIR` is unset — the socket must be opt-in and per-instance.
-- Do NOT set PTZ properties outside the param-spec range in tests — GObject emits a range warning that gst-check turns into a longjmp, skipping teardown and hanging the process.
-- Do NOT raise a `QUIRK_MAX_PIXEL_RATE` cap on the strength of a descriptor, a datasheet, or a successful `uvc_get_stream_ctrl_format_size()`. Only frames that actually ADVANCE on real hardware justify a higher cap; the cap is deliberately parked at the last CONFIRMED-GOOD rate, not the last known-bad one, because a cap set too low only costs resolution while a cap set too high costs the whole stream. (The Osmo Pocket 3 row sits at `3840x2160x30` = `248832000u` — raised from `62208000u` only after 4K@30 was captured through this element on 2026-07-30: 300/300 access units in ~10.8 s, SPS-verified `3840x2160`/`high`/`5.2`, zero errors, reproduced twice on board `192.168.78.131`. That is the bar. The 2026-08-27 campaign re-tested the whole advertised 4K ladder under the current probe policy and RETAINED the same number: 4K@60, 4K@50 and 4K@48 each failed 45/45 with `Unable to negotiate common caps` / `not-negotiated` and zero access units, while the 4K@30 control passed. Those three are a real caps-negotiation rejection, not an unexplained legacy suspicion. See `camera-compat.md` §2 Step 5.)
-- Do NOT read the historical shipping-build 4K@30 timing caveat as a reason to lower the cap, and do NOT reintroduce whole-process wall time as the fps denominator. Three independent 2026-08-27 cells each had one nominal floor failure, yet all 30 replicates delivered 300/300 access units at SPS-verified `3840x2160` with zero element and zero invalid-mode errors. Frame-level PTS analysis isolated startup/early-settling costs rather than sustained degradation. The harness now measures the N-1 intervals across the first-to-last AU PTS and retains full wall time as separate provenance; its synthetic self-test pins that distinction. This methodology correction does not itself re-run or adjudicate the authorizing subset.
-- Do NOT read an `Unable to get stream control: Invalid mode` failure as a caps-logic or descriptor problem before checking what mode the device last committed. libuvc rejects the mode when the device's SET_CUR/GET_CUR readback disagrees, and a camera that answers the first probe from its previously committed mode fails EVERY negotiation that asks for a larger mode — deterministically, though it looks intermittent in the field. That is what the bounded probe retry in `negotiate()` is for: one normal probe, then exactly one retry on `UVC_ERROR_INVALID_MODE` and nothing else. It is the DEFAULT for every device — there is no `QUIRK_DOUBLE_PROBE` flag any more, and a camera with this defect needs no quirk row.
-- Do NOT re-introduce a per-device probe-policy quirk flag, and do NOT widen the retry beyond `UVC_ERROR_INVALID_MODE` or beyond one extra attempt. The 2026-08-27 drill compared a narrow behaviour-triggered retry against an unconditional double probe: both passed every transition class, and the narrow one won precisely because it costs a healthy device nothing (a successful first probe returns immediately) and leaves `UVC_ERROR_PIPE`/`UVC_ERROR_NO_DEVICE` propagating on the first attempt, where they belong. The `LIBUVCH264SRC_PROBE_POLICY` override that let the drill force `single`/`double`/`retry` is compiled ONLY behind `LIBUVCH264SRC_PROBE_POLICY_OVERRIDE`; the production `.so` must not contain that string, and the build gate greps for it.
-- Do NOT "fix" the `quirks_ladder_no_quirk_picks_4k60` test because it asserts the buggy 3840x2160@60 outcome. That is deliberate: it pins the untouched max-area-then-max-fps behavior that every camera WITHOUT a quirk row still gets, and it is the control half of the pair whose other half proves the Osmo cap works.
-- Do NOT special-case a device inside `gst_libuvc_h264_negotiate()` (`if (vid == ... && w == 3840 ...)`). The quirk table exists so device knowledge stays data-driven — one row, no branching in the selection loop.
-- Do NOT re-derive the quirk exclusion outside `uvc_quirks_filter_caps()` — not in the engine, not in the UI, not in a second helper here. That split is precisely the shipped defect this function was added to close: the filtered ladder lived only inside `negotiate()`, so cerastream and CeraUI advertised `3840x2160@50` for a camera the element was guaranteed to refuse, and an operator picked it and lost a stream (board `192.168.78.131`, 2026-07-30 — twelve requests, twelve `Unable to negotiate common caps`). `negotiate()`, `deliverable-caps` and `filter-deliverable-caps` must all keep calling the one function.
-- Do NOT make `deliverable-caps` return an EMPTY caps when nothing is known. Empty means "this camera has no modes"; a consumer that trusts it will hide every option and strand the operator. `NULL` is the unknown answer, and `filter-deliverable-caps` on an unquirked vid:pid returns its input unchanged for the same reason — the filter may only ever REMOVE modes it has a positive verdict for.
-- The standard image installs this package through FIRST_PARTY_APT_PKGS, not REPOS. Custom installations must still check element availability.
+| Code path or task | Contract |
+|---|---|
+| Before changing anything else here, open docs/agents/README.md and read the contract for the subsystem you touch | [Contract index](docs/agents/README.md) |
+| Overview | [overview.md](docs/agents/overview.md) |
+| ROLE IN THE GROUP | [role-in-the-group.md](docs/agents/role-in-the-group.md) |
+| STRUCTURE | [structure.md](docs/agents/structure.md) |
+| WHERE TO LOOK | [where-to-look.md](docs/agents/where-to-look.md) |
+| PROPERTIES | [properties.md](docs/agents/properties.md) |
+| PTZ CONTROL SURFACE | [ptz-control-surface.md](docs/agents/ptz-control-surface.md) |
+| DISCONNECT / RECONNECT BEHAVIOR | [disconnect-reconnect-behavior.md](docs/agents/disconnect-reconnect-behavior.md) |
+| OUTPUT BUFFER CONTRACT (`alignment=au`) | [output-buffer-contract-alignment-au.md](docs/agents/output-buffer-contract-alignment-au.md) |
+| V4L2 CAPABILITY PROBE | [v4l2-capability-probe.md](docs/agents/v4l2-capability-probe.md) |
+| BUILD | [build.md](docs/agents/build.md) |
+| TEST | [test.md](docs/agents/test.md) |
+| VERSION SCHEME | [version-scheme.md](docs/agents/version-scheme.md) |
+| ANTI-PATTERNS | [anti-patterns.md](docs/agents/anti-patterns.md) |
+
+## HARD RULES
+
+- Repository `gstlibuvcsrc`; element `libuvcsrc`; package `gstreamer1.0-libuvcsrc` provides/replaces/conflicts with `gstreamer1.0-libuvch264src`.
+- Keep aliases `libuvch264src` and `libuvch26xsrc`, the single `libgstlibuvch264src.so`, libuvc SONAMEs, cache/socket names and persisted engine IDs.
+- `libuvcsrc` is the single UVC H.264/H.265 capture path; never substitute `v4l2src` on failure.
+- Probe once; retry exactly once only on `UVC_ERROR_INVALID_MODE`. No per-device probe-policy flag or production override string.
+- Deep USB recovery stays default-off, privileged and bounded; escalate only after failed reset; veto hubs with sibling devices.
+- Port cycling is not proven VBUS removal. No 4K60 qualification claim; raise pixel-rate caps only on advancing real hardware frames.
+- Keep pinned libuvc, not system libuvc; update only the selected dependency pin with provenance and validation.
+- Preserve one GstBuffer per access unit, `alignment=au`, IDR-gated parameter insertion and AUD-first ordering.
+- `uvc_close()` owns the single libusb close; never call `force_usb_release()` before it.
+- Recovery requires a delivered frame and context refresh; NOT_FOUND means re-enumeration; never re-arm reset on the first recovery frame.
+- Keep readiness polling bounded, not a fixed settle delay; teardown can exceed the retry-loop budget.
+- Control sockets stay opt-in, per-instance and private; never use a world-accessible fallback.
+- Keep quirk knowledge table-driven and filtering shared by negotiate/deliverable APIs; unknown caps are NULL, not EMPTY.
+- Runtime export is scratch-only plugin + three libuvc.so entries, never distro /usr; use computed multiarch paths.
+- Production is suite-checked Trixie; Bookworm is portability CI. Keep package ABI/dependency ceilings and exact payload checks.
+- Versions derive only from git tags; old release assets are immutable. Never add a tracked VERSION file.
+- Mock tests prove software contracts, not hardware outcomes; retain sanitizer coverage and separate gated board validation.
